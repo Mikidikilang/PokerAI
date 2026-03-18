@@ -27,7 +27,7 @@ v3.4: + Action History Vector (336 dim) + Position Encoding (12 dim)
 
 v4 (ÚJ): BB/SB explicit paraméter, M-ratio, street, board texture,
           pot odds, VPIP/PFR/AF stats, bet sizing history, hand equity.
-          Teljesen modularizált.
+          Teljesen modularizált. RTAManager + obs_builder hozzáadva.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 2. MODELL ARCHITEKTÚRA (ai_model.py → core/model.py)
@@ -95,12 +95,13 @@ get_env_action(abstract_action, raw_legal_actions):
 
 STATE VEKTOR ÖSSZETÉTELE (6 player példán):
 
-  [1] rlcard base obs          → dinamikus (72 @ 6p, 50 @ 2p, ~100 @ 9p)
-                                  → BB-normált értékek ahol lehetséges
+  [1] rlcard base obs          → 54 dim (MINDEN játékosszámnál UGYANANNYI!)
+                                  Forrás: nolimitholdem.py
+                                  state_shape = [[54] for _ in range(num_players)]
+                                  KORÁBBI HIBÁS ÉRTÉKEK: 72@6p, 50@2p, 100@9p → MIND HELYTELEN
   [2] OpponentHUD stats        → num_players × 7 dim = 42
                                   (VPIP, PFR, AF, 3bet%, fold_to_3bet,
                                    cbet%, fold_to_cbet per player)
-                                  RÉGEN: nyers action count – VÁLTOZIK!
   [3] Stack & blind features   → 8 dim
                                   spr, m_ratio, blind_ratio, active_ratio,
                                   depth_deep, depth_mid, depth_short, depth_push
@@ -113,16 +114,20 @@ STATE VEKTOR ÖSSZETÉTELE (6 player példán):
                                   max_connectedness, high_card_norm, num_board_cards_norm
   [7] Action history vector    → ACTION_HISTORY_LENGTH(8) × (num_players×7 + 1) dim
                                   one-hot(player,action) + bet_size_norm per akció
-                                  RÉGEN: bet_size nem volt benne – VÁLTOZIK!
   [8] Position encoding        → 2 × num_players dim
                                   button_one_hot + relative_position_one_hot
+  [9] Hand equity              → 1 dim (MC equity, 0.5 = semleges)
 
 ÖSSZESEN @ 6 player:
-  72 + 42 + 8 + 4 + 4 + 6 + 8×(42+1) + 12
-  = 72 + 42 + 8 + 4 + 4 + 6 + 344 + 12
-  = 492 dim
+  54 + 42 + 8 + 4 + 4 + 6 + 8×(42+1) + 12 + 1
+  = 54 + 42 + 8 + 4 + 4 + 6 + 344 + 12 + 1
+  = 475 dim
 
-Konst: STATE_SIZE automatikusan számolódik run_training_session()-ban.
+  FIGYELEM: a NOTES korábbi verziói 492-t írtak (hibásan 72 dimenziós obs-szal).
+  Az rlcard forráskód ellenőrzése alapján az obs MINDIG 54 dim.
+
+Konst: STATE_SIZE automatikusan számolódik run_training_session()-ban
+       a temp env rlcard obs méretéből → mindig a helyes értéket kapjuk.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 5. OPPONENT HUD TRACKER (core/opponent_tracker.py)
@@ -145,6 +150,33 @@ RÉGI (v3.x): nyers action count → frequency vector
   memory_length = 1000 action (rolling window)
   Cold start: 0.5 (neutral prior) – nem 0!
 
+KÉT OSZTÁLY:
+
+  OpponentHUDTracker (training pipeline):
+    - Lokális asztali indexek alapján tárol (0..N-1)
+    - A training collector ezt használja, változatlan
+    - reset() minden session-nél
+
+  GlobalPlayerTracker (RTA v4):
+    - Username alapján tárol → modellváltás-biztos
+    - KETTŐS RÉTEG:
+        Rolling window (memória): utolsó 1000 esemény per játékos
+          → adaptív, session-szintű, a modell ezt látja
+          → session végén eldobódik, nem kell perzisztálni
+        Lifetime számlálók (SQLite): összes valaha látott esemény int-ként
+          → soha nem törlődik, session-független
+          → 14 int per játékos → ~8 MB / 50k játékos
+    - COLD START BLENDING:
+        Ha rolling < 30 esemény: lifetime stat lineárisan bekeveredik
+        Így egy régen látott ellenfél adatai azonnal hasznosak
+    - SKÁLÁZHATÓSÁG:
+        50k játékos  → ~8 MB SQLite, <1ms/játékos lookup
+        500k játékos → ~80 MB SQLite, azonos sebesség
+        RAM          → max 9 PlayerStats él egyszerre (asztalon ülők)
+    - AUTO-FLUSH: 50 akciónként írja ki a dirty lifetime értékeket SQLite-ba
+    - PRELOAD: manage_table_change()-ben egyetlen batch DB query az asztalra
+    - MIGRÁCIÓ: GlobalPlayerTracker.migrate_from_json('players.json', 'players.db')
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 6. ACTION HISTORY ENCODER (core/features.py-ban)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -159,7 +191,8 @@ RÉGI: deque((player_id, action)) → one-hot(player_id × num_actions) per slot
 7. BOARD TEXTURE FEATURES (core/features.py-ban)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Input: raw_obs['public_cards'] → list of card strings pl. ['Ah', 'Kd', '2c']
+Input: raw_obs['public_cards'] → list of card strings rlcard formátumban
+       pl. ['DT', 'C7', 'S2']  (Suit+Rank nagybetű: 'SA'=Ace of Spades)
   is_paired          = 1.0 ha bármely két lap azonos rank
   is_monotone        = 1.0 ha mind azonos suit
   is_two_tone        = 1.0 ha pontosan 2 suit
@@ -181,14 +214,18 @@ Implementáció: egyszerű MC, nem igényel külső library-t.
   - n_sim iteráció, win_count/n_sim
 
 Cache: LRU cache (hand_key → equity) a repeated states gyorsításához.
-Ha az rlcard nem adja a hole_cards-ot közvetlenül:
-  → raw_obs['hand'] tartalmazza, parse kell.
+
+FIGYELEM: az equity modul 'As', 'Kh' formátumot vár (Rank+Suit kisbetű),
+ami ELTÉR az rlcard raw_obs['hand'] formátumától ('SA', 'HK').
+Az obs_builder.py card_to_obs_index() mindkét formátumot elfogadja.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 9. PPO BUFFER (training/buffer.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VÁLTOZATLAN v3.4-hez képest:
+VÁLTOZATLAN v3.1 óta. A GAE (Generalized Advantage Estimation)
+implementáció helyes és tesztelt.
+
   add(state, legal_actions, action, log_prob, value, reward, episode_end)
   compute_gae(gamma=0.99, lam=0.95) → (advantages, returns)
     GAE: Generalized Advantage Estimation
@@ -292,53 +329,178 @@ _reset_env(i):
     bb = random.choice([1,2,5,10,25])
     sb = bb // 2
     stack = bb * random.choice([20,30,40,60,80,100,150,200])
+  Fallback obs: [0.0] * 54  (54 dim, NEM 72!)
   action_history.clear()
-  tracker.reset() vagy new instance
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-14. REALTIME ASSISTANT (inference/realtime_assistant.py)
+14. REALTIME ASSISTANT (inference/)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-RealtimePokerAssistant:
-  __init__(model_path, num_players=6, device='cpu')
-    → betölti a modellt checkpoint-ból
-    → inicializálja tracker-t, history encoder-t
+KÉT OSZTÁLY:
 
-  set_game_context(bb, sb, my_stack, all_stacks, my_player_id, button_pos)
-    → beállítja az aktuális játék kontextusát
-    → visszaállítja history-t és tracker-t
+  RealtimePokerAssistant (inference/realtime_assistant.py):
+    - Egyszerű, egy modell, egy asztalmméret
+    - OpponentHUDTracker (lokális index, memória csak)
+    - Visszafelé kompatibilis régi kóddal
+    - Ajánlott: egyszerű teszteléshez, prototípushoz
 
-  get_recommendation(obs_dict, legal_actions)
-    → összerakja a state vektort
-    → modell forward (deterministic=False, de top-3 prob visszaad)
-    → visszatér:
-        action_name: str ('Fold'/'Call'/'Raise X BB')
-        confidence: float (max prob)
-        top3: [(action_name, prob), ...]
-        spr: float
-        m_ratio: float
-        equity: float (ha elérhető)
-        explanation: str (rövid szöveges magyarázat)
+  RTAManager (inference/rta_manager.py):
+    - Multi-asztalos, több modell, SQLite ellenfél DB
+    - AJÁNLOTT ÉLES HASZNÁLATHOZ
+    - Context manager-ként auto-flush kilépéskor
 
-  record_opponent_action(player_id, action_type, bet_amount=0.0)
-    → history és tracker frissítése
+RTAManager RÉSZLETES SPEC:
 
-  record_my_action(action_type, bet_amount=0.0)
-    → history frissítése
+  __init__(model_paths, db_path, device, equity_sims, tracker_memory)
+    model_paths:   dict[int, str] → {num_players: '.pth fájl'}
+    db_path:       SQLite fájl elérési útja (None = csak memória)
+    → ModelPool lazy betöltéssel
+    → GlobalPlayerTracker betöltése db_path-ból
+    → session elején loggolja a DB méretét és játékosszámot
 
-  new_hand()
-    → history clear, tracker reset NEM (megőrzi az ellenfél statokat!)
-    → street reset
+  manage_table_change(num_players, seat_map, my_seat, button_seat)
+    seat_map: dict[int, str] → {szék_idx: username}
+    1. Modell lazy betöltése a pool-ból
+    2. SeatMapper frissítése (username ↔ lokális index fordítás)
+    3. ActionHistoryEncoder újraalkotása (helyes num_players-szel)
+    4. Action history törlése (inkompatibilis lenne a régi mérettel)
+    5. GlobalPlayerTracker.preload_table() → batch DB query
+    FONTOS: GlobalPlayerTracker NEM resetelődik
 
-  new_street()
-    → street counter frissítése
+  new_hand(my_stack, all_stacks, bb, sb)
+    all_stacks: dict[username, float]
+
+  new_street(street)
+    street: 0=preflop, 1=flop, 2=turn, 3=river
+
+  get_recommendation(obs_vector, legal_actions, hole_cards, board_cards,
+                     current_pot, call_amount)
+    → dict:
+        action, action_name, confidence, top3
+        equity, spr, m_ratio, street_name
+        value_est, explanation
+        db_players  ← SQLite-ban ismert összes játékos száma
+
+  record_opponent_action(username, action, bet_amount, pot_size, context)
+    context: {'facing_3bet': bool, 'is_cbet_opp': bool, 'facing_cbet': bool}
+
+  record_my_action(action, bet_amount, pot_size)
+
+  flush_tracker()
+    → dirty lifetime értékek → SQLite
+    → context manager automatikusan hívja kilépéskor
+
+  reset_session()
+    → memória törlése, DB NEM érintett
+
+  player_stats(username) → summary dict
+  all_player_stats()     → session-szintű összes játékos
+  top_players(n)         → top N lifetime kézszám szerint (DB query)
+  db_info()              → DB méret, játékosszám, cache állapot
+
+BELSŐ KOMPONENSEK:
+
+  ModelPool:
+    - dict[int, AdvancedPokerAI] → lazy loading
+    - preload_all(): startup-ban hívható az összes modell előtöltéséhez
+
+  SeatMapper:
+    - seat_map frissítése: {szék_idx: username}
+    - local_index(username) → int (0..N-1)
+    - build_local_stacks(stack_by_username) → list (build_state_tensor-hoz)
+    - as_seat_map() → dict (preload_table-hoz)
+
+  _GlobalTrackerAdapter:
+    - Bridge: GlobalPlayerTracker → get_stats_vector() interface
+    - A build_state_tensor() OpponentHUDTracker.get_stats_vector()-t vár
+    - Ez az adapter burkolja a SQLite-alapú trackert
+
+TIPIKUS HASZNÁLAT:
+
+  with RTAManager(
+      model_paths = {6: '6max_ppo_v4.pth', 2: '2max_ppo_v4.pth'},
+      db_path     = 'players.db',
+  ) as manager:
+
+      # Session elején (egyszer):
+      manager.manage_table_change(6, seat_map, my_seat=0, button_seat=5)
+
+      # Minden kéznél:
+      manager.new_hand(my_stack=200.0, bb=2.0, sb=1.0)
+
+      # Leosztás közben:
+      manager.record_opponent_action('fish99', action=4, bet_amount=10.0)
+      result = manager.get_recommendation(obs, legal_actions,
+                                           hole_cards=['As','Kh'])
+      manager.record_my_action(result['action'])
+      manager.new_street(1)
+
+      # Asztalméret változáskor:
+      manager.manage_table_change(4, new_seat_map, my_seat=0)
+      # → új modell betöltve, DB megmarad, ellenfél statok megmaradnak
+
+  # kilépéskor automatikusan flush-ol
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-15. TRAINING RUNNER (training/runner.py)
+15. OBS BUILDER (inference/obs_builder.py) – ÚJ v4
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Forrás: rlcard/envs/nolimitholdem.py _extract_state()
+        + rlcard/games/limitholdem/card2index.json
+        + rlcard/games/base.py Card.get_index()
+
+OBS VEKTOR (54 dim, MINDIG, játékosszámtól FÜGGETLEN):
+
+  obs = np.zeros(54)
+  cards = public_cards + hand          ← board + kéz EGYÜTT (board előre!)
+  obs[[card2index[c] for c in cards]] = 1   ← one-hot, dim 0-51
+  obs[52] = float(my_chips)            ← player.in_chips: BETETT összeg
+  obs[53] = float(max(all_chips))      ← max BETETT összeg a táblán
+
+KRITIKUS – CHIP ÉRTÉKEK:
+  my_chips  = player.in_chips     = amit a LEOSZTÁSBA TETT (NEM megmaradt stack!)
+  all_chips = [p.in_chips ...]    = minden játékos betett összege
+  stakes    = [p.remained_chips]  = MEGMARADT stack (raw_obs['stakes']-ben van)
+
+  Ha az OCR a megmaradt stacket adja (pl. 98.0):
+    from inference.obs_builder import remained_to_in_chips
+    my_chips = remained_to_in_chips(remained=98.0, init_stack=100.0)  # = 2.0
+
+KÁRTYA FORMÁTUM:
+  Mi formátumunk:   Rank+Suit kisbetű  →  'As', 'Kh', 'Td', '2c'
+  rlcard formátum:  Suit+Rank nagybetű →  'SA', 'HK', 'DT', 'C2'
+                    (Card.get_index() = self.suit + self.rank)
+
+  card2index sorrend (limitholdem/card2index.json):
+    SA=0, S2=1, S3=2 ... SK=12
+    HA=13, H2=14 ... HK=25
+    DA=26, D2=27 ... DK=38
+    CA=39, C2=40 ... CK=51
+
+  card_to_obs_index() mindkét formátumot elfogadja.
+
+Használat:
+  from inference.obs_builder import ObsBuilder, remained_to_in_chips
+  builder = ObsBuilder()   # num_players paraméter nem számít, obs=54 fix
+
+  obs = builder.build(
+      hole_cards  = ['As', 'Kh'],           # saját lapok
+      board_cards = ['Td', '7c', '2s'],     # board lapok (preflop: [])
+      my_chips    = 2.0,                    # BETETT összeg (in_chips)
+      all_chips   = [2.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+  )
+  # obs.shape == (54,), dtype=float32
+
+Sanity check:
+  python inference/obs_builder.py  ← minden tesztet lefuttat rlcard nélkül
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+16. TRAINING RUNNER (training/runner.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 run_training_session(num_players, filename, episodes_to_run):
   1. STATE_SIZE kalkuláció (temp env-ből rlcard obs méret)
+     temp_env.reset() → len(state['obs']) → 54 minden játékosszámnál
   2. Model + Buffer + Trainer + Pool + Collector inicializálás
   3. Checkpoint betöltés (részleges is OK, input_proj-nél figyelem!)
   4. TensorBoard setup
@@ -355,25 +517,22 @@ CHECKPOINT: state_dict + episodes_trained + time_spent + algorithm +
             state_size + action_size + bb_config (v4 ÚJ!)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-16. KÖNYVTÁR STRUKTÚRA
+17. KÖNYVTÁR STRUKTÚRA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 poker_ai_v4/
 ├── NOTES_MASTER.txt          ← ez a fájl
 ├── README.md                 ← telepítés, használat
 ├── requirements.txt          ← rlcard, torch, numpy, tensorboard
-├── train.py                  ← belépési pont (volt: train_full_game.py)
+├── train.py                  ← belépési pont
+├── rta_example.py            ← RTAManager v4 példa
 │
 ├── core/                     ← platform-független logika
 │   ├── __init__.py
-│   ├── model.py              ← AdvancedPokerAI (volt: ai_model.py)
-│   ├── action_mapper.py      ← PokerActionMapper (volt: inline)
+│   ├── model.py              ← AdvancedPokerAI (PPO Actor-Critic)
+│   ├── action_mapper.py      ← PokerActionMapper
 │   ├── features.py           ← összes feature engineering
-│   │                            ActionHistoryEncoder, build_state_tensor,
-│   │                            compute_stack_features, encode_position,
-│   │                            encode_street, compute_board_texture,
-│   │                            compute_pot_odds_features
-│   ├── opponent_tracker.py   ← OpponentHUDTracker (volt: OpponentTracker)
+│   ├── opponent_tracker.py   ← OpponentHUDTracker + GlobalPlayerTracker (SQLite)
 │   └── equity.py             ← Monte Carlo equity becslő
 │
 ├── training/                 ← tréning-specifikus logika
@@ -382,19 +541,24 @@ poker_ai_v4/
 │   ├── trainer.py            ← PPOTrainer
 │   ├── normalizer.py         ← RunningMeanStd
 │   ├── opponent_pool.py      ← OpponentPool
-│   ├── collector.py          ← BatchedSyncCollector
+│   ├── collector.py          ← BatchedSyncCollector (256 párhuzamos env)
 │   └── runner.py             ← run_training_session, menu_system
 │
 ├── inference/                ← realtime asszisztens
-│   ├── __init__.py
-│   └── realtime_assistant.py ← RealtimePokerAssistant
+│   ├── __init__.py           ← RealtimePokerAssistant + RTAManager export
+│   ├── obs_builder.py        ← ÚJ: rlcard obs rekonstrukció (54 dim)
+│   ├── realtime_assistant.py ← egyszerű RTA (visszafelé kompatibilis)
+│   └── rta_manager.py        ← RTAManager v4 (multi-asztalos, SQLite)
 │
-└── utils/                    ← segédeszközök
-    ├── __init__.py
-    └── logging_setup.py      ← logger konfiguráció
+├── utils/                    ← segédeszközök
+│   ├── __init__.py
+│   └── logging_setup.py      ← logger konfiguráció
+│
+└── players.db                ← SQLite ellenfél adatbázis (gitignore-ban!)
+                                 (~8 MB / 50k játékos)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-17. KRITIKUS BUGOK JAVÍTVA v4-BEN
+18. KRITIKUS BUGOK JAVÍTVA v4-BEN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 BUG-1 (v3.4): Dupla _encode() call a collector-ban.
@@ -410,8 +574,13 @@ BUG-3 (v3.4): build_state_tensor() position placeholder.
 BUG-4 (v3.x): initial_stack hardkód → hibás pot becslés.
   JAVÍTÁS: per-env bb/sb/stack randomizálás, minden számítás BB-ben.
 
+BUG-5 (v4 korai): rlcard obs méret hibásan feltételezve (72@6p, 50@2p, stb.)
+  JAVÍTÁS: rlcard forráskód alapján az obs MINDIG 54 dim.
+  Érintett fájlok: rta_example.py (rand(72)→rand(54)), NOTES_MASTER.txt §4.
+  A STATE_SIZE @ 6p: 492 (régi, hibás) → 475 (helyes).
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-18. VISSZAFELÉ KOMPATIBILITÁS DÖNTÉS
+19. VISSZAFELÉ KOMPATIBILITÁS DÖNTÉS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 DÖNTÉS: INKOMPATIBILIS (v4 teljesen új tréning)
@@ -426,7 +595,7 @@ Checkpoint betöltő MEGTARTVA: strict=False + size mismatch kiszűrés.
 Ha valaki v3.x checkpoint-ot tölt be → warning + részleges betöltés.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-19. HIPERPARAMÉTEREK ÖSSZEFOGLALÓJA
+20. HIPERPARAMÉTEREK ÖSSZEFOGLALÓJA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 NUM_ENVS             = 256
@@ -454,38 +623,35 @@ BB_OPTIONS           = [1, 2, 5, 10, 25]
 STACK_MULTIPLIERS    = [20, 30, 40, 60, 80, 100, 150, 200]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-20. RLCARD SPECIFIKUS ISMERETEK
+21. RLCARD SPECIFIKUS ISMERETEK (forráskód alapján)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-state dict struktúra:
-  state['obs']                → numpy array, fő megfigyelés
-  state['raw_obs']['my_chips']   → saját chips
-  state['raw_obs']['all_chips']  → összes játékos chips lista
-  state['raw_obs']['pot']        → pot méret (v4-ben ezt használjuk!)
-  state['raw_obs']['public_cards']→ board lapok lista (pl. ['Ah','Kd','2c'])
-  state['raw_obs']['hand']        → saját lapok (pl. ['As','Kh'])
-  state['raw_obs']['button']      → button pozíció (0-indexed)
-  state['raw_obs']['stakes']      → {'ante':0,'small_blind':x,'big_blind':y}
-                                    VAGY nincs benne → saját BB/SB kezelés
-  state['legal_actions']          → list of int (raw action IDs)
+obs méret: MINDIG 54 dim – játékosszámtól FÜGGETLEN
+  Forrás: nolimitholdem.py  state_shape = [[54] for _ in range(num_players)]
+  KORÁBBI HIBÁS ÉRTÉKEK: 2p=50, 6p=72, 9p=100 → MIND HELYTELEN.
+  → mindig temp env.reset()-ből mérjük, de az eredmény mindig 54.
+
+state dict struktúra (game.py get_state()):
+  state['obs']                      → numpy array (54,)
+  state['raw_obs']['hand']          → [c.get_index() for c in hand]
+                                       rlcard kártyaformátum: 'SA', 'HK'
+                                       (Card.get_index() = suit+rank nagybetű)
+  state['raw_obs']['public_cards']  → board lapok ugyanígy ('DT', 'C7', 'S2')
+  state['raw_obs']['my_chips']      → player.in_chips (BETETT összeg, NEM stack!)
+  state['raw_obs']['all_chips']     → [p.in_chips for p in players] (betett)
+  state['raw_obs']['stakes']        → [p.remained_chips ...] (MEGMARADT stack)
+  state['raw_obs']['pot']           → sum(all in_chips) = teljes pot
+  state['raw_obs']['stage']         → Stage enum (PREFLOP/FLOP/TURN/RIVER)
+  state['legal_actions']            → list of Action enum
 
 env.reset() → (state, player_id)
 env.step(action) → (state, player_id)
 env.is_over() → bool
-env.get_payoffs() → list[float] per player
-env.get_player_id() → int
+env.get_payoffs() → numpy array[float] per player  ← NEM list! numpy array!
+                    `if payoffs` → ValueError, helyes: len(payoffs) > 0
 
 FIGYELEM: az rlcard no-limit-holdem env nem mindig adja a 'stakes'-t
           ezért a BB/SB-t a Collector tárolja és adja át feature buildnek.
-
-obs méret játékosszám szerint (empirikus):
-  2p: ~50 dim
-  3p: ~57 dim
-  4p: ~64 dim
-  5p: ~68 dim
-  6p: 72 dim
-  9p: ~100 dim
-  → mindig temp env-ből mérjük!
 
 ================================================================================
 EOF
