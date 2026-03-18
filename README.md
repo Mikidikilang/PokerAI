@@ -2,15 +2,11 @@
 
 Moduláris, PPO-alapú No-Limit Hold'em AI realtime asszisztens funkcióval.
 
----
-
 ## Telepítés
 
 ```bash
 pip install -r requirements.txt
 ```
-
----
 
 ## Tréning
 
@@ -18,106 +14,31 @@ pip install -r requirements.txt
 python train.py
 ```
 
-Menüből választható játékosszám (2–9) és checkpoint fájlnév.
-
----
-
-## Realtime asszisztens használata
+## RTAManager (online póker)
 
 ```python
-from inference import RealtimePokerAssistant
+from inference.rta_manager import RTAManager
 
-assistant = RealtimePokerAssistant(
-    model_path  = '6max_ppo_v4.pth',
-    num_players = 6,
-    device      = 'cpu',
-)
-
-# Kéz kezdete
-assistant.new_hand(
-    my_stack     = 150.0,
-    all_stacks   = [150.0] * 6,
-    bb           = 2.0,
-    sb           = 1.0,
-    my_player_id = 2,
-    button_pos   = 1,
-)
-
-# Döntés kérése
-result = assistant.get_recommendation(
-    obs_vector    = obs,             # rlcard obs array
-    legal_actions = [0, 1, 2, 3, 4, 5, 6],
-    hole_cards    = ['As', 'Kh'],    # opcionális
-    board_cards   = [],
-    call_amount   = 4.0,
-)
-
-print(result['action_name'])    # pl. "Raise 50%"
-print(result['confidence'])     # pl. 0.73
-print(result['explanation'])    # pl. "Preflop | Raise 50% (73%) | Equity: 67%"
-
-# Ellenfél lépés rögzítése
-assistant.record_opponent_action(player_id=3, action=4, bet_amount=10.0)
-
-# Street váltás
-assistant.new_street(street=1)  # flop
+with RTAManager(
+    model_paths = {6: '6max_ppo_v4.pth'},
+    db_path     = 'players.db',
+) as manager:
+    manager.manage_table_change(6, seat_map, my_seat=0)
+    manager.new_hand(my_stack=200.0, bb=2.0, sb=1.0)
+    result = manager.get_recommendation(obs, legal_actions,
+                                         hole_cards=['As','Kh'])
 ```
 
----
+## obs_builder – rlcard obs rekonstrukció
 
-## Könyvtár struktúra
-
+```python
+from inference.obs_builder import ObsBuilder
+builder = ObsBuilder(num_players=6)
+obs = builder.build(
+    hole_cards  = ['As', 'Kh'],
+    board_cards = ['Td', '7c', '2s'],
+    my_chips    = 200.0,
+    all_chips   = [200.0, 150.0, 300.0, 100.0, 250.0, 180.0],
+)
+# obs.shape == (54,)
 ```
-poker_ai_v4/
-├── train.py                   # belépési pont
-├── requirements.txt
-├── NOTES_MASTER.txt           # teljes fejlesztési dokumentáció
-│
-├── core/
-│   ├── model.py               # AdvancedPokerAI (PPO Actor-Critic)
-│   ├── action_mapper.py       # 7 absztrakt akció leképező
-│   ├── features.py            # teljes feature engineering
-│   ├── opponent_tracker.py    # HUD statisztikák (VPIP/PFR/AF/...)
-│   └── equity.py              # Monte Carlo kéz equity becslő
-│
-├── training/
-│   ├── buffer.py              # PPO buffer + GAE
-│   ├── trainer.py             # PPO trainer
-│   ├── normalizer.py          # futó reward normalizáló
-│   ├── opponent_pool.py       # self-play ellenfél pool
-│   ├── collector.py           # BatchedSyncCollector (256 párhuzamos env)
-│   └── runner.py              # tréning session + menü
-│
-├── inference/
-│   └── realtime_assistant.py  # RealtimePokerAssistant
-│
-└── utils/
-    └── logging_setup.py       # logger konfiguráció
-```
-
----
-
-## v4 újítások (v3.4-hez képest)
-
-| Feature | v3.4 | v4 |
-|---|---|---|
-| BB/SB paraméter | hardkód 100 | explicit, randomizált |
-| Reward skála | abszolút chip | BB-ben mérve |
-| Stack features | SPR + 3 dim | SPR + M-ratio + depth one-hot (8 dim) |
-| Street context | nincs | one-hot 4 dim |
-| Pot odds | nincs | pot_odds + call_bb + facing_bet (4 dim) |
-| Board texture | nincs | 6 dim |
-| Opponent stats | nyers frekvencia | VPIP/PFR/AF/3bet%/fold_to_3bet/cbet%/fcb% |
-| Bet size history | nincs | bet_size_norm per akció |
-| Hand equity | nincs | MC becslő (200 szimuláció, LRU cache) |
-| Dupla encode bug | jelen | javítva |
-| State before bug | jelen | javítva |
-| Realtime API | nincs | RealtimePokerAssistant |
-
----
-
-## Checkpoint kompatibilitás
-
-A v4 **inkompatibilis** v3.x checkpointokkal az `input_proj` réteg
-méretváltozása miatt. A checkpoint betöltő részleges betöltést végez
-(size-mismatch rétegek kihagyva), warninggal jelezve.

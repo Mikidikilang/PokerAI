@@ -44,7 +44,6 @@ AJÁNLOTT HASZNÁLAT
       manager.new_hand(my_stack=150.0, bb=2.0, sb=1.0)
 
       result = manager.get_recommendation(
-          obs_vector    = obs,
           legal_actions = [0,1,2,3,4,5,6],
           hole_cards    = ['As', 'Kh'],
           board_cards   = [],
@@ -87,6 +86,7 @@ from core.features import (
 )
 from core.opponent_tracker import GlobalPlayerTracker
 from core.equity import HandEquityEstimator
+from inference.obs_builder import ObsBuilder
 
 logger = logging.getLogger("PokerAI")
 
@@ -312,6 +312,11 @@ class RTAManager:
             memory=tracker_memory,
         )
 
+        # ObsBuilder: az rlcard obs vektor rekonstrukciója OCR adatokból
+        # Kalibráció nélkül is működik – az obs struktúra hardkódolva van
+        # a nolimitholdem.py forráskód alapján (54 dim, fix minden játékosszámnál)
+        self._obs_builder = ObsBuilder()
+
         # Aktuális asztal állapot
         self._seat_mapper     = SeatMapper()
         self._action_history  = collections.deque(maxlen=ACTION_HISTORY_LEN)
@@ -513,7 +518,6 @@ class RTAManager:
     # ── Fő ajánlás API ────────────────────────────────────────────────────────
 
     def get_recommendation(self,
-                            obs_vector:    object,
                             legal_actions: list,
                             hole_cards:    list  = None,
                             board_cards:   list  = None,
@@ -523,9 +527,8 @@ class RTAManager:
         Akcióajánlás az aktuális játékállapothoz.
 
         Paraméterek:
-            obs_vector:    rlcard obs array (numpy array vagy list)
             legal_actions: engedélyezett absztrakt akciók listája [0-6]
-            hole_cards:    ['As','Kh'] saját lapok (equity számításhoz)
+            hole_cards:    ['As','Kh'] saját lapok
             board_cards:   ['Td','7c','2s'] közösségi lapok
             current_pot:   aktuális pot mérete
             call_amount:   call összege (pot odds számításhoz)
@@ -551,9 +554,35 @@ class RTAManager:
         board_cards = board_cards or []
         hole_cards  = hole_cards  or []
 
-        # ── State dict összerakása ────────────────────────────────────────────
-        state = self._build_obs_dict(obs_vector, board_cards,
-                                      call_amount, current_pot)
+        # ── Obs vektor rekonstrukciója az ObsBuilder-rel ──────────────────────
+        # Az rlcard nolimitholdem.py _extract_state() logikáját reprodukálja:
+        #   obs[0:52] = public_cards + hand one-hot (card2index szerint)
+        #   obs[52]   = my_chips (normálatlan)
+        #   obs[53]   = max(all_chips) (normálatlan)
+        stacks = self._all_stacks or [self._my_stack] * self._num_players
+        obs_arr = self._obs_builder.build(
+            hole_cards  = hole_cards,
+            board_cards = board_cards,
+            my_chips    = self._my_stack,
+            all_chips   = stacks,
+        )
+
+        # ── State dict összerakása (build_state_tensor()-nak) ─────────────────
+        button_local = self._seat_mapper.local_index(
+            self._seat_mapper.username(self._button_seat)
+        )
+        state = {
+            'obs': obs_arr,
+            'raw_obs': {
+                'my_chips':     self._my_stack,
+                'all_chips':    stacks,
+                'pot':          current_pot or 0.0,
+                'public_cards': board_cards,
+                'hand':         hole_cards,
+                'button':       button_local,
+                'call_amount':  call_amount,
+            },
+        }
 
         # ── Equity becslés ───────────────────────────────────────────────────
         equity = 0.5
@@ -626,30 +655,6 @@ class RTAManager:
         }
 
     # ── Segédmetódusok ────────────────────────────────────────────────────────
-
-    def _build_obs_dict(self, obs_vector, board_cards: list,
-                         call_amount: float, current_pot) -> dict:
-        obs_arr = np.array(obs_vector, dtype=np.float32)
-        stacks  = self._all_stacks or [self._my_stack] * self._num_players
-        button_local = (
-            self._seat_mapper.local_index(
-                self._seat_mapper.username(self._button_seat)
-            )
-            if self._button_seat in range(self._num_players) else 0
-        )
-        return {
-            'obs': obs_arr,
-            'raw_obs': {
-                'my_chips':     self._my_stack,
-                'all_chips':    stacks,
-                'pot':          current_pot or 0.0,
-                'public_cards': board_cards,
-                'hand':         [],
-                'button':       button_local,
-                'call_amount':  call_amount,
-            },
-            'legal_actions': [],
-        }
 
     def _explain(self, action: int, equity: float, spr: float,
                   m_ratio: float, confidence: float,

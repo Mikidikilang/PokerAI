@@ -3,7 +3,7 @@ __pycache__/
 logs/
 runs/
 
-# SQLite ellenfél adatbázis (session-specifikus, ne kerüljön GitHubra)
+# SQLite ellenfél adatbázis
 players.db
 players.db-wal
 players.db-shm

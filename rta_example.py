@@ -20,7 +20,6 @@ MEGJEGYZÉS: valódi .pth fájlok nélkül MockModelPool fut.
 import sys
 import os
 import tempfile
-import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,8 +34,7 @@ from core.action_mapper import PokerActionMapper
 
 
 def _make_mock_model(num_players: int, device: torch.device) -> tuple:
-    obs_sizes   = {2: 50, 3: 57, 4: 64, 5: 68, 6: 72, 7: 79, 8: 86, 9: 100}
-    obs_size    = obs_sizes.get(num_players, 72)
+    obs_size    = 54  # ObsBuilder.OBS_SIZE – rlcard nolimitholdem mindig 54
     state_size  = compute_state_size(obs_size, num_players)
     action_size = PokerActionMapper.NUM_CUSTOM_ACTIONS
     model = AdvancedPokerAI(state_size, action_size).to(device)
@@ -134,9 +132,7 @@ try:
     manager.record_opponent_action('aggro_anna', action=1, pot_size=11.0)
     manager.record_opponent_action('loose_bill', action=1, pot_size=11.0)
 
-    obs_6p = np.random.rand(72).astype(np.float32)
     result = manager.get_recommendation(
-        obs_vector    = obs_6p,
         legal_actions = [0,1,2,3,4,5,6],
         hole_cards    = ['As','Kh'],
         board_cards   = [],
@@ -159,7 +155,6 @@ try:
         context={'is_cbet_opp': True}
     )
     result_flop = manager.get_recommendation(
-        obs_vector    = obs_6p,
         legal_actions = [0,1,4,5,6],
         hole_cards    = ['As','Kh'],
         board_cards   = ['Ad','7c','2s'],
@@ -214,9 +209,7 @@ try:
         bb=2.0, sb=1.0,
     )
 
-    obs_4p = np.random.rand(64).astype(np.float32)
     result_4p = manager.get_recommendation(
-        obs_vector    = obs_4p,
         legal_actions = [0,1,3,4,6],
         hole_cards    = ['Qh','Jd'],
         board_cards   = [],
