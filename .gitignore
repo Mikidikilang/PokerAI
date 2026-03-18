@@ -2,3 +2,11 @@ __pycache__/
 *.pth
 logs/
 runs/
+
+# SQLite ellenfél adatbázis (session-specifikus, ne kerüljön GitHubra)
+players.db
+players.db-wal
+players.db-shm
+*.db
+*.db-wal
+*.db-shm
