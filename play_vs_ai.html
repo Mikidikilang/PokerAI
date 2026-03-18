@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Poker AI v4 – Play vs Model</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  :root {
+    --bg: #0a0e0a;
+    --felt: #1a5c2e;
+    --felt-dark: #0c3012;
+    --gold: #c4a052;
+    --gold-bright: #f0d060;
+    --red: #ff4d6a;
+    --blue: #4da6ff;
+    --green: #50d890;
+    --text: #e8e8e8;
+    --text-dim: rgba(255,255,255,0.45);
+    --card-white: #f8f8f0;
+  }
+
+  body {
+    background: radial-gradient(ellipse at 50% 30%, #1a2a1a 0%, var(--bg) 70%);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ─── LOBBY ─────────────────────────────────────── */
+  #lobby {
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 40px 20px;
+  }
+  .lobby-title {
+    font-family: 'Playfair Display', serif; font-size: 42px; font-weight: 900;
+    color: var(--gold); letter-spacing: 2px; margin-bottom: 6px;
+    text-shadow: 0 2px 20px rgba(196,160,82,0.3);
+  }
+  .lobby-subtitle {
+    color: var(--text-dim); font-size: 14px; letter-spacing: 3px;
+    text-transform: uppercase; margin-bottom: 40px;
+  }
+  .lobby-card {
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px; padding: 32px 40px; max-width: 560px; width: 100%;
+    backdrop-filter: blur(20px);
+  }
+  .field-group { margin-bottom: 24px; }
+  .field-label {
+    font-size: 11px; color: var(--gold); letter-spacing: 2px;
+    text-transform: uppercase; margin-bottom: 8px; font-weight: 600;
+  }
+  select, input[type=number] {
+    width: 100%; padding: 12px 16px; background: rgba(0,0,0,0.4);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 8px;
+    color: var(--text); font-size: 15px; font-family: 'DM Sans', sans-serif;
+    outline: none; transition: border-color 0.2s;
+  }
+  select:focus, input:focus { border-color: var(--gold); }
+  select option { background: #1a1a1a; }
+  .seat-grid {
+    display: flex; flex-wrap: wrap; gap: 8px;
+  }
+  .seat-btn {
+    padding: 10px 18px; border-radius: 8px; border: 1.5px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.04); color: var(--text-dim);
+    cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s;
+    font-family: 'DM Sans', sans-serif;
+  }
+  .seat-btn:hover { border-color: var(--gold); color: var(--text); }
+  .seat-btn.active {
+    border-color: var(--gold); background: rgba(196,160,82,0.15);
+    color: var(--gold-bright);
+  }
+  .start-btn {
+    width: 100%; padding: 16px; border-radius: 12px; border: 2px solid var(--gold);
+    background: linear-gradient(180deg, rgba(196,160,82,0.2), rgba(196,160,82,0.05));
+    color: var(--gold-bright); font-size: 18px; font-weight: 700;
+    cursor: pointer; letter-spacing: 2px; text-transform: uppercase;
+    font-family: 'Playfair Display', serif; transition: all 0.2s; margin-top: 8px;
+  }
+  .start-btn:hover { background: rgba(196,160,82,0.3); transform: translateY(-1px); }
+  .start-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  .no-models { color: var(--red); text-align: center; padding: 30px; font-size: 15px; }
+  .model-meta { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+  .inline-fields { display: flex; gap: 12px; }
+  .inline-fields > div { flex: 1; }
+
+  /* ─── GAME ──────────────────────────────────────── */
+  #game { display: none; min-height: 100vh; padding: 16px; }
+  .game-header {
+    display: flex; justify-content: space-between; align-items: center;
+    max-width: 900px; margin: 0 auto 12px; padding: 0 8px;
+  }
+  .game-header-stat { font-size: 12px; color: var(--text-dim); letter-spacing: 1.5px; }
+  .game-header-title {
+    font-family: 'Playfair Display', serif; font-size: 14px;
+    color: var(--gold); letter-spacing: 2px;
+  }
+
+  /* Table */
+  .table-container {
+    max-width: 900px; margin: 0 auto; position: relative;
+    aspect-ratio: 16/9; min-height: 400px;
+  }
+  .table-felt {
+    position: absolute; inset: 8%; border-radius: 50%;
+    background: radial-gradient(ellipse, var(--felt) 0%, var(--felt-dark) 70%, #082a0e 100%);
+    box-shadow:
+      0 0 0 10px #2a1810, 0 0 0 13px var(--gold), 0 0 0 16px #2a1810,
+      0 0 60px rgba(0,0,0,0.8), inset 0 0 60px rgba(0,0,0,0.25);
+  }
+  .table-felt::after {
+    content: ''; position: absolute; inset: 0; border-radius: 50%;
+    background-image: url("data:image/svg+xml,%3Csvg width='4' height='4' viewBox='0 0 4 4' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 3h1v1H1V3zm2-2h1v1H3V1z' fill='rgba(255,255,255,0.015)' fill-rule='evenodd'/%3E%3C/svg%3E");
+  }
+
+  /* Board center */
+  .board-area {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center; gap: 10px; z-index: 10;
+  }
+  .pot-display {
+    background: rgba(0,0,0,0.55); padding: 4px 18px; border-radius: 20px;
+    border: 1px solid rgba(196,160,82,0.25); display: flex; align-items: center; gap: 6px;
+  }
+  .pot-label { font-size: 10px; color: var(--text-dim); letter-spacing: 1.5px; }
+  .pot-value { font-size: 20px; font-weight: 700; color: var(--gold-bright); font-family: 'Playfair Display', serif; }
+  .board-cards { display: flex; gap: 5px; min-height: 80px; align-items: center; }
+
+  /* Player seat */
+  .seat {
+    position: absolute; transform: translate(-50%, -50%); z-index: 5;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    transition: all 0.3s ease;
+  }
+  .seat-info {
+    background: rgba(0,0,0,0.6); border-radius: 12px; padding: 6px 14px;
+    border: 1.5px solid rgba(255,255,255,0.08); text-align: center;
+    min-width: 80px; backdrop-filter: blur(8px); transition: border-color 0.3s;
+  }
+  .seat.active-turn .seat-info { border-color: var(--gold); box-shadow: 0 0 16px rgba(196,160,82,0.25); }
+  .seat.human .seat-info { border-color: rgba(80,216,144,0.3); }
+  .seat.folded { opacity: 0.35; }
+  .seat-name { font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }
+  .seat-name.human-name { color: var(--green); }
+  .seat-stack { font-size: 13px; font-weight: 600; color: var(--gold-bright); }
+  .seat-cards { display: flex; gap: 3px; }
+  .seat-action-badge {
+    position: absolute; top: -18px; left: 50%; transform: translateX(-50%);
+    padding: 2px 10px; border-radius: 10px; font-size: 10px; font-weight: 700;
+    white-space: nowrap; animation: badgePop 0.3s ease-out;
+    letter-spacing: 0.5px;
+  }
+  .seat-bet-badge {
+    position: absolute; font-size: 12px; font-weight: 600;
+    color: var(--gold-bright); white-space: nowrap;
+    background: rgba(0,0,0,0.4); padding: 2px 8px; border-radius: 8px;
+  }
+
+  @keyframes badgePop {
+    from { opacity: 0; transform: translateX(-50%) translateY(6px); }
+    to { opacity: 1; transform: translateX(-50%) translateY(0); }
+  }
+
+  /* Cards */
+  .card {
+    width: 50px; height: 72px; border-radius: 6px; position: relative;
+    transition: transform 0.4s cubic-bezier(0.34,1.56,0.64,1), opacity 0.3s;
+    flex-shrink: 0;
+  }
+  .card.big { width: 62px; height: 88px; }
+  .card-front {
+    width: 100%; height: 100%; border-radius: 6px;
+    background: linear-gradient(145deg, var(--card-white), #e8e8e0);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    box-shadow: 0 3px 12px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.7);
+    border: 1px solid rgba(255,255,255,0.25); gap: 0;
+  }
+  .card-rank {
+    font-family: 'Playfair Display', serif; font-weight: 800;
+    font-size: 16px; line-height: 1;
+  }
+  .card.big .card-rank { font-size: 20px; }
+  .card-suit { font-size: 16px; line-height: 1; }
+  .card.big .card-suit { font-size: 20px; }
+  .card-back {
+    width: 100%; height: 100%; border-radius: 6px;
+    background: repeating-conic-gradient(#1a3a5c 0% 25%, #0f2744 0% 50%) 50% / 10px 10px;
+    box-shadow: 0 3px 12px rgba(0,0,0,0.4);
+    border: 2px solid var(--gold);
+  }
+  .card-back::after {
+    content: '♠'; position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%,-50%); font-size: 16px; color: rgba(196,160,82,0.4);
+  }
+  .suit-s, .suit-c { color: #2a2a2a; }
+  .suit-h { color: var(--red); }
+  .suit-d { color: var(--blue); }
+
+  /* Controls */
+  .controls {
+    max-width: 900px; margin: 16px auto 0; display: flex;
+    flex-direction: column; align-items: center; gap: 12px;
+  }
+  .action-btns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .action-btn {
+    padding: 12px 28px; border-radius: 24px; font-size: 14px;
+    font-weight: 700; cursor: pointer; letter-spacing: 0.5px;
+    transition: all 0.15s; font-family: 'DM Sans', sans-serif; border-width: 1.5px;
+    border-style: solid;
+  }
+  .action-btn:hover { transform: scale(1.05); }
+  .action-btn:active { transform: scale(0.98); }
+  .action-btn.fold { border-color: rgba(255,77,106,0.4); background: rgba(255,77,106,0.1); color: var(--red); }
+  .action-btn.check { border-color: rgba(77,166,255,0.4); background: rgba(77,166,255,0.1); color: var(--blue); }
+  .action-btn.call { border-color: rgba(80,216,144,0.4); background: rgba(80,216,144,0.1); color: var(--green); }
+  .action-btn.raise { border-color: rgba(196,160,82,0.4); background: rgba(196,160,82,0.1); color: var(--gold-bright); }
+  .action-btn.allin { border-color: rgba(255,68,68,0.5); background: rgba(255,68,68,0.12); color: #ff6666; }
+  .action-btn.new-hand { border-color: var(--gold); background: linear-gradient(180deg, rgba(196,160,82,0.2), rgba(196,160,82,0.05)); color: var(--gold-bright); font-size: 16px; padding: 14px 44px; letter-spacing: 2px; text-transform: uppercase; font-family: 'Playfair Display', serif; }
+
+  .raise-panel {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center;
+  }
+  .raise-slider { width: 180px; accent-color: var(--gold); }
+  .raise-amount {
+    font-size: 20px; font-weight: 700; color: var(--gold-bright);
+    min-width: 50px; text-align: center; font-family: 'Playfair Display', serif;
+  }
+  .raise-preset {
+    padding: 5px 12px; border-radius: 10px; border: 1px solid rgba(196,160,82,0.3);
+    background: rgba(196,160,82,0.08); color: var(--gold); font-size: 11px;
+    cursor: pointer; font-weight: 600; font-family: 'DM Sans', sans-serif;
+    transition: all 0.15s;
+  }
+  .raise-preset:hover { background: rgba(196,160,82,0.2); }
+
+  .thinking {
+    display: flex; align-items: center; gap: 8px; color: var(--text-dim);
+    font-size: 13px; letter-spacing: 1px;
+  }
+  .thinking-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--gold);
+    animation: pulse 1s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.4); }
+  }
+
+  .message-bar {
+    text-align: center; min-height: 38px; display: flex;
+    align-items: center; justify-content: center;
+  }
+  .message {
+    display: inline-block; padding: 6px 24px; border-radius: 20px;
+    font-size: 14px; font-weight: 600; letter-spacing: 0.5px;
+    animation: badgePop 0.3s ease-out;
+  }
+  .message.win { background: rgba(80,216,144,0.12); border: 1px solid rgba(80,216,144,0.3); color: var(--green); }
+  .message.lose { background: rgba(255,77,106,0.12); border: 1px solid rgba(255,77,106,0.3); color: var(--red); }
+  .message.tie { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: var(--text); }
+  .message.info { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); color: var(--text-dim); }
+
+  /* Hand log */
+  .hand-log {
+    max-width: 900px; margin: 16px auto 0; display: flex;
+    gap: 6px; flex-wrap: wrap; justify-content: center;
+    min-height: 24px;
+  }
+  .log-entry {
+    font-size: 11px; padding: 3px 10px; border-radius: 12px;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
+    color: var(--text-dim); animation: badgePop 0.2s ease-out;
+  }
+  .log-entry .log-name { color: var(--text); font-weight: 600; }
+  .log-entry.human-log .log-name { color: var(--green); }
+  .log-entry .log-fold { color: var(--red); }
+  .log-entry .log-raise { color: var(--gold-bright); }
+
+  .equity-bar {
+    font-size: 11px; color: var(--text-dim); letter-spacing: 1px; text-align: center;
+  }
+
+  .back-btn {
+    position: fixed; top: 16px; left: 16px; padding: 8px 16px;
+    border-radius: 8px; border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(0,0,0,0.4); color: var(--text-dim);
+    font-size: 12px; cursor: pointer; z-index: 100;
+    font-family: 'DM Sans', sans-serif; transition: all 0.2s;
+  }
+  .back-btn:hover { border-color: var(--gold); color: var(--text); }
+</style>
+</head>
+<body>
+
+<!-- ════════ LOBBY ════════ -->
+<div id="lobby">
+  <div class="lobby-title">♠ Poker AI v4</div>
+  <div class="lobby-subtitle">Play against your trained model</div>
+  <div class="lobby-card">
+    <div id="lobbyContent">
+      <div style="text-align:center;color:var(--text-dim)">Modellek betöltése...</div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════ GAME ════════ -->
+<div id="game">
+  <button class="back-btn" onclick="backToLobby()">← Lobby</button>
+  <div class="game-header">
+    <div class="game-header-stat" id="headerLeft">HAND #0</div>
+    <div class="game-header-title" id="headerTitle">POKER AI v4</div>
+    <div class="game-header-stat" id="headerRight">W/L: 0/0</div>
+  </div>
+
+  <div class="table-container" id="tableContainer">
+    <div class="table-felt"></div>
+    <div class="board-area" id="boardArea">
+      <div class="pot-display" id="potDisplay" style="display:none">
+        <span class="pot-label">POT</span>
+        <span class="pot-value" id="potValue">0</span>
+      </div>
+      <div class="board-cards" id="boardCards"></div>
+    </div>
+    <div id="seats"></div>
+  </div>
+
+  <div class="message-bar" id="messageBar"></div>
+
+  <div class="controls" id="controls"></div>
+
+  <div class="hand-log" id="handLog"></div>
+
+  <div class="equity-bar" id="equityBar"></div>
+</div>
+
+<script>
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let state = {
+  models: [],
+  selectedModel: null,
+  numPlayers: 6,
+  humanSeat: 0,
+  bb: 2, sb: 1, stack: 100,
+  gameActive: false,
+  currentState: null,
+  raiseMode: false,
+  raiseAmount: 4,
+  waitingForAI: false,
+};
+
+// ─── API ─────────────────────────────────────────────────────────────────────
+async function api(path, body = null, method = null) {
+  const usePost = method === 'POST' || body !== null;
+  const opts = usePost
+    ? { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body || {}) }
+    : { method: 'GET' };
+  try {
+    const res = await fetch('/api/' + path, opts);
+    const data = await res.json();
+    if (data.error) console.error('API error:', data.error);
+    return data;
+  } catch (e) {
+    console.error('API fetch error:', e);
+    return { error: e.message };
+  }
+}
+
+// ─── LOBBY ───────────────────────────────────────────────────────────────────
+async function initLobby() {
+  const data = await api('models');
+  state.models = data.models || [];
+  renderLobby();
+}
+
+function renderLobby() {
+  const el = document.getElementById('lobbyContent');
+  if (!state.models.length) {
+    el.innerHTML = `<div class="no-models">
+      <p style="font-size:24px;margin-bottom:12px">⚠</p>
+      <p>Nem találtam .pth modell fájlt!</p>
+      <p style="margin-top:8px;font-size:13px;color:var(--text-dim)">
+        Másold a kitrénelt modelleket a projekt mappába, majd frissítsd az oldalt.
+      </p>
+    </div>`;
+    return;
+  }
+
+  let html = `
+    <div class="field-group">
+      <div class="field-label">Modell kiválasztása</div>
+      <select id="modelSelect" onchange="onModelChange()">
+        ${state.models.map((m,i) => `<option value="${i}">
+          ${m.filename} — ${(m.episodes||0).toLocaleString()} ep${m.guessed_players ? ` (${m.guessed_players}p)` : ''}
+        </option>`).join('')}
+      </select>
+      <div class="model-meta" id="modelMeta"></div>
+    </div>
+
+    <div class="field-group">
+      <div class="field-label">Játékosok száma</div>
+      <div class="seat-grid" id="playerCountGrid"></div>
+    </div>
+
+    <div class="field-group">
+      <div class="field-label">A te széked (0 = UTG/SB)</div>
+      <div class="seat-grid" id="seatGrid"></div>
+    </div>
+
+    <div class="inline-fields">
+      <div class="field-group">
+        <div class="field-label">Big Blind</div>
+        <input type="number" id="bbInput" value="${state.bb}" min="1" max="100" onchange="state.bb=+this.value">
+      </div>
+      <div class="field-group">
+        <div class="field-label">Small Blind</div>
+        <input type="number" id="sbInput" value="${state.sb}" min="0.5" max="50" step="0.5" onchange="state.sb=+this.value">
+      </div>
+      <div class="field-group">
+        <div class="field-label">Stack</div>
+        <input type="number" id="stackInput" value="${state.stack}" min="10" max="10000" onchange="state.stack=+this.value">
+      </div>
+    </div>
+
+    <button class="start-btn" id="startBtn" onclick="startGame()">Játék indítása</button>
+  `;
+  el.innerHTML = html;
+
+  onModelChange();
+  renderPlayerCount();
+  renderSeatGrid();
+}
+
+function onModelChange() {
+  const idx = document.getElementById('modelSelect')?.value || 0;
+  state.selectedModel = state.models[idx];
+  const m = state.selectedModel;
+  const meta = document.getElementById('modelMeta');
+  if (meta && m) {
+    meta.textContent = `${m.algorithm} | state_size=${m.state_size} | ${m.guessed_players ? m.guessed_players + ' játékos' : 'ismeretlen méret'}`;
+    if (m.guessed_players) {
+      state.numPlayers = m.guessed_players;
+      renderPlayerCount();
+      renderSeatGrid();
+    }
+  }
+}
+
+function renderPlayerCount() {
+  const grid = document.getElementById('playerCountGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (let n = 2; n <= 9; n++) {
+    const btn = document.createElement('button');
+    btn.className = 'seat-btn' + (n === state.numPlayers ? ' active' : '');
+    btn.textContent = n === 2 ? '2 (HU)' : n === 6 ? '6 (6max)' : n === 9 ? '9 (Full)' : n + '';
+    btn.onclick = () => { state.numPlayers = n; state.humanSeat = Math.min(state.humanSeat, n-1); renderPlayerCount(); renderSeatGrid(); };
+    grid.appendChild(btn);
+  }
+}
+
+function renderSeatGrid() {
+  const grid = document.getElementById('seatGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (let s = 0; s < state.numPlayers; s++) {
+    const btn = document.createElement('button');
+    btn.className = 'seat-btn' + (s === state.humanSeat ? ' active' : '');
+    btn.textContent = `Szék ${s}`;
+    btn.onclick = () => { state.humanSeat = s; renderSeatGrid(); };
+    grid.appendChild(btn);
+  }
+}
+
+async function startGame() {
+  const btn = document.getElementById('startBtn');
+  btn.disabled = true; btn.textContent = 'Betöltés...';
+  try {
+    const res = await api('start', {
+      model_path: state.selectedModel.path,
+      num_players: state.numPlayers,
+      human_seat: state.humanSeat,
+      bb: state.bb, sb: state.sb, stack: state.stack,
+    });
+    if (res.error) { alert('Hiba: ' + res.error); btn.disabled = false; btn.textContent = 'Játék indítása'; return; }
+
+    state.gameActive = true;
+    document.getElementById('lobby').style.display = 'none';
+    document.getElementById('game').style.display = 'block';
+    dealNewHand();
+  } catch (e) {
+    alert('Szerver hiba: ' + e.message);
+    btn.disabled = false; btn.textContent = 'Játék indítása';
+  }
+}
+
+function backToLobby() {
+  state.gameActive = false;
+  document.getElementById('game').style.display = 'none';
+  document.getElementById('lobby').style.display = 'flex';
+  initLobby();
+}
+
+// ─── GAME ────────────────────────────────────────────────────────────────────
+
+async function dealNewHand() {
+  state.raiseMode = false;
+  state.waitingForAI = true;
+  renderControls();
+  showMessage('Osztás...', 'info');
+
+  const res = await api('new_hand', {});
+  if (res.error) {
+    state.waitingForAI = false;
+    showMessage('Hiba: ' + res.error, 'lose');
+    renderNewHandBtn();
+    return;
+  }
+  state.currentState = res;
+  state.waitingForAI = false;
+  renderFullState();
+}
+
+async function doAction(abstractAction) {
+  state.waitingForAI = true;
+  state.raiseMode = false;
+  renderControls();
+
+  const res = await api('action', { action: abstractAction });
+  if (res.error) {
+    state.waitingForAI = false;
+    showMessage('Hiba: ' + res.error, 'lose');
+    renderNewHandBtn();
+    return;
+  }
+  state.currentState = res;
+  state.waitingForAI = false;
+  renderFullState();
+}
+
+// ─── RENDERING ───────────────────────────────────────────────────────────────
+
+function renderFullState() {
+  const s = state.currentState;
+  if (!s) return;
+
+  renderHeader(s);
+  renderSeats(s);
+  renderBoard(s);
+  renderPot(s);
+  renderHandLog(s);
+  renderEquity(s);
+
+  if (s.is_over) {
+    renderResult(s);
+  } else if (s.current_player === s.human_seat) {
+    clearMessage();
+    renderControls(s);
+  } else {
+    showMessage('AI gondolkodik...', 'info');
+    renderControls();
+  }
+}
+
+function renderHeader(s) {
+  const r = s.total_results || {};
+  document.getElementById('headerLeft').textContent = `HAND #${s.hand_num || 0}`;
+  document.getElementById('headerTitle').textContent =
+    `${s.num_players} PLAYER — ${state.selectedModel?.filename || 'AI'}`;
+  document.getElementById('headerRight').textContent =
+    `W: ${r.player || 0}  L: ${r.ai || 0}`;
+}
+
+function getSeatPos(seatIndex, numPlayers, humanSeat) {
+  const rel = (seatIndex - humanSeat + numPlayers) % numPlayers;
+  const angle = rel * 2 * Math.PI / numPlayers;
+  return {
+    x: 50 + 39 * Math.sin(angle),
+    y: 52 + 34 * Math.cos(angle),
+  };
+}
+
+function getBetPos(seatIndex, numPlayers, humanSeat) {
+  const rel = (seatIndex - humanSeat + numPlayers) % numPlayers;
+  const angle = rel * 2 * Math.PI / numPlayers;
+  return {
+    x: 50 + 22 * Math.sin(angle),
+    y: 52 + 19 * Math.cos(angle),
+  };
+}
+
+function renderSeats(s) {
+  const container = document.getElementById('seats');
+  container.innerHTML = '';
+
+  s.players.forEach(p => {
+    const pos = getSeatPos(p.seat, s.num_players, s.human_seat);
+    const isActive = !s.is_over && s.current_player === p.seat;
+    const isFolded = p.status === 'folded';
+    const isHuman = p.is_human;
+
+    const seatEl = document.createElement('div');
+    seatEl.className = `seat${isActive ? ' active-turn' : ''}${isHuman ? ' human' : ''}${isFolded ? ' folded' : ''}`;
+    seatEl.style.cssText = `left:${pos.x}%;top:${pos.y}%`;
+
+    // Cards
+    const cardsHtml = renderSeatCards(p, isHuman);
+
+    // Last action badge
+    const lastLog = (s.hand_log || []).filter(l => l.player === p.seat).pop();
+    let badge = '';
+    if (lastLog) {
+      const cls = lastLog.action === 0 ? 'log-fold' : (lastLog.action >= 2 ? 'log-raise' : '');
+      badge = `<div class="seat-action-badge" style="background:rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.1);color:${lastLog.action===0?'var(--red)':lastLog.action>=2?'var(--gold-bright)':'var(--text-dim)'}">
+        ${lastLog.action_name}
+      </div>`;
+    }
+
+    seatEl.innerHTML = `
+      ${badge}
+      <div class="seat-cards">${cardsHtml}</div>
+      <div class="seat-info">
+        <div class="seat-name ${isHuman?'human-name':''}">${p.name}</div>
+        <div class="seat-stack">${p.stack?.toFixed?.(0) ?? '?'}</div>
+      </div>
+    `;
+    container.appendChild(seatEl);
+
+    // Bet badge near center
+    if (p.chips_in_pot > 0) {
+      const betPos = getBetPos(p.seat, s.num_players, s.human_seat);
+      const betEl = document.createElement('div');
+      betEl.className = 'seat-bet-badge';
+      betEl.style.cssText = `position:absolute;left:${betPos.x}%;top:${betPos.y}%;transform:translate(-50%,-50%);z-index:8`;
+      betEl.textContent = p.chips_in_pot.toFixed(0);
+      container.appendChild(betEl);
+    }
+  });
+}
+
+function renderSeatCards(player, isHuman) {
+  if (player.cards && player.cards.length) {
+    return player.cards.map(c => makeCardHTML(c, isHuman)).join('');
+  }
+  if (player.status === 'folded') return '';
+  // Face-down cards
+  return `<div class="card"><div class="card-back"></div></div>`.repeat(2);
+}
+
+function makeCardHTML(cardObj, big = false) {
+  if (!cardObj) return '';
+  return `<div class="card${big?' big':''}">
+    <div class="card-front suit-${cardObj.suit}">
+      <span class="card-rank">${cardObj.rank}</span>
+      <span class="card-suit">${{'s':'♠','h':'♥','d':'♦','c':'♣'}[cardObj.suit]||'?'}</span>
+    </div>
+  </div>`;
+}
+
+function renderBoard(s) {
+  const el = document.getElementById('boardCards');
+  el.innerHTML = (s.board || []).map(c => makeCardHTML(c, true)).join('');
+}
+
+function renderPot(s) {
+  const el = document.getElementById('potDisplay');
+  if (s.pot > 0) {
+    el.style.display = 'flex';
+    document.getElementById('potValue').textContent = s.pot.toFixed(0);
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function renderHandLog(s) {
+  const el = document.getElementById('handLog');
+  el.innerHTML = (s.hand_log || []).map(l => {
+    const isHuman = l.player === s.human_seat;
+    const streetNames = ['Pre','Flop','Turn','River'];
+    const actionCls = l.action === 0 ? 'log-fold' : (l.action >= 2 ? 'log-raise' : '');
+    return `<div class="log-entry${isHuman ? ' human-log' : ''}">
+      <span class="log-name">${l.player_name}</span>
+      <span class="${actionCls}">${l.action_name}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderEquity(s) {
+  const el = document.getElementById('equityBar');
+  if (s.equity != null && !s.is_over) {
+    el.textContent = `${s.street_name} | Equity: ~${(s.equity*100).toFixed(0)}%`;
+  } else {
+    el.textContent = '';
+  }
+}
+
+function renderResult(s) {
+  if (!s.payoffs) { showMessage('Kéz vége', 'info'); renderNewHandBtn(); return; }
+  const humanPayoff = s.payoffs[s.human_seat] || 0;
+  if (humanPayoff > 0) {
+    showMessage(`Nyertél! +${humanPayoff.toFixed(1)}`, 'win');
+  } else if (humanPayoff < 0) {
+    showMessage(`Vesztettél: ${humanPayoff.toFixed(1)}`, 'lose');
+  } else {
+    showMessage('Döntetlen', 'tie');
+  }
+  renderNewHandBtn();
+}
+
+function renderNewHandBtn() {
+  const el = document.getElementById('controls');
+  el.innerHTML = `<div class="action-btns">
+    <button class="action-btn new-hand" onclick="dealNewHand()">Következő Kéz</button>
+  </div>`;
+}
+
+function renderControls(s) {
+  const el = document.getElementById('controls');
+  if (!s || state.waitingForAI) {
+    if (state.waitingForAI) {
+      el.innerHTML = `<div class="thinking"><div class="thinking-dot"></div>AI gondolkodik...</div>`;
+    } else {
+      el.innerHTML = '';
+    }
+    return;
+  }
+
+  if (s.is_over || s.current_player !== s.human_seat) { el.innerHTML = ''; return; }
+
+  const legal = s.legal_actions || [];
+  const names = s.legal_action_names || {};
+  const callAmt = s.call_amount || 0;
+  const canCheck = legal.includes(1) && callAmt < 0.01;
+  const canCall = legal.includes(1) && callAmt >= 0.01;
+  const canFold = legal.includes(0);
+  const canRaise = legal.some(a => a >= 2);
+
+  if (state.raiseMode && canRaise) {
+    const pot = s.pot || 1;
+    const minR = Math.max(callAmt + state.bb, state.bb * 2);
+    const humanStack = s.players?.find(p => p.is_human)?.stack || 100;
+    const maxR = humanStack;
+    if (state.raiseAmount < minR) state.raiseAmount = Math.round(minR);
+
+    el.innerHTML = `<div class="raise-panel">
+      <input type="range" class="raise-slider" min="${Math.round(minR)}" max="${Math.round(maxR)}" step="1"
+             value="${state.raiseAmount}" oninput="state.raiseAmount=+this.value;document.getElementById('raiseVal').textContent=this.value">
+      <div class="raise-amount" id="raiseVal">${state.raiseAmount}</div>
+      <button class="raise-preset" onclick="setRaise(${Math.round(pot*0.33+callAmt)})">33%</button>
+      <button class="raise-preset" onclick="setRaise(${Math.round(pot*0.5+callAmt)})">50%</button>
+      <button class="raise-preset" onclick="setRaise(${Math.round(pot*0.75+callAmt)})">75%</button>
+      <button class="raise-preset" onclick="setRaise(${Math.round(pot+callAmt)})">Pot</button>
+      <button class="action-btn raise" onclick="executeRaise()">Raise ${state.raiseAmount}</button>
+      <button class="action-btn check" onclick="state.raiseMode=false;renderControls(state.currentState)" style="padding:10px 16px;font-size:12px">Mégse</button>
+    </div>`;
+    return;
+  }
+
+  let btns = '';
+  if (canFold) btns += `<button class="action-btn fold" onclick="doAction(0)">Fold</button>`;
+  if (canCheck) btns += `<button class="action-btn check" onclick="doAction(1)">Check</button>`;
+  if (canCall) btns += `<button class="action-btn call" onclick="doAction(1)">Call ${callAmt.toFixed(0)}</button>`;
+  if (canRaise) {
+    btns += `<button class="action-btn raise" onclick="state.raiseMode=true;renderControls(state.currentState)">Raise</button>`;
+    // Quick raise buttons for common sizes
+    const pot = s.pot || 1;
+    const humanStack = s.players?.find(p => p.is_human)?.stack || 100;
+    btns += `<button class="action-btn allin" onclick="doAllin()">All-In (${humanStack.toFixed(0)})</button>`;
+  }
+
+  el.innerHTML = `<div class="action-btns">${btns}</div>`;
+}
+
+function setRaise(val) {
+  const s = state.currentState;
+  const humanStack = s?.players?.find(p => p.is_human)?.stack || 100;
+  const callAmt = s?.call_amount || 0;
+  const minR = Math.max(callAmt + state.bb, state.bb * 2);
+  state.raiseAmount = Math.max(Math.round(minR), Math.min(Math.round(val), Math.round(humanStack)));
+  renderControls(state.currentState);
+}
+
+function executeRaise() {
+  // Map raise amount to abstract action tier (2-6)
+  const s = state.currentState;
+  const pot = s?.pot || 1;
+  const callAmt = s?.call_amount || 0;
+  const humanStack = s?.players?.find(p => p.is_human)?.stack || 100;
+  const ratio = (state.raiseAmount - callAmt) / Math.max(pot, 1);
+
+  // Map to tier
+  let tier;
+  if (state.raiseAmount >= humanStack * 0.95) tier = 6; // all-in
+  else if (ratio >= 0.85) tier = 6;
+  else if (ratio >= 0.6) tier = 5;
+  else if (ratio >= 0.4) tier = 4;
+  else if (ratio >= 0.2) tier = 3;
+  else tier = 2;
+
+  doAction(tier);
+}
+
+function doAllin() {
+  doAction(6);
+}
+
+function showMessage(text, type = 'info') {
+  document.getElementById('messageBar').innerHTML = `<div class="message ${type}">${text}</div>`;
+}
+function clearMessage() {
+  document.getElementById('messageBar').innerHTML = '';
+}
+
+// ─── INIT ────────────────────────────────────────────────────────────────────
+initLobby();
+</script>
+
+</body>
+</html>
