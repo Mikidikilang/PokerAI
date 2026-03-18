@@ -1,0 +1,82 @@
+"""
+training/buffer.py  –  PPO élmény buffer GAE számítással
+
+Változatlan v3.1 óta. A GAE (Generalized Advantage Estimation)
+implementáció helyes és tesztelt.
+
+GAE képlet:
+  delta_t   = r_t + γ·V(s_{t+1})·(1-done_t) - V(s_t)
+  A_t       = Σ_{k=0}^{T} (γλ)^k · delta_{t+k}
+  returns_t = A_t + V(s_t)
+"""
+
+import torch
+import numpy as np
+
+
+class PPOBuffer:
+    """
+    Egyszeri gyűjtési ciklus buffere.
+    reset() minden PPO update után!
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.states        = []
+        self.legal_actions = []
+        self.actions       = []
+        self.log_probs     = []
+        self.values        = []
+        self.rewards       = []
+        self.episode_ends  = []
+
+    def add(self, state, legal_actions, action, log_prob,
+            value, reward, episode_end):
+        """
+        Egy lépés hozzáadása.
+        state: (state_size,) CPU tensor (squeeze(0) után!)
+        """
+        self.states.append(state.squeeze(0).detach().cpu())
+        self.legal_actions.append(legal_actions)
+        self.actions.append(action.detach().cpu().squeeze())
+        self.log_probs.append(log_prob.detach().cpu().squeeze())
+        self.values.append(value.detach().cpu().squeeze().float())
+        self.rewards.append(float(reward))
+        self.episode_ends.append(bool(episode_end))
+
+    def compute_gae(self, gamma: float = 0.99,
+                    lam: float = 0.95):
+        """
+        GAE advantages és returns számítása.
+        Visszatér: (advantages, returns) – mind (N,) float32 tensor
+        """
+        n = len(self.rewards)
+        if n == 0:
+            return torch.zeros(0), torch.zeros(0)
+
+        rewards    = torch.tensor(self.rewards,      dtype=torch.float32)
+        dones      = torch.tensor(self.episode_ends, dtype=torch.float32)
+        values     = torch.stack(self.values).float()
+
+        advantages = torch.zeros(n, dtype=torch.float32)
+        last_gae   = 0.0
+
+        for t in reversed(range(n)):
+            not_done = 1.0 - float(dones[t])
+            nv       = float(values[t + 1]) if t + 1 < n else 0.0
+            delta    = (float(rewards[t])
+                        + gamma * nv * not_done
+                        - float(values[t]))
+            last_gae = delta + gamma * lam * not_done * last_gae
+            advantages[t] = last_gae
+
+        returns = advantages + values
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) \
+                         / (advantages.std() + 1e-8)
+        return advantages, returns
+
+    def __len__(self):
+        return len(self.states)

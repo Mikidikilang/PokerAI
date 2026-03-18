@@ -1,0 +1,492 @@
+================================================================================
+POKER AI v4 – MASTER NOTES
+Minden ami a v4 fejlesztéséhez kell. Ez az "agy" – mindig ebből dolgozz!
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. VERZIÓTÖRTÉNET – TANULSÁGOK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+v3.2: LSTM + PPO → HIBÁS. LSTM hidden state-tel döntött gyűjtéskor,
+      de nullázott state-tel számolt PPO update-nél (new_lp).
+      → PPO ratio szisztematikusan torzított. Lassú, instabil tanulás.
+
+v3.3: LSTM → 2× TemporalBlock (feedforward). Korrekt PPO ratio.
+      ~20% gyorsabb PPO update, ~15% gyorsabb gyűjtés.
+      STATE_SIZE: 72 + 42 + 4 = 118 (6 player)
+
+v3.4: + Action History Vector (336 dim) + Position Encoding (12 dim)
+      STATE_SIZE: 118 + 336 + 12 = 466 (6 player)
+      CHECKPOINT INKOMPATIBILIS v3.3-mal.
+      BUG: build_state_tensor() placeholder position encodinggal volt kiadva,
+           build_state_tensor_with_position() a valódi implementáció.
+      BUG: _step_learners_batched() kétszer hívja _encode()-ot:
+           logits_batch = model.actor_head(model._encode(states_batch))
+           values_batch = model.critic_head(model._encode(states_batch))
+           → dupla forward pass! v4-ben javítani kell.
+
+v4 (ÚJ): BB/SB explicit paraméter, M-ratio, street, board texture,
+          pot odds, VPIP/PFR/AF stats, bet sizing history, hand equity.
+          Teljesen modularizált.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. MODELL ARCHITEKTÚRA (ai_model.py → core/model.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AdvancedPokerAI:
+  input → LayerNorm → Linear(state_size → hidden_size=512)
+        → 4× ResidualBlock (Pre-LN + GELU, expansion=2, dropout=0.05)
+        → 2× TemporalBlock (Pre-LN + GELU, dropout=0.05)
+        → Actor head:  LN → Linear(512→256) → GELU → Linear(256→7)
+        → Critic head: LN → Linear(512→256) → GELU → Linear(256→1)
+
+ResidualBlock:
+  LayerNorm → Linear(h→h*2) → GELU → Dropout → Linear(h*2→h) + skip
+
+TemporalBlock:
+  LayerNorm → Linear(h→h) → GELU → Dropout → Linear(h→h) + skip
+
+Weight init:
+  - orthogonal(gain=sqrt(2)) minden weight dim>=2
+  - orthogonal(gain=0.01) actor head utolsó réteg
+  - orthogonal(gain=1.0) critic head utolsó réteg
+  - zeros bias mindenütt
+
+API:
+  forward(state, legal_actions, hidden_state=None)
+    → (action_probs, value, None)
+  get_action(state, legal_actions, hidden_state=None, deterministic=False)
+    → (action, log_prob, entropy, value, None)
+  evaluate_actions(states, legal_actions_batch, actions)
+    → (log_probs, entropies, values)
+  _encode(state) → hidden tensor (INTERNAL)
+
+FONTOS: hidden_state paraméter csak backward compat, mindig None-t ad vissza.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. AKCIÓ ABSZTRAKCIÓ (core/action_mapper.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+7 absztrakt akció:
+  0 = Fold
+  1 = Call / Check
+  2 = Raise tier 0 (min raise / 25% fraction)
+  3 = Raise tier 1 (33% fraction)
+  4 = Raise tier 2 (50% fraction)  ← pot mérethez viszonyítva
+  5 = Raise tier 3 (75% fraction)
+  6 = Raise tier 4 (100% = pot bet / all-in)
+
+get_abstract_legal_actions(raw_legal_actions):
+  - 0 in raw → abstract 0 (fold)
+  - 1 in raw → abstract 1 (call/check)
+  - bármely a>1 in raw → abstract 2,3,4,5,6 (raise szintek)
+  - fallback: [0] ha üres
+
+get_env_action(abstract_action, raw_legal_actions):
+  - fold/call direkt map
+  - raise: raise_actions = sorted(a for a in raw if a > 1)
+    fractions = [0.0, 0.25, 0.50, 0.75, 1.0]
+    target = min + (max-min)*frac
+    closest raise action
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. FEATURE ENGINEERING – TELJES v4 SPEC (core/features.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATE VEKTOR ÖSSZETÉTELE (6 player példán):
+
+  [1] rlcard base obs          → dinamikus (72 @ 6p, 50 @ 2p, ~100 @ 9p)
+                                  → BB-normált értékek ahol lehetséges
+  [2] OpponentHUD stats        → num_players × 7 dim = 42
+                                  (VPIP, PFR, AF, 3bet%, fold_to_3bet,
+                                   cbet%, fold_to_cbet per player)
+                                  RÉGEN: nyers action count – VÁLTOZIK!
+  [3] Stack & blind features   → 8 dim
+                                  spr, m_ratio, blind_ratio, active_ratio,
+                                  depth_deep, depth_mid, depth_short, depth_push
+  [4] Street context           → 4 dim (one-hot: preflop/flop/turn/river)
+  [5] Pot odds & bet context   → 4 dim
+                                  pot_odds_norm, call_amount_bb, is_facing_bet,
+                                  facing_bet_size_pot_pct
+  [6] Board texture            → 6 dim
+                                  is_paired, is_monotone, is_two_tone,
+                                  max_connectedness, high_card_norm, num_board_cards_norm
+  [7] Action history vector    → ACTION_HISTORY_LENGTH(8) × (num_players×7 + 1) dim
+                                  one-hot(player,action) + bet_size_norm per akció
+                                  RÉGEN: bet_size nem volt benne – VÁLTOZIK!
+  [8] Position encoding        → 2 × num_players dim
+                                  button_one_hot + relative_position_one_hot
+
+ÖSSZESEN @ 6 player:
+  72 + 42 + 8 + 4 + 4 + 6 + 8×(42+1) + 12
+  = 72 + 42 + 8 + 4 + 4 + 6 + 344 + 12
+  = 492 dim
+
+Konst: STATE_SIZE automatikusan számolódik run_training_session()-ban.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. OPPONENT HUD TRACKER (core/opponent_tracker.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RÉGI (v3.x): nyers action count → frequency vector
+  → 7 dim per player (action 0-6 frekvenciája)
+  PROBLÉMA: nem ad igazi poker statisztikákat
+
+ÚJ (v4): valódi HUD statisztikák per player
+  VPIP  = preflop call/raise / preflop opportunities
+  PFR   = preflop raise / preflop opportunities
+  AF    = (bet+raise) / call (aggression factor)
+  3bet% = 3bet / 3bet_opportunity
+  fold_to_3bet% = fold when facing 3bet / times faced 3bet
+  cbet% = continuation bet flop / flop seen as preflop aggressor
+  fold_to_cbet% = fold to cbet / times faced cbet
+
+  Per player: 7 stat × num_players dim
+  memory_length = 1000 action (rolling window)
+  Cold start: 0.5 (neutral prior) – nem 0!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ACTION HISTORY ENCODER (core/features.py-ban)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RÉGI: deque((player_id, action)) → one-hot(player_id × num_actions) per slot
+ÚJ:   deque((player_id, action, bet_size_norm)) → one-hot + float per slot
+      bet_size_norm = bet_amount / pot_size (0 ha nem bet/raise)
+      dim per slot = num_players × num_actions + 1 = 42 + 1 = 43 @ 6p
+      total = 8 × 43 = 344 dim
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. BOARD TEXTURE FEATURES (core/features.py-ban)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Input: raw_obs['public_cards'] → list of card strings pl. ['Ah', 'Kd', '2c']
+  is_paired          = 1.0 ha bármely két lap azonos rank
+  is_monotone        = 1.0 ha mind azonos suit
+  is_two_tone        = 1.0 ha pontosan 2 suit
+  max_connectedness  = max gap nélküli szekvencia hossz / 5 (normált)
+  high_card_norm     = max(ranks) / 14.0 (Ace=14)
+  num_board_cards_norm = len(board) / 5.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. HAND EQUITY (core/equity.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Monte Carlo equity becslés.
+Input: hole_cards (2 lap), board_cards (0-5 lap), num_opponents, n_sim=200
+Output: equity float 0.0–1.0
+
+Implementáció: egyszerű MC, nem igényel külső library-t.
+  - Random board completion
+  - Hand strength comparison (rank-based)
+  - n_sim iteráció, win_count/n_sim
+
+Cache: LRU cache (hand_key → equity) a repeated states gyorsításához.
+Ha az rlcard nem adja a hole_cards-ot közvetlenül:
+  → raw_obs['hand'] tartalmazza, parse kell.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. PPO BUFFER (training/buffer.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+VÁLTOZATLAN v3.4-hez képest:
+  add(state, legal_actions, action, log_prob, value, reward, episode_end)
+  compute_gae(gamma=0.99, lam=0.95) → (advantages, returns)
+    GAE: Generalized Advantage Estimation
+    delta_t = r_t + γ*V(s_{t+1})*(1-done) - V(s_t)
+    A_t = sum_{k=0}^{T} (γλ)^k * delta_{t+k}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. PPO TRAINER (training/trainer.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CLIP_EPS      = 0.2
+PPO_EPOCHS    = 8
+MINIBATCH     = 256
+VALUE_COEF    = 0.5
+ENTROPY_COEF  = 0.02  (→ 0.002 lineáris decay 50M update alatt)
+MAX_GRAD_NORM = 0.5
+GAMMA         = 0.99
+GAE_LAM       = 0.95
+
+Optimizer: Adam(lr=3e-4, eps=1e-5)
+Scheduler: StepLR(step_size=1_000_000, gamma=0.7)
+AMP: torch.amp.autocast + GradScaler (csak CUDA)
+
+Loss = actor_loss + 0.5*critic_loss + entropy_coef*entropy_loss
+  actor_loss  = -min(ratio*adv, clip(ratio,1±ε)*adv).mean()
+  critic_loss = huber_loss(new_val, returns)
+  entropy_loss = -entropy.mean()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. REWARD NORMALIZÁLÁS (training/normalizer.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RunningMeanStd: Welford online algoritmus
+  update(x): count++, delta=x-mean, mean+=delta/count, M2+=delta*(x-mean)
+  var = M2/(count-1) ha count>1 else 1.0
+  normalize(x) = clip((x-mean)/(sqrt(var)+eps), -10, 10)
+
+ÚJ v4: reward = payoffs[0] / bb  → BB-ben mérve!
+  Indok: 100BB stackkel és 500BB stackkel játszott kezek összehasonlítható.
+  A normalizáló ERRE a BB-ban mért értékre fut.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. OPPONENT POOL / SELF-PLAY (training/opponent_pool.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POOL_SIZE = 15 (deque, maxlen)
+SNAPSHOT_INTERVAL = 1000 epizód
+
+snapshot(model): deepcopy state_dict → CPU, eval mode
+get_opponent(current_model):
+  50% valószínűséggel: current_model (self-play)
+  50%: random pool tag
+
+Indok: ha csak régi modell ellen játszik → túl könnyű ellenfél.
+       Ha csak magával → instabil, ciklikus stratégiák.
+       50/50 mix → stabil konvergencia.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. BATCHED SYNC COLLECTOR (training/collector.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NUM_ENVS = 256 (benchmark alapján optimális)
+MAX_STEPS_PER_HAND = 500
+
+Per-env state:
+  _states[i]          → aktuális rlcard state dict
+  _players[i]         → aktuális játékos ID
+  _trackers[i]        → OpponentHUDTracker instance
+  _steps[i]           → trajectory buffer (state,legal,action,lp,val)
+  _opp_models[i]      → pool-ból kiválasztott ellenfél modell
+  _step_cnt[i]        → lépésszámláló (végtelen loop védelem)
+  _active[i]          → bool, fut-e az env
+  _action_histories[i]→ deque(maxlen=8), (player,action,bet_size_norm)
+  _history_encoder    → ActionHistoryEncoder instance (shared)
+  _bb[i]              → aktuális BB érték per env (v4 ÚJ!)
+  _sb[i]              → aktuális SB érték per env (v4 ÚJ!)
+  _initial_stack[i]   → aktuális stack per env   (v4 ÚJ!)
+
+collect(n_episodes):
+  loop:
+    _step_opponents()       → ellenfél lépések CPU-n
+    _step_learners_batched()→ batch GPU forward + lépés
+    _collect_done_envs()    → kész epizódok kinyerése, reset
+
+_step_opponents():
+  while current_player != learner(0) and not done:
+    build_state_tensor() → opp forward → action → env.step()
+    history.append((player, action, bet_size_norm))
+    tracker.record_action(player, action, context)
+
+_step_learners_batched():
+  JAVÍTÁS v3.4 bughoz: egyetlen _encode() call!
+    x = model._encode(states_batch)
+    logits = model.actor_head(x)
+    values = model.critic_head(x)
+  history.append((0, action, bet_size_norm))
+  steps.append(state_BEFORE_action, ...)  ← state t előtt, nem utána!
+
+_reset_env(i):
+  v4 ÚJ: BB/SB/stack randomizálás reset-kor!
+    bb = random.choice([1,2,5,10,25])
+    sb = bb // 2
+    stack = bb * random.choice([20,30,40,60,80,100,150,200])
+  action_history.clear()
+  tracker.reset() vagy new instance
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. REALTIME ASSISTANT (inference/realtime_assistant.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RealtimePokerAssistant:
+  __init__(model_path, num_players=6, device='cpu')
+    → betölti a modellt checkpoint-ból
+    → inicializálja tracker-t, history encoder-t
+
+  set_game_context(bb, sb, my_stack, all_stacks, my_player_id, button_pos)
+    → beállítja az aktuális játék kontextusát
+    → visszaállítja history-t és tracker-t
+
+  get_recommendation(obs_dict, legal_actions)
+    → összerakja a state vektort
+    → modell forward (deterministic=False, de top-3 prob visszaad)
+    → visszatér:
+        action_name: str ('Fold'/'Call'/'Raise X BB')
+        confidence: float (max prob)
+        top3: [(action_name, prob), ...]
+        spr: float
+        m_ratio: float
+        equity: float (ha elérhető)
+        explanation: str (rövid szöveges magyarázat)
+
+  record_opponent_action(player_id, action_type, bet_amount=0.0)
+    → history és tracker frissítése
+
+  record_my_action(action_type, bet_amount=0.0)
+    → history frissítése
+
+  new_hand()
+    → history clear, tracker reset NEM (megőrzi az ellenfél statokat!)
+    → street reset
+
+  new_street()
+    → street counter frissítése
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15. TRAINING RUNNER (training/runner.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+run_training_session(num_players, filename, episodes_to_run):
+  1. STATE_SIZE kalkuláció (temp env-ből rlcard obs méret)
+  2. Model + Buffer + Trainer + Pool + Collector inicializálás
+  3. Checkpoint betöltés (részleges is OK, input_proj-nél figyelem!)
+  4. TensorBoard setup
+  5. Fő loop:
+     while collected < target:
+       collector.collect(BUFFER_COLLECT_SIZE=1024)
+       trainer.update(buffer)
+       log + checkpoint 1000 epizódonként
+
+BUFFER_COLLECT_SIZE = 1024 (4 × NUM_ENVS)
+HIDDEN_SIZE = 512
+LEARNING_RATE = 3e-4
+CHECKPOINT: state_dict + episodes_trained + time_spent + algorithm +
+            state_size + action_size + bb_config (v4 ÚJ!)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+16. KÖNYVTÁR STRUKTÚRA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+poker_ai_v4/
+├── NOTES_MASTER.txt          ← ez a fájl
+├── README.md                 ← telepítés, használat
+├── requirements.txt          ← rlcard, torch, numpy, tensorboard
+├── train.py                  ← belépési pont (volt: train_full_game.py)
+│
+├── core/                     ← platform-független logika
+│   ├── __init__.py
+│   ├── model.py              ← AdvancedPokerAI (volt: ai_model.py)
+│   ├── action_mapper.py      ← PokerActionMapper (volt: inline)
+│   ├── features.py           ← összes feature engineering
+│   │                            ActionHistoryEncoder, build_state_tensor,
+│   │                            compute_stack_features, encode_position,
+│   │                            encode_street, compute_board_texture,
+│   │                            compute_pot_odds_features
+│   ├── opponent_tracker.py   ← OpponentHUDTracker (volt: OpponentTracker)
+│   └── equity.py             ← Monte Carlo equity becslő
+│
+├── training/                 ← tréning-specifikus logika
+│   ├── __init__.py
+│   ├── buffer.py             ← PPOBuffer
+│   ├── trainer.py            ← PPOTrainer
+│   ├── normalizer.py         ← RunningMeanStd
+│   ├── opponent_pool.py      ← OpponentPool
+│   ├── collector.py          ← BatchedSyncCollector
+│   └── runner.py             ← run_training_session, menu_system
+│
+├── inference/                ← realtime asszisztens
+│   ├── __init__.py
+│   └── realtime_assistant.py ← RealtimePokerAssistant
+│
+└── utils/                    ← segédeszközök
+    ├── __init__.py
+    └── logging_setup.py      ← logger konfiguráció
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17. KRITIKUS BUGOK JAVÍTVA v4-BEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BUG-1 (v3.4): Dupla _encode() call a collector-ban.
+  JAVÍTÁS: x = model._encode(batch); logits=actor(x); val=critic(x)
+
+BUG-2 (v3.4): State t UTÁNI observation mentése a trajectory-ba.
+  A step-re reagáló akció ELŐTTI state-et kell menteni.
+  JAVÍTÁS: state_before = current_state; env.step(action); → mentsd state_before-t.
+
+BUG-3 (v3.4): build_state_tensor() position placeholder.
+  JAVÍTÁS: csak build_state_tensor_with_position()-t használunk v4-ben.
+
+BUG-4 (v3.x): initial_stack hardkód → hibás pot becslés.
+  JAVÍTÁS: per-env bb/sb/stack randomizálás, minden számítás BB-ben.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+18. VISSZAFELÉ KOMPATIBILITÁS DÖNTÉS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DÖNTÉS: INKOMPATIBILIS (v4 teljesen új tréning)
+INDOK:
+  - state_size változik (input_proj mérete)
+  - reward skála változik (abs chip → BB-ben)
+  - feature semantika változik (opponent stats)
+  Az eddigi checkpointok input_proj kivételével betölthetők,
+  de a reward/feature eltérés miatt a betöltés félrevezető lenne.
+
+Checkpoint betöltő MEGTARTVA: strict=False + size mismatch kiszűrés.
+Ha valaki v3.x checkpoint-ot tölt be → warning + részleges betöltés.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+19. HIPERPARAMÉTEREK ÖSSZEFOGLALÓJA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NUM_ENVS             = 256
+BUFFER_COLLECT_SIZE  = 1024
+HIDDEN_SIZE          = 512
+LEARNING_RATE        = 3e-4
+ACTION_HISTORY_LEN   = 8
+POOL_SIZE            = 15
+SNAPSHOT_INTERVAL    = 1000
+MAX_STEPS_PER_HAND   = 500
+PPO_EPOCHS           = 8
+MINIBATCH            = 256
+CLIP_EPS             = 0.2
+VALUE_COEF           = 0.5
+ENTROPY_COEF         = 0.02  → 0.002 (50M update alatt)
+ENTROPY_DECAY_STEPS  = 50_000_000
+MAX_GRAD_NORM        = 0.5
+GAMMA                = 0.99
+GAE_LAM              = 0.95
+LR_STEP_SIZE         = 1_000_000
+LR_GAMMA             = 0.7
+EQUITY_SIM_N         = 200
+EQUITY_CACHE_SIZE    = 10000
+BB_OPTIONS           = [1, 2, 5, 10, 25]
+STACK_MULTIPLIERS    = [20, 30, 40, 60, 80, 100, 150, 200]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+20. RLCARD SPECIFIKUS ISMERETEK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+state dict struktúra:
+  state['obs']                → numpy array, fő megfigyelés
+  state['raw_obs']['my_chips']   → saját chips
+  state['raw_obs']['all_chips']  → összes játékos chips lista
+  state['raw_obs']['pot']        → pot méret (v4-ben ezt használjuk!)
+  state['raw_obs']['public_cards']→ board lapok lista (pl. ['Ah','Kd','2c'])
+  state['raw_obs']['hand']        → saját lapok (pl. ['As','Kh'])
+  state['raw_obs']['button']      → button pozíció (0-indexed)
+  state['raw_obs']['stakes']      → {'ante':0,'small_blind':x,'big_blind':y}
+                                    VAGY nincs benne → saját BB/SB kezelés
+  state['legal_actions']          → list of int (raw action IDs)
+
+env.reset() → (state, player_id)
+env.step(action) → (state, player_id)
+env.is_over() → bool
+env.get_payoffs() → list[float] per player
+env.get_player_id() → int
+
+FIGYELEM: az rlcard no-limit-holdem env nem mindig adja a 'stakes'-t
+          ezért a BB/SB-t a Collector tárolja és adja át feature buildnek.
+
+obs méret játékosszám szerint (empirikus):
+  2p: ~50 dim
+  3p: ~57 dim
+  4p: ~64 dim
+  5p: ~68 dim
+  6p: 72 dim
+  9p: ~100 dim
+  → mindig temp env-ből mérjük!
+
+================================================================================
+EOF
+================================================================================
