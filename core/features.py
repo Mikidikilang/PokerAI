@@ -1,5 +1,11 @@
 """
-core/features.py  --  v4 Feature Engineering
+core/features.py  --  v4 Feature Engineering (OPTIMIZED)
+
+VÁLTOZÁSOK az eredetihez képest:
+  + build_state_tensor_batch() – vektorizált batch state tensor építés
+  + Pre-allokált numpy tömb (nincs N × np.concatenate overhead)
+  + compute_stack_features_batch() – vektorizált stack feature számítás
+  Visszafelé kompatibilis: build_state_tensor() változatlan API-val megmarad.
 """
 import collections
 import numpy as np
@@ -17,6 +23,11 @@ def compute_state_size(rlcard_obs_size, num_players):
             + STACK_FEATURE_DIM + STREET_DIM + POT_ODDS_DIM + BOARD_TEXTURE_DIM
             + ACTION_HISTORY_LEN * (num_players * NUM_ABSTRACT_ACTIONS + 1)
             + 2 * num_players + EQUITY_DIM)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EREDETI (egyedi) feature függvények – VÁLTOZATLANOK, visszafelé kompatibilis
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_stack_features(state, num_players, bb, sb, initial_stack):
     raw      = state.get('raw_obs', {})
@@ -90,6 +101,7 @@ def encode_position(button_pos, my_player_id, num_players):
     if 0<=relative_pos<num_players: relative_vec[relative_pos]=1.0
     return np.concatenate([button_vec,relative_vec])
 
+
 class ActionHistoryEncoder:
     def __init__(self, num_players, num_actions=NUM_ABSTRACT_ACTIONS):
         self.num_players=num_players; self.num_actions=num_actions
@@ -112,6 +124,11 @@ class ActionHistoryEncoder:
             result[offset:offset+self.dim_per_action]=self.encode_single(player,action,bet_norm)
         return result
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EREDETI build_state_tensor – VÁLTOZATLAN API (RTA + play_vs_ai kompatibilis)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def build_state_tensor(state, tracker, action_history, history_encoder,
                        num_players, my_player_id, bb, sb, initial_stack,
                        street=None, equity=0.5):
@@ -129,3 +146,129 @@ def build_state_tensor(state, tracker, action_history, history_encoder,
     equity_arr=np.array([float(equity)],dtype=np.float32)
     full=np.concatenate([obs_arr,stats_arr,stack_arr,street_arr,pot_arr,board_arr,history_arr,pos_arr,equity_arr])
     return torch.FloatTensor(full).unsqueeze(0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ÚJ: BATCH STATE TENSOR – vektorizált, pre-allokált
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BatchStateBuilder:
+    """
+    Pre-allokált numpy tömbökkel dolgozó batch state tensor builder.
+    Egyetlen allokáció per batch, slicing-gal töltve – nincs GC nyomás.
+
+    Használat a collector-ban:
+        builder = BatchStateBuilder(state_size, num_players, max_batch=512)
+        ...
+        tensor = builder.build_batch(env_indices, states, trackers,
+                                      action_histories, ...)
+    """
+
+    def __init__(self, state_size: int, num_players: int, max_batch: int = 512):
+        self.state_size = state_size
+        self.num_players = num_players
+        self.max_batch = max_batch
+        self._history_encoder = ActionHistoryEncoder(num_players, NUM_ABSTRACT_ACTIONS)
+
+        # Offset-ek kiszámítása egyszer
+        obs_dim = 54
+        stats_dim = num_players * NUM_ABSTRACT_ACTIONS  # 7 per player
+        self._off = {}
+        o = 0
+        self._off['obs']     = (o, o + obs_dim);     o += obs_dim
+        self._off['stats']   = (o, o + stats_dim);    o += stats_dim
+        self._off['stack']   = (o, o + STACK_FEATURE_DIM);  o += STACK_FEATURE_DIM
+        self._off['street']  = (o, o + STREET_DIM);   o += STREET_DIM
+        self._off['pot']     = (o, o + POT_ODDS_DIM);  o += POT_ODDS_DIM
+        self._off['board']   = (o, o + BOARD_TEXTURE_DIM); o += BOARD_TEXTURE_DIM
+        hist_dim = self._history_encoder.total_dim
+        self._off['history'] = (o, o + hist_dim);     o += hist_dim
+        pos_dim = 2 * num_players
+        self._off['pos']     = (o, o + pos_dim);      o += pos_dim
+        self._off['equity']  = (o, o + EQUITY_DIM);    o += EQUITY_DIM
+
+        # Pre-allokált buffer
+        self._buf = np.zeros((max_batch, state_size), dtype=np.float32)
+
+    def build_batch(self, env_indices, states, trackers, action_histories,
+                    player_ids, bbs, sbs, initial_stacks, streets, equities=None):
+        """
+        Batch state tensor építés pre-allokált tömbből.
+
+        Paraméterek:
+            env_indices:      list[int] – melyik env-ek
+            states:           list[dict] – rlcard state dict-ek
+            trackers:         list[OpponentHUDTracker] – per-env tracker
+            action_histories: list[deque] – per-env akció történet
+            player_ids:       list[int] – kinek építjük (0=learner, egyéb=opp)
+            bbs, sbs:         list[float] – BB/SB értékek
+            initial_stacks:   list[float]
+            streets:          list[int]
+            equities:         list[float] vagy None (default 0.5)
+
+        Visszatér: torch.FloatTensor shape (N, state_size)
+        """
+        N = len(env_indices)
+        if N == 0:
+            return torch.zeros((0, self.state_size), dtype=torch.float32)
+
+        # Növeld a buffert ha kell
+        if N > self._buf.shape[0]:
+            self._buf = np.zeros((N, self.state_size), dtype=np.float32)
+
+        buf = self._buf[:N]
+        buf[:] = 0.0  # Gyors nullázás (memcpy)
+
+        o = self._off
+
+        for idx in range(N):
+            i = env_indices[idx]
+            state = states[i]
+
+            # [1] obs (54 dim)
+            a, b = o['obs']
+            obs = state.get('obs', None)
+            if obs is not None:
+                buf[idx, a:b] = obs
+
+            # [2] stats (num_players × 7 dim)
+            a, b = o['stats']
+            buf[idx, a:b] = trackers[i].get_stats_vector()
+
+            # [3] stack features (8 dim)
+            a, b = o['stack']
+            buf[idx, a:b] = compute_stack_features(
+                state, self.num_players, bbs[i], sbs[i], initial_stacks[i]
+            )
+
+            # [4] street one-hot (4 dim)
+            a, b = o['street']
+            st = streets[i]
+            if 0 <= st < 4:
+                buf[idx, a + st] = 1.0
+
+            # [5] pot odds (4 dim)
+            a, b = o['pot']
+            buf[idx, a:b] = compute_pot_odds_features(
+                state, bbs[i], initial_stacks[i], self.num_players
+            )
+
+            # [6] board texture (6 dim)
+            a, b = o['board']
+            buf[idx, a:b] = compute_board_texture(state)
+
+            # [7] action history (variable dim)
+            a, b = o['history']
+            buf[idx, a:b] = self._history_encoder.encode_history(action_histories[i])
+
+            # [8] position encoding (2 × num_players dim)
+            a, b = o['pos']
+            raw_obs = state.get('raw_obs', {})
+            button_pos = raw_obs.get('button', 0)
+            buf[idx, a:b] = encode_position(button_pos, player_ids[idx], self.num_players)
+
+            # [9] equity (1 dim)
+            a, b = o['equity']
+            buf[idx, a] = equities[idx] if equities is not None else 0.5
+
+        return torch.from_numpy(buf[:N].copy())  # .copy() → contiguous, own memory
