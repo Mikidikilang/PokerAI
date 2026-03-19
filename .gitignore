@@ -2,6 +2,7 @@ __pycache__/
 *.pth
 logs/
 runs/
+screenshots/
 
 # SQLite ellenfél adatbázis
 players.db
