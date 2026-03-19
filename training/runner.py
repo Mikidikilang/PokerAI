@@ -135,7 +135,15 @@ def run_training_session(num_players, filename, episodes_to_run):
     learner = AdvancedPokerAI(**model_kwargs).to(device)
     buffer = PPOBuffer()
     trainer = PPOTrainer(learner, lr=LEARNING_RATE, device=device)
-    pool = OpponentPool(AdvancedPokerAI, model_kwargs, device=device)
+    pool = OpponentPool(
+        AdvancedPokerAI, 
+        model_kwargs, 
+        device=device,
+        bot_ratio=0.1,  # 10% bot arány kezdésnek
+        bot_types=['fish', 'nit', 'calling_station', 'lag'],
+        num_players=num_players,
+        state_size=STATE_SIZE
+    )
     action_mapper = PokerActionMapper()
     reward_norm = RunningMeanStd()
 
