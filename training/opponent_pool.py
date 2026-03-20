@@ -1,22 +1,24 @@
 """
-training/opponent_pool.py  –  Self-play ellenfél pool + szabály-alapú botok
+training/opponent_pool.py  –  Self-play ellenfél pool + Phase 2 exploitative botok
 
-v4 VÁLTOZÁS: Bot integráció
-  Ha bot_ratio > 0, a get_opponent() néha szabály-alapú botokat ad vissza.
-  Visszafelé kompatibilis: ha bot_ratio=0 (default), pontosan úgy működik mint előbb.
+TRÉNING FÁZISOK:
+  Phase 1 (PHASE_SELF_PLAY):
+    50% self-play + 50% snapshot
+    Stabil konvergencia, Nash-irányú tanulás
+    Beállítás: OpponentPool(..., phase=OpponentPool.PHASE_SELF_PLAY)
 
-HASZNÁLAT:
-  # Régi mód (változatlan):
-  pool = OpponentPool(AdvancedPokerAI, model_kwargs, device)
+  Phase 2 (PHASE_EXPLOITATIVE):
+    30% self-play + 30% snapshot + 40% botok (10% fish/nit/cs/lag egyenként)
+    Exploitative play, HUD tanulás, sizing korreláció javítása
+    Beállítás: OpponentPool(..., phase=OpponentPool.PHASE_EXPLOITATIVE)
+    Ajánlott: 10-12M ep után, ha a modell erősen konvergált self-play-re
 
-  # Új mód (botokkal):
-  pool = OpponentPool(AdvancedPokerAI, model_kwargs, device,
-                       bot_ratio=0.2,
-                       bot_types=['fish', 'nit', 'calling_station', 'lag'],
-                       num_players=2, state_size=215)
-  
-  opp = pool.get_opponent(current_model)
-  # 40% self-play, 40% snapshot, 20% random bot
+  A fázis futás közben is váltható: pool.set_phase(OpponentPool.PHASE_EXPLOITATIVE)
+
+VISSZAFELÉ KOMPATIBILITÁS:
+  A bot_ratio paraméter megmaradt Phase 1-ben (ha valaki nem akarja a phase rendszert).
+  Ha phase=PHASE_SELF_PLAY és bot_ratio>0, az eredeti viselkedés érvényes.
+  Ha phase=PHASE_EXPLOITATIVE, a bot_ratio-t a phase 2 logika felülírja.
 """
 
 import copy, random, collections, logging
@@ -27,37 +29,45 @@ logger = logging.getLogger("PokerAI")
 
 
 class OpponentPool:
-    POOL_SIZE = 15
-    SNAPSHOT_INTERVAL = 1_000
+    POOL_SIZE          = 15
+    SNAPSHOT_INTERVAL  = 1_000
+
+    # Tréning fázis konstansok
+    PHASE_SELF_PLAY    = 1  # 50/50 self-play + snapshot (eredeti)
+    PHASE_EXPLOITATIVE = 2  # 30/30/10/10/10/10 (Phase 2)
+
+    # Phase 2 sampling célok (összesen 1.0)
+    _P2_SELF_PLAY  = 0.30
+    _P2_SNAPSHOT   = 0.30
+    _P2_BOTS       = 0.40  # egyenletesen elosztva a botok közt
 
     def __init__(self, model_class, model_kwargs, device=None,
-                 bot_ratio=0.0, bot_types=None,
-                 num_players=None, state_size=None):
+                 phase: int = PHASE_SELF_PLAY,
+                 bot_ratio: float = 0.0,
+                 bot_types: list = None,
+                 num_players: int = None,
+                 state_size: int = None):
         """
-        model_class:  AdvancedPokerAI osztály
-        model_kwargs: dict – state_size, action_size, hidden_size
-        device:       torch device
-        bot_ratio:    float 0-1 – botok aránya a get_opponent()-ben
-                      0.0 = nincs bot (régi viselkedés)
-                      0.2 = 20% bot, 40% self-play, 40% snapshot
-        bot_types:    list – ['fish', 'nit', 'calling_station', 'lag']
-        num_players:  int – szükséges ha bot_ratio > 0
-        state_size:   int – szükséges ha bot_ratio > 0
+        Args:
+            model_class:  AdvancedPokerAI osztály
+            model_kwargs: dict – state_size, action_size, hidden_size
+            device:       torch device
+            phase:        PHASE_SELF_PLAY (1) vagy PHASE_EXPLOITATIVE (2)
+            bot_ratio:    Phase 1-ben: botok aránya [0, 1]. Phase 2-ben figyelmen kívül hagyva.
+            bot_types:    ['fish', 'nit', 'calling_station', 'lag']
+            num_players:  botok létrehozásához szükséges
+            state_size:   botok létrehozásához szükséges
         """
-        self.model_class = model_class
+        self.model_class  = model_class
         self.model_kwargs = model_kwargs
-        self._pool = collections.deque(maxlen=self.POOL_SIZE)
-        self._device = device or torch.device('cpu')
+        self._pool        = collections.deque(maxlen=self.POOL_SIZE)
+        self._device      = device or torch.device('cpu')
+        self._phase       = phase
+        self._bot_ratio   = max(0.0, min(1.0, bot_ratio))
+        self._bots: list  = []
 
-        # ── Bot integráció ────────────────────────────────────────────────
-        self._bot_ratio = max(0.0, min(1.0, bot_ratio))
-        self._bots = []
-
-        if self._bot_ratio > 0 and bot_types:
-            if num_players is None or state_size is None:
-                raise ValueError(
-                    "num_players és state_size szükséges ha bot_ratio > 0"
-                )
+        # Botok inicializálása
+        if bot_types and (num_players is not None) and (state_size is not None):
             try:
                 from .opponent_archetypes import create_bot
             except ImportError:
@@ -65,21 +75,57 @@ class OpponentPool:
 
             action_size = model_kwargs.get('action_size', 7)
             for bt in bot_types:
-                bot = create_bot(bt, num_players, state_size, action_size)
-                self._bots.append(bot)
-                logger.info(f"  Bot hozzáadva: {bot}")
+                try:
+                    bot = create_bot(bt, num_players, state_size, action_size)
+                    self._bots.append(bot)
+                except ValueError as e:
+                    logger.warning(f"Bot létrehozási hiba ({bt}): {e}")
 
+        if self._phase == self.PHASE_EXPLOITATIVE:
             logger.info(
-                f"OpponentPool: {len(self._bots)} bot, "
-                f"ratio={self._bot_ratio:.0%} | "
-                f"self-play={(1-self._bot_ratio)/2:.0%} | "
-                f"snapshot={(1-self._bot_ratio)/2:.0%}"
+                f"OpponentPool Phase 2 – EXPLOITATIVE | "
+                f"{len(self._bots)} bot | "
+                f"eloszlás: {self._P2_SELF_PLAY:.0%} self / "
+                f"{self._P2_SNAPSHOT:.0%} snap / "
+                f"{self._P2_BOTS:.0%} botok"
             )
+            if self._bots:
+                per_bot = self._P2_BOTS / len(self._bots)
+                for b in self._bots:
+                    logger.info(f"  {b.__class__.__name__}: {per_bot:.0%}")
+        elif self._bot_ratio > 0 and self._bots:
+            logger.info(
+                f"OpponentPool Phase 1 | bot_ratio={self._bot_ratio:.0%} | "
+                f"{len(self._bots)} bot"
+            )
+        else:
+            logger.info("OpponentPool Phase 1 – pure self-play")
+
+    # ── Fázisváltás futás közben ──────────────────────────────────────────────
+
+    def set_phase(self, phase: int):
+        """
+        Fázis váltása tréning közben.
+
+        Példa:
+            # 10M ep után kapcsolj át exploitative mode-ra
+            if total_collected >= 10_000_000:
+                pool.set_phase(OpponentPool.PHASE_EXPLOITATIVE)
+        """
+        if phase not in (self.PHASE_SELF_PLAY, self.PHASE_EXPLOITATIVE):
+            raise ValueError(f"Érvénytelen fázis: {phase}")
+        old = self._phase
+        self._phase = phase
+        logger.info(
+            f"OpponentPool fázisváltás: {old} → {phase} "
+            f"({'exploitative' if phase == self.PHASE_EXPLOITATIVE else 'self-play'})"
+        )
+
+    # ── Snapshot ─────────────────────────────────────────────────────────────
 
     def snapshot(self, model):
-        """Modell snapshot mentése a pool-ba."""
+        """Modell snapshot mentése a pool-ba (mindkét fázisban szükséges)."""
         clone = self.model_class(**self.model_kwargs)
-        # torch.compile() _orig_mod. prefix kezelése
         sd = {
             (k.replace('_orig_mod.', '', 1) if k.startswith('_orig_mod.') else k): v
             for k, v in model.state_dict().items()
@@ -89,67 +135,115 @@ class OpponentPool:
         clone.eval()
         self._pool.append(clone)
 
+    # ── Ellenfél kiválasztás ──────────────────────────────────────────────────
+
     def get_opponent(self, current_model):
         """
-        Ellenfél kiválasztása.
+        Ellenfél kiválasztása az aktuális fázis alapján.
 
-        Ha bot_ratio = 0 (default):
-          50% current_model (self-play)
-          50% random snapshot
+        Phase 1: bot_ratio-alapú (legacy)
+          bot_ratio=0.0 → 50% self, 50% snapshot
+          bot_ratio=0.2 → 20% random bot, 40% self, 40% snapshot
 
-        Ha bot_ratio > 0 (pl. 0.2):
-          bot_ratio%  random bot         (20%)
-          (1-bot_ratio)/2%  self-play    (40%)
-          (1-bot_ratio)/2%  snapshot     (40%)
+        Phase 2: explicit exploitative eloszlás
+          30% self-play
+          30% snapshot (ha van; különben self-play)
+          40% botok (10% egyenként ha 4 bot van)
+        """
+        if self._phase == self.PHASE_EXPLOITATIVE and self._bots:
+            return self._get_opponent_phase2(current_model)
+        return self._get_opponent_phase1(current_model)
+
+    def _get_opponent_phase2(self, current_model):
+        """
+        Phase 2 eloszlás: 30% self / 30% snapshot / 40% botok.
+
+        A botok egyenlő eséllyel kerülnek kiválasztásra (10% mindegyik ha 4 van).
+        Ha nincs elég snapshot, a snapshot-slot self-play-ra esik vissza.
         """
         r = random.random()
 
-        # Bot kiválasztás
+        if r < self._P2_SELF_PLAY:
+            # 30%: self-play
+            return current_model
+
+        elif r < self._P2_SELF_PLAY + self._P2_SNAPSHOT:
+            # 30%: historical snapshot
+            if self._pool:
+                return random.choice(list(self._pool))
+            return current_model  # fallback ha még nincs snapshot
+
+        else:
+            # 40%: botok – egyenletesen elosztva
+            bot_fraction = self._P2_BOTS / len(self._bots)
+            bot_idx = int((r - self._P2_SELF_PLAY - self._P2_SNAPSHOT) / bot_fraction)
+            bot_idx = min(bot_idx, len(self._bots) - 1)
+            return self._bots[bot_idx]
+
+    def _get_opponent_phase1(self, current_model):
+        """
+        Phase 1 eloszlás (eredeti logika megőrizve visszafelé kompatibilitáshoz).
+
+        bot_ratio=0.0: 50% self, 50% snapshot
+        bot_ratio=0.2: 20% random bot, 40% self, 40% snapshot
+        """
+        r = random.random()
+
         if self._bots and r < self._bot_ratio:
             return random.choice(self._bots)
 
-        # Self-play vs snapshot
-        # A maradék arányt 50/50 osztjuk
         remaining_start = self._bot_ratio
         midpoint = remaining_start + (1.0 - remaining_start) / 2.0
 
         if r < midpoint:
-            # Self-play
             return current_model
         else:
-            # Snapshot
             if self._pool:
                 return random.choice(list(self._pool))
             return current_model
 
-    # ── Diagnosztika ──────────────────────────────────────────────────────
+    # ── Diagnosztika ──────────────────────────────────────────────────────────
 
     @property
-    def bot_count(self):
-        return len(self._bots)
+    def current_phase(self) -> int:
+        return self._phase
 
     @property
-    def bot_ratio(self):
-        return self._bot_ratio
+    def phase_name(self) -> str:
+        return "exploitative" if self._phase == self.PHASE_EXPLOITATIVE else "self-play"
 
-    @bot_ratio.setter
-    def bot_ratio(self, value):
-        """Bot arány dinamikus módosítása tréning közben."""
-        self._bot_ratio = max(0.0, min(1.0, value))
-        logger.info(f"OpponentPool bot_ratio → {self._bot_ratio:.0%}")
-
-    def stats(self):
+    def stats(self) -> dict:
+        n_bots = len(self._bots)
+        if self._phase == self.PHASE_EXPLOITATIVE and n_bots > 0:
+            per_bot = self._P2_BOTS / n_bots
+            dist = {
+                'self_play': f"{self._P2_SELF_PLAY:.0%}",
+                'snapshot':  f"{self._P2_SNAPSHOT:.0%}",
+                **{b.__class__.__name__: f"{per_bot:.0%}" for b in self._bots},
+            }
+        else:
+            half = (1 - self._bot_ratio) / 2
+            dist = {
+                'self_play': f"{half:.0%}",
+                'snapshot':  f"{half:.0%}",
+                'bots_total': f"{self._bot_ratio:.0%}",
+            }
         return {
-            'pool_size': len(self._pool),
-            'max_pool': self.POOL_SIZE,
-            'bot_count': len(self._bots),
-            'bot_ratio': self._bot_ratio,
-            'bot_types': [str(b) for b in self._bots],
+            'phase':       self._phase,
+            'phase_name':  self.phase_name,
+            'pool_size':   len(self._pool),
+            'max_pool':    self.POOL_SIZE,
+            'bot_count':   n_bots,
+            'bot_types':   [b.__class__.__name__ for b in self._bots],
+            'distribution': dist,
         }
 
     def __len__(self):
         return len(self._pool)
 
     def __repr__(self):
-        return (f"OpponentPool(snapshots={len(self._pool)}, "
-                f"bots={len(self._bots)}, ratio={self._bot_ratio:.0%})")
+        return (
+            f"OpponentPool(phase={self.phase_name}, "
+            f"snapshots={len(self._pool)}, "
+            f"bots={[b.__class__.__name__ for b in self._bots]})"
+        )

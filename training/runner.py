@@ -265,10 +265,10 @@ def run_training_session(num_players, filename, episodes_to_run):
         AdvancedPokerAI,
         model_kwargs,
         device=device,
-        bot_ratio=0.1,
+        phase=OpponentPool.PHASE_EXPLOITATIVE,    # 30/30/10/10/10/10 eloszlás
         bot_types=['fish', 'nit', 'calling_station', 'lag'],
         num_players=num_players,
-        state_size=STATE_SIZE
+        state_size=STATE_SIZE,
     )
     action_mapper = PokerActionMapper()
     reward_norm = RunningMeanStd()
