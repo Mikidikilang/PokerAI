@@ -9,9 +9,18 @@ OPTIMALIZÁCIÓK:
   OPT-6: BUFFER_COLLECT_SIZE 1024→2048 – hatékonyabb PPO update
   OPT-7: torch.compile(mode="reduce-overhead") ha elérhető
 
+MÉRFÖLDKŐ RENDSZER:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  MILESTONE_INTERVAL epizódonként (default: 2_000_000) a runner:
+    1. Elmenti a modellt: ModellNaplo/{modellnev}_{N}M/{modellnev}_{N}M.pth
+    2. Elindítja a test_model_sanity.py-t subprocessként – a tréning
+       erre az időre szünetel (így a teszt megkapja a GPU erőforrásokat)
+    3. A teszt eredménye (.log + .json) ugyanabba a mappába kerül
+
   CHECKPOINT FORMÁTUM: VÁLTOZATLAN – régi .pth fájlok betölthetők.
 """
-import os, sys, time, logging
+import os, sys, time, logging, subprocess
 import rlcard, torch
 from core.model import AdvancedPokerAI
 from core.action_mapper import PokerActionMapper
@@ -36,6 +45,13 @@ NUM_ENVS            = 512     # Volt: 256 → GPU jobban kihasználva
 BUFFER_COLLECT_SIZE = 2048    # Volt: 1024 → jobb gradiens becslés
 HIDDEN_SIZE         = 512
 LEARNING_RATE       = 3e-4
+
+# ── Mérföldkő rendszer ───────────────────────────────────────────────────────
+MILESTONE_INTERVAL  = 2_000_000   # Ennyi epizódonként ment + tesztel
+MILESTONE_HANDS     = 2000        # Szituációs + stat tesztek kézszáma
+MILESTONE_DIR_ROOT  = "ModellNaplo"  # Főmappa a mentésekhez
+# Megjegyzés: ha UTF-8 névvel gondod van a fájlrendszeren,
+# cseréld "ModellNaplo"-ra (ékezet nélkül).
 
 
 def _get_model_info(filename):
@@ -63,6 +79,7 @@ def menu_system():
     print("\n  Játékosszám:")
     print("    2 = Heads-Up  |  6 = 6-max  |  9 = Full ring  |  A = összes")
     print(f"\n  Env-ek: {NUM_ENVS} | Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 4")
+    print(f"  Mérföldkő: minden {MILESTONE_INTERVAL:,} ep → mentés + auto-teszt")
     print("=" * 70)
     choice = input("\n  Választás [2/6/9/A]: ").strip().upper()
     if choice == 'A':
@@ -97,7 +114,6 @@ def _try_compile(model, device):
 
     try:
         compiled = torch.compile(model, mode="reduce-overhead")
-        # Warmup – egy dummy forward, hogy a compile lefusson
         logger.info("torch.compile(mode='reduce-overhead') aktív – warmup...")
         dummy_state_size = model.input_proj.in_features
         dummy = torch.randn(1, dummy_state_size, device=device)
@@ -108,6 +124,116 @@ def _try_compile(model, device):
     except Exception as exc:
         logger.warning(f"torch.compile sikertelen, fallback eredeti modellre: {exc}")
         return model
+
+
+def _save_checkpoint(filename, model, trainer, reward_norm,
+                     episodes, time_spent, state_size, action_size):
+    """Checkpoint mentése. Kezeli a torch.compile _orig_mod prefixet."""
+    try:
+        if hasattr(model, '_orig_mod'):
+            sd = model._orig_mod.state_dict()
+        else:
+            sd = model.state_dict()
+
+        torch.save({
+            'state_dict': sd,
+            'trainer': trainer.state_dict(),
+            'reward_norm': reward_norm.state_dict(),
+            'episodes_trained': episodes,
+            'time_spent': time_spent,
+            'algorithm': 'PPO_SelfPlay_v4',
+            'state_size': state_size,
+            'action_size': action_size,
+            'bb_options': BB_OPTIONS,
+            'stack_multipliers': STACK_MULTIPLIERS,
+        }, filename)
+        logger.debug(f"Checkpoint mentve: {filename}")
+    except Exception as exc:
+        logger.error(f"Checkpoint mentési hiba: {exc}", exc_info=True)
+
+
+def _run_milestone(filename, model, trainer, reward_norm,
+                   episodes, time_spent, state_size, action_size,
+                   num_players, milestone_episodes):
+    """
+    Mérföldkő elérése: elmenti a modellt egy dedikált mappába,
+    majd elindítja a test_model_sanity.py-t subprocessként.
+
+    A tréning a teszt végéig SZÜNETEL – ez szándékos, így a teszt
+    megkapja az összes erőforrást és nem akad be memóriahiány miatt.
+    Max timeout: 10 perc. Ha tovább tart, a tréning továbblép.
+
+    Mappa struktúra:
+        ModellNaplo/
+        └── 2max_ppo_v4_4M/
+            ├── 2max_ppo_v4_4M.pth   ← modell snapshot
+            ├── test_...log           ← részletes log
+            └── test_...json          ← géppel olvasható eredmény
+    """
+    milestone_m = milestone_episodes // 1_000_000
+    milestone_str = f"{milestone_m}M"
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+
+    # Mappa létrehozása
+    milestone_dir = os.path.join(MILESTONE_DIR_ROOT, f"{base_name}_{milestone_str}")
+    try:
+        os.makedirs(milestone_dir, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Mérföldkő mappa nem hozható létre ({milestone_dir}): {e}")
+        return
+
+    # Modell snapshot mentése
+    milestone_model_path = os.path.join(
+        milestone_dir, f"{base_name}_{milestone_str}.pth"
+    )
+    _save_checkpoint(
+        milestone_model_path, model, trainer, reward_norm,
+        episodes, time_spent, state_size, action_size,
+    )
+    logger.info(
+        f"🏆 Mérföldkő: {milestone_episodes:,} ep → {milestone_model_path}"
+    )
+
+    # test_model_sanity.py elérési útja (projekt gyökérben van)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    test_script = os.path.join(project_root, "test_model_sanity.py")
+
+    if not os.path.exists(test_script):
+        logger.warning(
+            f"Teszt script nem található: {test_script} – teszt kihagyva"
+        )
+        return
+
+    cmd = [
+        sys.executable, test_script,
+        milestone_model_path,
+        "--num-players", str(num_players),
+        "--hands", str(MILESTONE_HANDS),
+        "--out-dir", milestone_dir,
+        # --winrate NEM fut automatikusan (túl lassú lenne minden 2M-nél).
+        # Ha manuálisan akarod: python test_model_sanity.py <pth> --winrate
+    ]
+
+    logger.info(
+        f"Teszt indítása (tréning szünetel, max 10 perc):\n"
+        f"  {' '.join(cmd)}"
+    )
+    try:
+        subprocess.run(cmd, check=True, timeout=600)
+        logger.info(f"✅ {milestone_str} teszt kész → eredmények: {milestone_dir}")
+    except subprocess.TimeoutExpired:
+        logger.error(
+            f"❌ {milestone_str} teszt timeout (>10 perc) – tréning folytatódik"
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error(
+            f"❌ {milestone_str} teszt hibával zárult (returncode={e.returncode}) "
+            f"– tréning folytatódik"
+        )
+    except Exception as e:
+        logger.error(
+            f"❌ {milestone_str} teszt ismeretlen hiba: {e} – tréning folytatódik"
+        )
 
 
 def run_training_session(num_players, filename, episodes_to_run):
@@ -136,10 +262,10 @@ def run_training_session(num_players, filename, episodes_to_run):
     buffer = PPOBuffer()
     trainer = PPOTrainer(learner, lr=LEARNING_RATE, device=device)
     pool = OpponentPool(
-        AdvancedPokerAI, 
-        model_kwargs, 
+        AdvancedPokerAI,
+        model_kwargs,
         device=device,
-        bot_ratio=0.1,  # 10% bot arány kezdésnek
+        bot_ratio=0.1,
         bot_types=['fish', 'nit', 'calling_station', 'lag'],
         num_players=num_players,
         state_size=STATE_SIZE
@@ -203,6 +329,18 @@ def run_training_session(num_players, filename, episodes_to_run):
 
     target_episodes = start_episode + episodes_to_run
     total_collected = start_episode
+
+    # ── Mérföldkő inicializálás ───────────────────────────────────────────
+    # Ha folytatott tréning (pl. betöltöttük a 4M-es checkpointot),
+    # a last_milestone = 4M lesz, így nem teszteli újra az already-done
+    # mérföldköveket – csak a következőtől (6M) indul el.
+    last_milestone = (start_episode // MILESTONE_INTERVAL) * MILESTONE_INTERVAL
+    logger.info(
+        f"Mérföldkő rendszer: interval={MILESTONE_INTERVAL:,} | "
+        f"következő: {last_milestone + MILESTONE_INTERVAL:,} ep | "
+        f"mentési hely: {MILESTONE_DIR_ROOT}/"
+    )
+
     session_start = time.time()
     metrics = {}
 
@@ -288,11 +426,28 @@ def run_training_session(num_players, filename, episodes_to_run):
                 f"Pool {len(pool):2d}"
             )
 
+            # Normál rolling checkpoint
             _save_checkpoint(
                 filename, learner, trainer, reward_norm,
                 total_collected, total_time_spent + elapsed,
                 STATE_SIZE, ACTION_SIZE,
             )
+
+            # ── Mérföldkő ellenőrzés ──────────────────────────────────────
+            # Pl: total_collected=2_001_500 → current_milestone=2_000_000
+            # Ha last_milestone=0, akkor 2M > 0 → trigger!
+            # Ha last_milestone=2M, akkor 2M > 2M → False, nem triggerel újra.
+            current_milestone = (
+                (total_collected // MILESTONE_INTERVAL) * MILESTONE_INTERVAL
+            )
+            if current_milestone > last_milestone and current_milestone > 0:
+                last_milestone = current_milestone
+                _run_milestone(
+                    filename, learner, trainer, reward_norm,
+                    total_collected, total_time_spent + elapsed,
+                    STATE_SIZE, ACTION_SIZE,
+                    num_players, current_milestone,
+                )
 
     if writer:
         writer.close()
@@ -303,29 +458,3 @@ def run_training_session(num_players, filename, episodes_to_run):
         STATE_SIZE, ACTION_SIZE,
     )
     logger.info(f"KÉSZ  →  {filename}  ({target_episodes:,} epizód)")
-
-
-def _save_checkpoint(filename, model, trainer, reward_norm,
-                      episodes, time_spent, state_size, action_size):
-    try:
-        # Ha compiled modell, az eredeti state_dict-et mentjük
-        if hasattr(model, '_orig_mod'):
-            sd = model._orig_mod.state_dict()
-        else:
-            sd = model.state_dict()
-
-        torch.save({
-            'state_dict': sd,
-            'trainer': trainer.state_dict(),
-            'reward_norm': reward_norm.state_dict(),
-            'episodes_trained': episodes,
-            'time_spent': time_spent,
-            'algorithm': 'PPO_SelfPlay_v4',
-            'state_size': state_size,
-            'action_size': action_size,
-            'bb_options': BB_OPTIONS,
-            'stack_multipliers': STACK_MULTIPLIERS,
-        }, filename)
-        logger.debug(f"Checkpoint mentve: {filename}")
-    except Exception as exc:
-        logger.error(f"Checkpoint mentési hiba: {exc}", exc_info=True)

@@ -1,5 +1,5 @@
 ================================================================================
-POKER AI v4 – MASTER NOTES
+POKER AI v4.1 – MASTER NOTES
 Minden ami a v4 fejlesztéséhez kell. Ez az "agy" – mindig ebből dolgozz!
 ================================================================================
 
@@ -23,11 +23,16 @@ v3.4: + Action History Vector (336 dim) + Position Encoding (12 dim)
       BUG: _step_learners_batched() kétszer hívja _encode()-ot:
            logits_batch = model.actor_head(model._encode(states_batch))
            values_batch = model.critic_head(model._encode(states_batch))
-           → dupla forward pass! v4-ben javítani kell.
+           → dupla forward pass!
+      v4-ben javítani kell.
 
 v4 (ÚJ): BB/SB explicit paraméter, M-ratio, street, board texture,
           pot odds, VPIP/PFR/AF stats, bet sizing history, hand equity.
-          Teljesen modularizált. RTAManager + obs_builder hozzáadva.
+      Teljesen modularizált. RTAManager + obs_builder hozzáadva.
+
+v4.1 (ÚJ): Szabály-alapú Bot Pool (Fish, Nit, Calling Station, LAG) integrálása,
+           OCR/YOLO alapú élő kliens olvasó (live_reader), 
+           Szigorú teszt-infrastruktúra (test_model_sanity.py v3 FINAL).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 2. MODELL ARCHITEKTÚRA (ai_model.py → core/model.py)
@@ -44,7 +49,8 @@ ResidualBlock:
   LayerNorm → Linear(h→h*2) → GELU → Dropout → Linear(h*2→h) + skip
 
 TemporalBlock:
-  LayerNorm → Linear(h→h) → GELU → Dropout → Linear(h→h) + skip
+  LayerNorm → Linear(h→h) 
+  → GELU → Dropout → Linear(h→h) + skip
 
 Weight init:
   - orthogonal(gain=sqrt(2)) minden weight dim>=2
@@ -125,9 +131,8 @@ STATE VEKTOR ÖSSZETÉTELE (6 player példán):
 
   FIGYELEM: a NOTES korábbi verziói 492-t írtak (hibásan 72 dimenziós obs-szal).
   Az rlcard forráskód ellenőrzése alapján az obs MINDIG 54 dim.
-
-Konst: STATE_SIZE automatikusan számolódik run_training_session()-ban
-       a temp env rlcard obs méretéből → mindig a helyes értéket kapjuk.
+  Konst: STATE_SIZE automatikusan számolódik run_training_session()-ban
+  a temp env rlcard obs méretéből → mindig a helyes értéket kapjuk.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 5. OPPONENT HUD TRACKER (core/opponent_tracker.py)
@@ -170,7 +175,7 @@ KÉT OSZTÁLY:
         Ha rolling < 30 esemény: lifetime stat lineárisan bekeveredik
         Így egy régen látott ellenfél adatai azonnal hasznosak
     - SKÁLÁZHATÓSÁG:
-        50k játékos  → ~8 MB SQLite, <1ms/játékos lookup
+        50k játékos → ~8 MB SQLite, <1ms/játékos lookup
         500k játékos → ~80 MB SQLite, azonos sebesség
         RAM          → max 9 PlayerStats él egyszerre (asztalon ülők)
     - AUTO-FLUSH: 50 akciónként írja ki a dirty lifetime értékeket SQLite-ba
@@ -214,7 +219,6 @@ Implementáció: egyszerű MC, nem igényel külső library-t.
   - n_sim iteráció, win_count/n_sim
 
 Cache: LRU cache (hand_key → equity) a repeated states gyorsításához.
-
 FIGYELEM: az equity modul 'As', 'Kh' formátumot vár (Rank+Suit kisbetű),
 ami ELTÉR az rlcard raw_obs['hand'] formátumától ('SA', 'HK').
 Az obs_builder.py card_to_obs_index() mindkét formátumot elfogadja.
@@ -225,8 +229,7 @@ Az obs_builder.py card_to_obs_index() mindkét formátumot elfogadja.
 
 VÁLTOZATLAN v3.1 óta. A GAE (Generalized Advantage Estimation)
 implementáció helyes és tesztelt.
-
-  add(state, legal_actions, action, log_prob, value, reward, episode_end)
+add(state, legal_actions, action, log_prob, value, reward, episode_end)
   compute_gae(gamma=0.99, lam=0.95) → (advantages, returns)
     GAE: Generalized Advantage Estimation
     delta_t = r_t + γ*V(s_{t+1})*(1-done) - V(s_t)
@@ -264,24 +267,31 @@ RunningMeanStd: Welford online algoritmus
   normalize(x) = clip((x-mean)/(sqrt(var)+eps), -10, 10)
 
 ÚJ v4: reward = payoffs[0] / bb  → BB-ben mérve!
-  Indok: 100BB stackkel és 500BB stackkel játszott kezek összehasonlítható.
+Indok: 100BB stackkel és 500BB stackkel játszott kezek összehasonlítható.
   A normalizáló ERRE a BB-ban mért értékre fut.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-12. OPPONENT POOL / SELF-PLAY (training/opponent_pool.py)
+12. OPPONENT POOL ÉS BOTOK (training/opponent_pool.py)  (ÚJ v4.1)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 POOL_SIZE = 15 (deque, maxlen)
 SNAPSHOT_INTERVAL = 1000 epizód
+BOT_RATIO = 0.1 (10% esély fix stílusú botra)
+
+Arche-típusok (opponent_archetypes.py):
+  - FishBot: VPIP 55%, passzív, calling station
+  - NitBot: VPIP 12%, PFR 10%, csak premium lapokkal
+  - CallingStation: Mindent callol, soha nem blöfföl
+  - LAGBot: Sokat raise-el, sokat blöfföl.
 
 snapshot(model): deepcopy state_dict → CPU, eval mode
 get_opponent(current_model):
-  50% valószínűséggel: current_model (self-play)
-  50%: random pool tag
+  (1 - bot_ratio) valószínűséggel:
+      50%: current_model (self-play)
+      50%: random pool tag (régi snapshot)
+  bot_ratio valószínűséggel: Random bot az arche-típusok közül
 
-Indok: ha csak régi modell ellen játszik → túl könnyű ellenfél.
-       Ha csak magával → instabil, ciklikus stratégiák.
-       50/50 mix → stabil konvergencia.
+Indok: Ha csak önmaga ellen tanul, agressziós spirálba kerül (AF > 6.0). A fix botok rákényszerítik a modellünket, hogy megvizsgálja a HUD értékeket és exploitálja az adott ellenfelet.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 13. BATCHED SYNC COLLECTOR (training/collector.py)
@@ -454,7 +464,7 @@ OBS VEKTOR (54 dim, MINDIG, játékosszámtól FÜGGETLEN):
   obs = np.zeros(54)
   cards = public_cards + hand          ← board + kéz EGYÜTT (board előre!)
   obs[[card2index[c] for c in cards]] = 1   ← one-hot, dim 0-51
-  obs[52] = float(my_chips)            ← player.in_chips: BETETT összeg
+  obs[52] = float(my_chips)             ← player.in_chips: BETETT összeg
   obs[53] = float(max(all_chips))      ← max BETETT összeg a táblán
 
 KRITIKUS – CHIP ÉRTÉKEK:
@@ -495,7 +505,31 @@ Sanity check:
   python inference/obs_builder.py  ← minden tesztet lefuttat rlcard nélkül
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-16. TRAINING RUNNER (training/runner.py)
+16. LIVE READER & GAME BRIDGE (live_reader/) – ÚJ v4.1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ez a rendszer felel azért, hogy a képernyőn futó póker kliensből automatikusan 
+RTAManager hívásokat generáljon OCR segítségével (nem nyúl memóriához).
+
+- ScreenReader: Képernyőképet olvas (mss). WindowFinder segítségével lokalizálja az ablakot, RegionMapper (bounding box-ok alapján) kivágja az elemeket.
+- Kártyák: OpenCV template matching (52 template fájllal)
+- Számok: Tesseract/EasyOCR a pot és stack méretekhez.
+- GameBridge: Ez az "Állapotgép". FrameDelta alapján figyeli a változásokat két képkocka között. Generálja az RTAManager számára a new_hand(), record_opponent_action() és get_recommendation() hívásokat.
+- Kalibráció: Szükséges egy kalibrációs fájl (`configs/pokerstars_6max.json`), amit a `calibrate.py` futtatásával generálhatunk.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17. MODELL VIZSGÁZTATÁS (test_model_sanity.py) – ÚJ v4.1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mivel a botokat bekötöttük, kellett egy objektív mérőrendszer. A `test_model_sanity.py` (v3 FINAL) a következőket méri:
+- Winrate vs Random: Stabil (+170 BB/100).
+- AF (Agresszió): Jelenleg 6.02, ami túl magas. (Cél: 2.5 - 3.5)
+- Draw-Fold hiba: Eldobja-e a postflop erős húzókat? (Jelenleg 60% hiba, ezt kell javítani).
+- PFR: Csak 23%, nagyon alacsony. (Cél: 65%+)
+- HUD-vakság: Teszteli a bluffing ratiót egy Nit vs Maniac ellenfél profil esetén.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+18. TRAINING RUNNER (training/runner.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 run_training_session(num_players, filename, episodes_to_run):
@@ -517,15 +551,17 @@ CHECKPOINT: state_dict + episodes_trained + time_spent + algorithm +
             state_size + action_size + bb_config (v4 ÚJ!)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-17. KÖNYVTÁR STRUKTÚRA
+19. KÖNYVTÁR STRUKTÚRA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 poker_ai_v4/
 ├── NOTES_MASTER.txt          ← ez a fájl
 ├── README.md                 ← telepítés, használat
+├── YOLO_TRAINING_GUIDE.md    ← YOLO v8 képzés leírása
 ├── requirements.txt          ← rlcard, torch, numpy, tensorboard
 ├── train.py                  ← belépési pont
 ├── rta_example.py            ← RTAManager v4 példa
+├── run_live.py               ← ÚJ: Élő olvasó és RTA indítása
 │
 ├── core/                     ← platform-független logika
 │   ├── __init__.py
@@ -541,15 +577,24 @@ poker_ai_v4/
 │   ├── trainer.py            ← PPOTrainer
 │   ├── normalizer.py         ← RunningMeanStd
 │   ├── opponent_pool.py      ← OpponentPool
+│   ├── opponent_archetypes.py← ÚJ: FishBot, NitBot stb.
 │   ├── collector.py          ← BatchedSyncCollector (256 párhuzamos env)
 │   └── runner.py             ← run_training_session, menu_system
 │
 ├── inference/                ← realtime asszisztens
 │   ├── __init__.py           ← RealtimePokerAssistant + RTAManager export
-│   ├── obs_builder.py        ← ÚJ: rlcard obs rekonstrukció (54 dim)
+│   ├── obs_builder.py        ← rlcard obs rekonstrukció (54 dim)
 │   ├── realtime_assistant.py ← egyszerű RTA (visszafelé kompatibilis)
 │   └── rta_manager.py        ← RTAManager v4 (multi-asztalos, SQLite)
 │
+├── live_reader/              ← ÚJ: OCR és YOLO integráció klienshez
+│   ├── screen_reader.py
+│   ├── game_bridge.py
+│   ├── data_types.py
+│   └── calibrate.py
+│
+├── configs/                  ← ÚJ: OCR régió JSON konfigurációk
+├── templates/                ← ÚJ: OCR kártya és gomb sablonok
 ├── utils/                    ← segédeszközök
 │   ├── __init__.py
 │   └── logging_setup.py      ← logger konfiguráció
@@ -558,7 +603,7 @@ poker_ai_v4/
                                  (~8 MB / 50k játékos)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-18. KRITIKUS BUGOK JAVÍTVA v4-BEN
+20. KRITIKUS BUGOK JAVÍTVA v4-BEN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 BUG-1 (v3.4): Dupla _encode() call a collector-ban.
@@ -580,7 +625,7 @@ BUG-5 (v4 korai): rlcard obs méret hibásan feltételezve (72@6p, 50@2p, stb.)
   A STATE_SIZE @ 6p: 492 (régi, hibás) → 475 (helyes).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-19. VISSZAFELÉ KOMPATIBILITÁS DÖNTÉS
+21. VISSZAFELÉ KOMPATIBILITÁS DÖNTÉS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 DÖNTÉS: INKOMPATIBILIS (v4 teljesen új tréning)
@@ -590,12 +635,11 @@ INDOK:
   - feature semantika változik (opponent stats)
   Az eddigi checkpointok input_proj kivételével betölthetők,
   de a reward/feature eltérés miatt a betöltés félrevezető lenne.
-
-Checkpoint betöltő MEGTARTVA: strict=False + size mismatch kiszűrés.
+  Checkpoint betöltő MEGTARTVA: strict=False + size mismatch kiszűrés.
 Ha valaki v3.x checkpoint-ot tölt be → warning + részleges betöltés.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-20. HIPERPARAMÉTEREK ÖSSZEFOGLALÓJA
+22. HIPERPARAMÉTEREK ÖSSZEFOGLALÓJA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 NUM_ENVS             = 256
@@ -623,7 +667,7 @@ BB_OPTIONS           = [1, 2, 5, 10, 25]
 STACK_MULTIPLIERS    = [20, 30, 40, 60, 80, 100, 150, 200]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-21. RLCARD SPECIFIKUS ISMERETEK (forráskód alapján)
+23. RLCARD SPECIFIKUS ISMERETEK (forráskód alapján)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 obs méret: MINDIG 54 dim – játékosszámtól FÜGGETLEN
@@ -652,6 +696,18 @@ env.get_payoffs() → numpy array[float] per player  ← NEM list! numpy array!
 
 FIGYELEM: az rlcard no-limit-holdem env nem mindig adja a 'stakes'-t
           ezért a BB/SB-t a Collector tárolja és adja át feature buildnek.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+24. V5 ROADMAP / LOW STAKES CÉLOK (10-15M Epizód Fázis)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CÉL: NL2-NL10 szintű profittermelő AI létrehozása, ami nem csak a randomot veri, de exploitálja a bot/micro-stakes tendenciákat.
+- Tréning: További 5-10M epizód a bot_ratio=0.1 beállítással.
+- Finomhangolás: 
+  - Ha a Draw-Fold hiba 10M-nél is fennáll: Apró auxiliary loss/reward shaping a húzók megtartásáért (+0.05 BB erős equity húzó callolásáért).
+  - Entropy Coeff: Csökkentés 0.02 → 0.01 / 0.005.
+  - Stack specializáció: Tréning szűkítése 80, 100, 120 BB mélységre.
+- A modell tesztelését 10,000 leosztás/bot mértékben kell futtatni az `evaluate.py` / `test_model_sanity.py` segítségével, hogy a winrate-ek statisztikailag szignifikánsak legyenek.
 
 ================================================================================
 EOF

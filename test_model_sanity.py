@@ -17,6 +17,7 @@ Használat:
     python test_model_sanity.py 2max_ppo_v4.pth
     python test_model_sanity.py 2max_ppo_v4.pth --hands 5000 --verbose
     python test_model_sanity.py 2max_ppo_v4.pth --winrate --winrate-hands 5000
+    python test_model_sanity.py 2max_ppo_v4.pth --out-dir ModellNaplo/2max_ppo_v4_4M
     python test_model_sanity.py --compare 2max_5M.pth 2max_10M.pth 2max_20M.pth
 """
 
@@ -44,11 +45,13 @@ ALL_CARDS = [r + s for r in RANKS for s in SUITS]
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestLogger:
-    def __init__(self, model_path, num_players, n_hands):
-        os.makedirs("logs", exist_ok=True)
+    def __init__(self, model_path, num_players, n_hands, out_dir="logs"):
+        os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = os.path.splitext(os.path.basename(model_path))[0]
-        self.log_path = f"logs/test_{model_name}_{num_players}p_{n_hands}h_{ts}.log"
+        self.log_path = os.path.join(
+            out_dir, f"test_{model_name}_{num_players}p_{n_hands}h_{ts}.log"
+        )
         self._file = open(self.log_path, 'w', encoding='utf-8')
         self.results = {'timestamp': ts, 'model': model_path,
                         'num_players': num_players, 'n_hands': n_hands,
@@ -352,7 +355,6 @@ def run_sizing_test(model, ob, tr, he, np_, dev, ee, tl):
     tl.log(f"{'─'*65}\n")
     mp=PokerActionMapper()
 
-    # Preflop BTN open
     tl.log(f"  ── Preflop BTN open ──")
     pf_hands=[('72o',['7s','2h'],1),('T5o',['Td','5c'],2),('K8o',['Kd','8h'],3),
               ('QJs',['Qh','Jh'],4),('TT',['Ts','Th'],5),('AQo',['Ac','Qd'],6),
@@ -370,7 +372,6 @@ def run_sizing_test(model, ob, tr, he, np_, dev, ee, tl):
     pc=_spearman([r['strength'] for r in pf_r],[r['weighted_tier'] for r in pf_r])
     tl.log(f"\n  Preflop sizing r={pc:.2f} ({'✅' if pc>0.5 else '⚠' if pc>0.2 else '❌'})")
 
-    # Postflop (dry flop Kd 7d 2c)
     tl.log(f"\n  ── Postflop bet sizing (Kd 7d 2c) ──")
     pp_hands=[('Air 94o',['9d','4c'],1),('Mid pair',['7s','6s'],2),
               ('Top pair',['Kc','Jd'],3),('Overpair',['As','Ah'],4),
@@ -397,10 +398,6 @@ def run_sizing_test(model, ob, tr, he, np_, dev, ee, tl):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_consistency_test(model, ob, tr, he, np_, dev, ee, tl):
-    """
-    A probability distribution entropy-jából méri a döntési magabiztosságot.
-    Alacsony entropy = magabiztos. Magas entropy = bizonytalan.
-    """
     tl.log(f"\n{'─'*65}")
     tl.log(f"  KONZISZTENCIA / ENTROPY TESZT")
     tl.log(f"{'─'*65}\n")
@@ -454,9 +451,6 @@ def run_consistency_test(model, ob, tr, he, np_, dev, ee, tl):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_winrate_test(model, np_, device, n_hands, tl):
-    """
-    Self-play + random ellenfél winrate mérés rlcard env-ben.
-    """
     tl.log(f"\n{'─'*65}")
     tl.log(f"  BB/100 WINRATE TESZT ({n_hands} kéz)")
     tl.log(f"{'─'*65}\n")
@@ -472,7 +466,6 @@ def run_winrate_test(model, np_, device, n_hands, tl):
     bb=2.0; sb=1.0
 
     def play_hands(model_p0, model_p1, n, is_random_p1=False):
-        """N kezet lejátszik, visszaadja p0 összesített payoff-ját."""
         env = rlcard.make('no-limit-holdem', config={'game_num_players': np_})
         tracker = OpponentHUDTracker(np_)
         he = ActionHistoryEncoder(np_, PokerActionMapper.NUM_CUSTOM_ACTIONS)
@@ -487,24 +480,16 @@ def run_winrate_test(model, np_, device, n_hands, tl):
                 continue
             ah = collections.deque(maxlen=ACTION_HISTORY_LEN)
             steps = 0
-            
-            # A JAVÍTÁS: A kiértékelt modell a paritás függvényében a 0-s vagy 1-es székre ül
             model_seat = hand_idx % 2
-            
+
             while not env.is_over() and steps < 200:
                 steps += 1
                 raw_legal = state.get('legal_actions', [1])
                 abs_legal = mapper.get_abstract_legal_actions(raw_legal)
 
-                if player_id == model_seat:
-                    act_model = model_p0
-                else:
-                    act_model = model_p1
-
                 if is_random_p1 and player_id != model_seat:
                     aa = random.choice(abs_legal)
                 else:
-                    # Equity
                     try:
                         hand = env.game.players[player_id].hand
                         hole_eq = [f"{c.get_index()[1]}{c.get_index()[0].lower()}" for c in hand]
@@ -514,25 +499,14 @@ def run_winrate_test(model, np_, device, n_hands, tl):
                         eq = 0.5
 
                     street = detect_street(state)
-                    sc = {'hole_cards': [], 'board_cards': [],
-                          'my_chips': state.get('raw_obs',{}).get('my_chips',0),
-                          'all_chips': state.get('raw_obs',{}).get('all_chips',[0]*np_),
-                          'pot': state.get('raw_obs',{}).get('pot',0),
-                          'call_amount': state.get('raw_obs',{}).get('call_amount',0),
-                          'bb':bb, 'sb':sb, 'stack':100.0, 'street': street,
-                          'button_pos': state.get('raw_obs',{}).get('button',0),
-                          'my_player_id': player_id}
-
                     obs = np.array(state['obs'], dtype=np.float32)
-                    st_dict = {
-                        'obs': obs,
-                        'raw_obs': state.get('raw_obs', {}),
-                    }
+                    st_dict = {'obs': obs, 'raw_obs': state.get('raw_obs', {})}
                     state_t = build_state_tensor(
                         st_dict, tracker, ah, he, np_,
                         my_player_id=player_id, bb=bb, sb=sb,
                         initial_stack=100.0, street=street, equity=eq)
 
+                    act_model = model_p0 if player_id == model_seat else model_p1
                     with torch.no_grad():
                         probs_t, _, _ = act_model.forward(state_t.to(device), abs_legal)
                     probs = probs_t.squeeze(0).cpu().numpy()
@@ -547,7 +521,6 @@ def run_winrate_test(model, np_, device, n_hands, tl):
 
             try:
                 payoffs = env.get_payoffs()
-                # A payoffot mostantól mindig a model_seat (saját) pozíciónkból kérjük le
                 total_payoff += float(payoffs[model_seat])
                 completed += 1
             except:
@@ -558,7 +531,6 @@ def run_winrate_test(model, np_, device, n_hands, tl):
 
     t0 = time.time()
 
-    # Self-play
     tl.log(f"  Self-play ({n_hands} kéz)...", console=True)
     sp_bb100, sp_n, sp_total = play_hands(model, model, n_hands, is_random_p1=False)
     tl.log(f"  Self-play BB/100: {sp_bb100:+.1f} ({sp_n} kéz, total={sp_total:+.1f})")
@@ -567,7 +539,6 @@ def run_winrate_test(model, np_, device, n_hands, tl):
     else:
         tl.log(f"  ⚠ Self-play aszimmetria: {sp_bb100:+.1f} BB/100")
 
-    # Vs random
     tl.log(f"\n  Vs random ({n_hands} kéz)...", console=True)
     rnd_bb100, rnd_n, rnd_total = play_hands(model, model, n_hands, is_random_p1=True)
     elapsed = time.time() - t0
@@ -680,7 +651,6 @@ def run_poker_stats(model, ob, tr, he, np_, dev, ee, n_hands, tl):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compare_models(model_paths, np_, device, n_hands, seed, do_winrate, wr_hands):
-    """Több modellt futtat ugyanazzal a beállítással, tabulált kimenet."""
     print(f"\n{'='*75}")
     print(f"  🔄  MODELL ÖSSZEHASONLÍTÁS ({len(model_paths)} modell)")
     print(f"{'='*75}\n")
@@ -698,7 +668,6 @@ def compare_models(model_paths, np_, device, n_hands, seed, do_winrate, wr_hands
         print("  ⚠ Legalább 2 modell kell az összehasonlításhoz")
         return
 
-    # Tabulált kimenet
     print(f"\n{'='*75}")
     print(f"  ÖSSZEHASONLÍTÁS")
     print(f"{'='*75}\n")
@@ -742,7 +711,8 @@ def compare_models(model_paths, np_, device, n_hands, seed, do_winrate, wr_hands
 
 
 def run_single_model(model_path, np_, device_str, n_hands, seed,
-                     verbose=False, do_winrate=False, wr_hands=2000, quiet=False):
+                     verbose=False, do_winrate=False, wr_hands=2000,
+                     quiet=False, out_dir="logs"):
     """Egyetlen modell teljes tesztelése, visszaadja az összesített dict-et."""
     device = torch.device(device_str)
     try:
@@ -763,7 +733,7 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
     if np_ is None:
         print(f"  ⚠ state_size={state_size}"); return None
 
-    tl = TestLogger(model_path, np_, n_hands)
+    tl = TestLogger(model_path, np_, n_hands, out_dir=out_dir)
     if quiet:
         tl.log = lambda text, console=False: tl._file.write(text+'\n')
 
@@ -790,7 +760,6 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
     if do_winrate:
         wr = run_winrate_test(model,np_,device,wr_hands,tl)
 
-    # Értékelés
     ti = f + len(stats.get('degeneration',[]))
     if draw['draw_fold_pct']>30: ti+=1
     if ti==0 and w<=3: g='🟢 JÓ'
@@ -856,6 +825,9 @@ def main():
     parser.add_argument('--winrate-hands', type=int, default=2000)
     parser.add_argument('--compare', nargs='+', metavar='MODEL',
                         help='Több modell összehasonlítása')
+    parser.add_argument('--out-dir', default='logs',
+                        help='Log és JSON mentési mappa (default: logs/). '
+                             'Automatikus tesztelésnél a runner állítja be.')
     args = parser.parse_args()
 
     # ── Compare mód ──────────────────────────────────────────────────────
@@ -871,7 +843,8 @@ def main():
     random.seed(args.seed); np.random.seed(args.seed)
     run_single_model(args.model_path, args.num_players, args.device,
                      args.hands, args.seed, args.verbose,
-                     args.winrate, args.winrate_hands, quiet=False)
+                     args.winrate, args.winrate_hands, quiet=False,
+                     out_dir=args.out_dir)
 
 
 if __name__ == '__main__':
