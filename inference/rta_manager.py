@@ -145,11 +145,16 @@ class ModelPool:
         if not (isinstance(ck, dict) and 'state_dict' in ck):
             raise ValueError(f"Érvénytelen checkpoint formátum: {path}")
 
-        state_size  = ck.get('state_size',  492)
-        action_size = ck.get('action_size', 7)
-        model = AdvancedPokerAI(state_size=state_size,
-                                action_size=action_size).to(self._device)
-        model.load_state_dict(ck['state_dict'])
+        state_size      = ck.get('state_size',  492)
+        action_size     = ck.get('action_size', 7)
+        # [RF-8] GRU params from checkpoint
+        num_players     = ck.get('num_players', None)
+        rlcard_obs_size = ck.get('rlcard_obs_size', 54)
+        model = AdvancedPokerAI(
+            state_size=state_size, action_size=action_size,
+            num_players=num_players, rlcard_obs_size=rlcard_obs_size,
+        ).to(self._device)
+        model.load_state_dict(ck['state_dict'], strict=False)
         model.eval()
 
         self._models[num_players] = model

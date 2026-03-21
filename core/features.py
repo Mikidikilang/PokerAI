@@ -168,14 +168,24 @@ class BatchStateBuilder:
                                       action_histories, ...)
     """
 
-    def __init__(self, state_size: int, num_players: int, max_batch: int = 512):
+    def __init__(self, state_size: int, num_players: int,
+                 obs_dim: int = 54, max_batch: int = 512):
+        """
+        Paraméterek:
+            state_size: teljes state vektor mérete (compute_state_size() eredménye)
+            num_players: játékosok száma
+            obs_dim:    rlcard obs tömb mérete – [RF-4 FIX] már nem hardcode,
+                        hanem paraméterként kapja a collector-tól. Default=54
+                        visszafelé kompatibilis.
+            max_batch:  pre-allokált buffer méret
+        """
         self.state_size = state_size
         self.num_players = num_players
+        self.obs_dim = obs_dim          # [RF-4 FIX] eltárolva jövőbeli introspekció-hoz
         self.max_batch = max_batch
         self._history_encoder = ActionHistoryEncoder(num_players, NUM_ABSTRACT_ACTIONS)
 
-        # Offset-ek kiszámítása egyszer
-        obs_dim = 54
+        # Offset-ek kiszámítása egyszer – obs_dim-t paraméterből veszi
         stats_dim = num_players * NUM_ABSTRACT_ACTIONS  # 7 per player
         self._off = {}
         o = 0
@@ -229,7 +239,7 @@ class BatchStateBuilder:
             i = env_indices[idx]
             state = states[i]
 
-            # [1] obs (54 dim)
+            # [1] obs (obs_dim dim – parametrized, RF-4 FIX)
             a, b = o['obs']
             obs = state.get('obs', None)
             if obs is not None:

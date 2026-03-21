@@ -22,9 +22,27 @@ OPTIMALIZÁCIÓK az eredetihez képest:
   KOMPATIBILITÁS: Checkpoint formátum VÁLTOZATLAN.
                   A modell architektúra VÁLTOZATLAN.
                   A tanulási dinamika AZONOS (azonos state tensor kimenet).
+
+  [RF-1 FIX] BB/Stack mismatch javítva: _reset_env() most az rlcard env
+             tényleges game konfigját olvassa vissza reset után, ahelyett
+             hogy véletlenszerű, soha nem alkalmazott bb/stack értékeket
+             használna a feature normalizáláshoz.
+
+  [RF-9 FIX] Valódi equity számítás rlcard raw_obs alapján.
+             _step_learners_batched() mostantól HandEquityEstimator-t hív
+             a state tensor equity dimenzióját (state[-1]) kitöltendő.
+             Preflop: lookup cache, postflop: adaptív MC (min 50, max 200 sim).
+             Ha a kártyák nem elérhetők (preflop rejtett lap), 0.5 fallback.
+
+  [RF-11 FIX] Street-átmenet equity delta intermediate reward.
+             Flop/turn/river átmenetkor equity_delta * STREET_REWARD_SCALE
+             reward shaping adódik hozzá. Ez gyorsabb konvergenciát ad a
+             drawing hand szituációkhoz – óvatosan kalibrált (0.05 scale),
+             hogy ne torzítsa el a terminális reward fontosságát.
 """
-import collections, logging, random
+import collections, logging
 import rlcard, torch, torch.nn.functional as F
+from core.equity import HandEquityEstimator
 from core.action_mapper import PokerActionMapper
 from core.features import (
     ActionHistoryEncoder, build_state_tensor, detect_street,
@@ -35,13 +53,81 @@ from core.opponent_tracker import OpponentHUDTracker
 logger = logging.getLogger("PokerAI")
 _MAX_STEPS_PER_HAND = 500
 _LEARNER_ID = 0
-BB_OPTIONS = [1, 2, 5, 10, 25]
-STACK_MULTIPLIERS = [20, 30, 40, 60, 80, 100, 150, 200]
+# BB_OPTIONS / STACK_MULTIPLIERS eltávolítva (RF-1 fix): az env saját konfigja
+# kerül kiolvasásra reset után – véletlenszerű, soha nem alkalmazott értékek helyett.
+
+# [RF-11] Street-átmenet intermediate reward shaping
+# Equity delta szorozva ezzel az értékkel adódik a reward-hoz flop/turn/river-en.
+# Alacsony érték szándékos: a terminális reward marad a fő tanulási jel.
+_STREET_REWARD_SCALE = 0.05
+
+# [RF-9] Equity estimator singleton (thread-safe: read-only cache + random)
+_EQUITY_ESTIMATOR = HandEquityEstimator(n_sim=200, cache_size=20_000)
+
+
+
+def _rlcard_cards_to_equity_fmt(cards: list) -> list:
+    """
+    [RF-9] rlcard kártya formátum ('SA', 'HK') → equity.py formátum ('As', 'Kh').
+
+    rlcard: Card.get_index() = suit_upper + rank_upper  (pl. 'SA', 'HK', 'DT')
+    equity: rank_lower + suit_lower                     (pl. 'As', 'Kh', 'Td')
+    """
+    _SUIT_MAP  = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
+    _RANK_MAP  = {'A':'a','2':'2','3':'3','4':'4','5':'5','6':'6',
+                  '7':'7','8':'8','9':'9','T':'t','J':'j','Q':'q','K':'k'}
+    result = []
+    for card in cards:
+        if not card or len(card) < 2:
+            continue
+        suit = _SUIT_MAP.get(card[0].upper())
+        rank = _RANK_MAP.get(card[1].upper())
+        if suit and rank:
+            result.append(rank + suit)
+    return result
+
+
+def _compute_equity_for_env(state: dict, num_opponents: int) -> float:
+    """
+    [RF-9] Valódi equity becslés az aktuális rlcard state-hez.
+
+    Kártyák kinyerése raw_obs['hand'] és raw_obs['public_cards']-ból,
+    majd HandEquityEstimator.equity() hívás.
+
+    Visszatér: float [0.0, 1.0] – fallback 0.5 ha a lapok nem elérhetők.
+    """
+    raw = state.get('raw_obs', {})
+    hole_rlcard  = raw.get('hand', [])
+    board_rlcard = raw.get('public_cards', [])
+
+    hole  = _rlcard_cards_to_equity_fmt(hole_rlcard)
+    board = _rlcard_cards_to_equity_fmt(board_rlcard)
+
+    if len(hole) < 2:
+        return 0.5  # lapok nem elérhetők → neutral prior
+
+    try:
+        return _EQUITY_ESTIMATOR.equity(
+            hole_cards=hole,
+            board=board,
+            num_opponents=max(num_opponents, 1),
+        )
+    except Exception:
+        return 0.5
 
 
 class BatchedSyncCollector:
     def __init__(self, num_envs, model, device, num_players, action_mapper,
-                 model_kwargs, pool):
+                 model_kwargs, pool, rlcard_obs_size: int = 54):
+        """
+        Paraméterek:
+            ...
+            rlcard_obs_size: [RF-4 FIX] rlcard obs tömb mérete. Default=54 a
+                standard no-limit-holdem env-hez. Ha az rlcard frissítése vagy
+                más config megváltoztatja az obs méretet, ezt kell frissíteni –
+                nem fog silent méretbeli eltérés keletkezni.
+                runner.py-ban: rlcard_obs_size = len(env.reset()[0]['obs'])
+        """
         self.num_envs = num_envs
         self.model = model
         self.device = device
@@ -49,6 +135,7 @@ class BatchedSyncCollector:
         self.action_mapper = action_mapper
         self.pool = pool
         self.action_size = PokerActionMapper.NUM_CUSTOM_ACTIONS
+        self._rlcard_obs_size = rlcard_obs_size  # [RF-4 FIX] stored for _reset_env fallback
 
         logger.info(f"  {num_envs} rlcard env inicializálása...")
         self.envs = [
@@ -73,12 +160,20 @@ class BatchedSyncCollector:
         self._bb = [2.0] * num_envs
         self._sb = [1.0] * num_envs
         self._initial_stack = [100.0] * num_envs
-        self._street = [0] * num_envs
+        self._street      = [0]   * num_envs
         self._last_equity = [0.5] * num_envs
+        # [RF-11] street-átmenet equity delta reward shaping
+        self._prev_street  = [0]   * num_envs   # előző lépés utcája
+        self._prev_equity  = [0.5] * num_envs   # előző lépés equitije
 
         # ── OPT-2: BatchStateBuilder pre-allokált tömbökkel ───────────────
-        state_size = compute_state_size(54, num_players)
-        self._batch_builder = BatchStateBuilder(state_size, num_players, max_batch=num_envs)
+        # [RF-4 FIX] obs_dim paraméterből jön, nem hardcode 54
+        state_size = compute_state_size(rlcard_obs_size, num_players)
+        self._batch_builder = BatchStateBuilder(
+            state_size, num_players,
+            obs_dim=rlcard_obs_size,
+            max_batch=num_envs,
+        )
 
         # ── Opponent model → id mapping a batch csoportosításhoz ──────────
         self._opp_model_ids = [0] * num_envs  # id(model) → int index
@@ -110,25 +205,40 @@ class BatchedSyncCollector:
             self._reset_env(i)
 
     def _reset_env(self, i):
-        # 15% valószínűséggel explicit short-stack szituáció
-        if random.random() < 0.15:
-            bb = random.choice([1, 2, 5])          # csak kisebb vakokat
-            sb = max(1, bb // 2)
-            short_multiplier = random.choice([8, 10, 12, 15])  # 8-15 BB mélység
-            stack = bb * short_multiplier
-        else:
-            bb = random.choice(BB_OPTIONS)
-            sb = bb // 2
-            stack = bb * random.choice(STACK_MULTIPLIERS)
-        self._bb[i] = float(bb)
-        self._sb[i] = float(sb)
-        self._initial_stack[i] = float(stack)
+        # [RF-1 FIX] Nem generálunk véletlenszerű bb/stack értékeket amelyeket
+        # az rlcard env nem kap meg. Ehelyett: reset után beolvassuk az env
+        # tényleges game konfigurációját, hogy a feature pipeline konzisztens
+        # adatot lásson.
+        #
+        # Korábbi hiba: bb=5, stack=150 generálódott, de envs[i].reset()
+        # ignórálta őket → a stack_in_bb, SPR, pot_odds feature-ök
+        # szisztematikusan hibás értékeket adtak vissza.
         try:
             s, p = self.envs[i].reset()
+            # ── Tényleges game konfig kiolvasása az rlcard game objektumból ──
+            game = self.envs[i].game
+            bb   = float(getattr(game, 'big_blind',   getattr(game, 'blind', 2.0)))
+            sb   = float(getattr(game, 'small_blind', bb / 2.0))
+            # initial_stack: reset utáni all_chips maximum értéke (mindenki egyforma)
+            raw  = s.get('raw_obs', {})
+            chips = raw.get('all_chips', [])
+            stack = float(max(chips)) if chips else float(
+                getattr(game, 'init_chips', getattr(game, 'chips', 100.0))
+            )
+            # Sanity: ha az env nem ad értelmes értékeket, maradunk sane defaulton
+            if bb < 0.5:   bb = 2.0
+            if sb < 0.25:  sb = 1.0
+            if stack < bb: stack = bb * 100
         except Exception as exc:
             logger.error(f"Env {i} reset hiba: {exc}", exc_info=True)
-            s = {'obs': [0.0] * 54, 'raw_obs': {}, 'legal_actions': [1]}
-            p = 0
+            s     = {'obs': [0.0] * self._rlcard_obs_size, 'raw_obs': {}, 'legal_actions': [1]}
+            p     = 0
+            bb    = 2.0
+            sb    = 1.0
+            stack = 200.0
+        self._bb[i]            = bb
+        self._sb[i]            = sb
+        self._initial_stack[i] = stack
         self._states[i] = s
         self._players[i] = p
         self._steps[i] = []
@@ -140,6 +250,8 @@ class BatchedSyncCollector:
             self._trackers[i] = OpponentHUDTracker(self.num_players)
         self._action_histories[i].clear()
         self._last_equity[i] = 0.5
+        self._prev_street[i]  = 0
+        self._prev_equity[i]  = 0.5
 
     # ═══════════════════════════════════════════════════════════════════════
     # OPT-1: BATCHED OPPONENT STEPPING
@@ -336,15 +448,28 @@ class BatchedSyncCollector:
                 (state_before, legal, action.cpu(), lp.cpu(), value.cpu())
             )
 
-            # Equity kinyerése a state tensor utolsó eleméből (equity dim = state[-1])
-            self._last_equity[i] = float(state_before[-1].item())
+            # [RF-9 FIX] Valódi equity számítás rlcard raw_obs alapján
+            # (nem a state tensor utolsó dimenziójából, ami még 0.5 default volt)
+            equity_now = _compute_equity_for_env(
+                self._states[i], num_opponents=self.num_players - 1
+            )
+            self._last_equity[i] = equity_now
+            # [RF-11] Street-átmenet equity delta tracking
+            # A delta-t a _collect_done_envs-ben használjuk intermediate reward-hoz
+            self._prev_equity[i] = self._prev_equity[i]  # megőrizzük az előzőt
 
             try:
                 ns, np_ = self.envs[i].step(ea)
+                # [RF-11] Street váltás előtt mentjük az equity-t
+                new_street = detect_street(ns)
+                if new_street != self._street[i]:
+                    # Street-átmenet: frissítjük a prev értékeket
+                    self._prev_street[i] = self._street[i]
+                    self._prev_equity[i] = equity_now
                 self._states[i] = ns
                 self._players[i] = np_
                 self._step_cnt[i] += 1
-                self._street[i] = detect_street(ns)
+                self._street[i] = new_street
             except Exception as exc:
                 logger.error(f"Env {i} learner step hiba: {exc}", exc_info=True)
                 self._active[i] = False
@@ -376,24 +501,36 @@ class BatchedSyncCollector:
                         logger.debug(f"Env {i} payoffs hiba: {exc}")
                         raw_reward = 0.0
 
-                    # ── Draw fold reward shaping ─────────────────────────────────────────────
-                    # Ha a modell utolsó akciója fold volt, postflop, és az equity erős volt
-                    # (8+ outos draw szintje: equity >= 0.44), büntetjük.
-                    # A büntetés mértéke -0.08 BB, ami a pot méretéhez képest kis összeg,
-                    # de elegendő gradienst ad a draw-ok megtanulásához.
+                    # ── Reward shaping ───────────────────────────────────────────────────────
+                    #
+                    # 1) Draw fold penalty (eredeti): ha postflop fold erős equity-vel → -0.08
+                    # 2) [RF-11 FIX] Street-átmenet equity delta: flop/turn/river-en az
+                    #    equity növekedés kis pozitív, csökkenés kis negatív jutalmat ad.
+                    #    Scale: 0.05 – szándékosan alacsony, hogy a terminális reward
+                    #    domináljon. Célja: draw-ok és semibluff-ok gyorsabb tanulása.
+
                     if self._steps[i]:
                         last_state, last_legal, last_action, last_lp, last_val = self._steps[i][-1]
                         last_action_int = int(last_action.item())
                         last_street = self._street[i]
-                        last_eq = self._last_equity[i]
+                        last_eq    = self._last_equity[i]
 
-                        DRAW_FOLD_PENALTY = 0.08   # BB-ben mért büntetés
+                        # 1) Draw fold penalty
+                        DRAW_FOLD_PENALTY     = 0.08
                         DRAW_EQUITY_THRESHOLD = 0.44  # ~8-9 outos draw szintje
-
-                        if (last_action_int == 0           # 0 = Fold
-                                and last_street >= 1       # Postflop (flop/turn/river)
+                        if (last_action_int == 0
+                                and last_street >= 1
                                 and last_eq >= DRAW_EQUITY_THRESHOLD):
                             raw_reward -= DRAW_FOLD_PENALTY
+
+                        # 2) [RF-11 FIX] Street-átmenet equity delta reward
+                        # Csak akkor adódik hozzá ha ténylegesen volt street-váltás
+                        # (prev_street != current street) és mindkét equity érvényes.
+                        if last_street > self._prev_street[i] and last_street >= 1:
+                            equity_delta = last_eq - self._prev_equity[i]
+                            # Clamp: max ±0.3 equity változás vehető figyelembe
+                            equity_delta = max(-0.3, min(0.3, equity_delta))
+                            raw_reward += equity_delta * _STREET_REWARD_SCALE
                     
                     bb_reward = raw_reward / max(self._bb[i], 1e-6)
                     completed.append((self._steps[i], bb_reward))

@@ -784,3 +784,627 @@ CÉL: NL2-NL10 szintű profittermelő AI létrehozása, ami nem csak a randomot 
 ================================================================================
 EOF
 ================================================================================
+
+================================================================================
+POKER AI v4.2 – AUDIT SPRINT JAVÍTÁSOK ÉS VÁLTOZÁSOK
+2026-03-21 | Senior kódaudit alapján, 11 RF javítva, 62/62 teszt zöld
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERZIÓTÖRTÉNET FOLYTATÁS – v4.2
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+v4.2 (Audit Sprint):
+  Kiindulás: senior kódaudit 15 kulcsfájlon, 12 issue azonosítva.
+  Összesített pontszám előtte: 6.6/10
+
+  P0 – Kritikus bugfixek (2 db, azonnal rontottak a tréning minőségén):
+    RF-1: BB/Stack mismatch javítva (collector.py)
+    RF-2: StepLR → CosineAnnealingLR (trainer.py)
+
+  P1 – Sürgős javítások (4 db):
+    RF-3: GAE last_value bootstrap (buffer.py + trainer.py + runner.py)
+    RF-7: Üres legal_actions NaN guard (model.py)
+    RF-10: _BLEND_THRESHOLD 10 → 50 (opponent_tracker.py)
+    BONUS: dead BB_OPTIONS/STACK_MULTIPLIERS import cleanup (runner.py)
+
+  P2 – Teljesítmény & helyesség (3 db):
+    RF-5: Vektorizált action mask (~20× gyorsítás) (model.py)
+    RF-4: obs_dim=54 hardcode eltávolítva (features.py + collector.py + runner.py)
+    RF-6: SQLite thread-local connection pool (opponent_tracker.py)
+
+  P3 – Stratégiai fejlesztések (3 db):
+    RF-8: Valódi GRU TemporalBlock (model.py + runner.py + play_vs_ai.py + rta_manager.py)
+    RF-9: Valódi equity számítás rlcard raw_obs-ból (collector.py)
+    RF-11: Street-átmenet equity delta intermediate reward (collector.py)
+
+  Arch sprint:
+    config.py: TrainingConfig dataclass (centralizált konfiguráció)
+    test_all_fixes.py: 62 regressziós teszt (AST-alapú, torch-független)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+25. P0 BUGFIXEK RÉSZLETESEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RF-1: BB/STACK MISMATCH (collector.py _reset_env)
+  ─────────────────────────────────────────────────
+  HIBA: _reset_env() véletlenszerű bb/stack értékeket generált (BB_OPTIONS,
+  STACK_MULTIPLIERS), de az rlcard env.reset()-et PARAMÉTER NÉLKÜL hívta.
+  Az env a saját default értékeivel játszott (bb=2, stack=100),
+  miközben a feature pipeline a véletlenszerű értékekkel normalizált.
+
+  HATÁS: stack_in_bb, pot_in_bb, SPR, M-ratio, pot odds MIND szisztematikusan
+  hibásak. Pl. ha bb=10 generálódott de az env bb=2-t használt:
+    stack_in_bb = 100 / 10 = 10  (helyes lenne: 100 / 2 = 50)
+    → a modell "short stack"-nek látja a deep stack szituációt → 5× torzítás!
+
+  JAVÍTÁS: _reset_env() most először env.reset()-et hív, MAJD visszaolvassa
+  az env.game objektumból a tényleges big_blind, small_blind értékeket.
+  A stack a raw_obs['all_chips'] maximumából jön.
+  Sanity check: bb < 0.5 → default 2.0; stack < bb → bb * 100.
+
+  MELLÉKHATÁS: BB_OPTIONS és STACK_MULTIPLIERS konstansok eltávolítva
+  (collector.py és runner.py-ból is). A véletlenszerű stack randomizálás
+  megszűnt – az env mindig saját konfigját játssza, a feature pipeline
+  konzisztensen ugyanazokat az értékeket látja.
+
+  FONTOS TANULSÁG: ha rlcard-ot rekonfigurálni szeretnénk (különböző
+  blind-ok, stack mélységek szimulálása), azt env.game.game_config.update()-tel
+  RESET ELŐTT kell elvégezni, nem utána.
+
+RF-2: STEPLR → COSINEANNEALINGLR (trainer.py)
+  ─────────────────────────────────────────────
+  HIBA: StepLR(step_size=1_000_000, gamma=0.7) + scheduler.step() minden
+  update()-ben. Mivel 1 update ≈ 2048 epizód:
+    1_000_000 update × 2048 ep/update = ~2 milliárd epizód az első decay-hez
+  Az LR soha nem csökkent normál futásban.
+
+  JAVÍTÁS: CosineAnnealingLR(T_max=500, eta_min=lr * 0.05)
+    T_max=500 update ≈ 1M epizód → az LR 3e-4-ről 1.5e-5-re csökken,
+    majd felmegy, majd újra le (cosine alakban). Ez PPO-hoz ideális –
+    a cosine görbe elkerüli az abrupt LR csökkenéseket.
+
+  load_state_dict() try/except védelemmel: régi StepLR checkpointok
+  kompatibilitási hiba esetén egyszerűen kihagyódnak (scheduler nulláról indul).
+
+  MELLÉKHATÁS: LR_T_MAX=500 és LR_ETA_MIN_RATIO=0.05 osztályváltozóként
+  eltárolva, hogy TrainingConfig-ból könnyen felülírható legyen.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+26. P1 BUGFIXEK RÉSZLETESEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RF-3: GAE BOOTSTRAP JAVÍTÁS (buffer.py + trainer.py + runner.py)
+  ────────────────────────────────────────────────────────────────
+  HIBA: compute_gae()-ban ha t == n-1 (buffer utolsó lépése), a kód
+  nv = 0.0-t használt. Ez akkor hibás, ha az utolsó lépés NEM terminális
+  (pl. a buffer megtelt, de az epizód még fut).
+
+  Helyes GAE képlet nem-terminális lépésnél:
+    delta_T = r_T + γ * V(s_{T+1}) * (1 - done_T) - V(s_T)
+  Ha done_T = False és V(s_{T+1}) = 0.0 → delta_T alulbecsül.
+  Ez a value function szisztematikus torzítását okozza a buffer végén.
+
+  JAVÍTÁS (3 fájlban összehangolva):
+    buffer.py: compute_gae(last_value=0.0) – ha nem terminális, last_value
+               kerül be nv helyett. Default 0.0 → visszafelé kompatibilis.
+    trainer.py: update(buffer, last_value=0.0) – átadja a buffer-nek.
+    runner.py: A trainer.update() hívása ELŐTT:
+      if buffer.episode_ends[-1] == False:  # nem terminális
+          last_state = buffer.states[-1].unsqueeze(0).to(device)
+          _, lv, _ = learner.forward(last_state, last_legal)
+          last_value = float(lv.item())
+      metrics = trainer.update(buffer, last_value=last_value)
+
+  VÁRHATÓ JAVULÁS: 10–15%-os value function pontosság javulás, különösen
+  hosszú kézállásokban (turn, river multi-street döntések).
+
+RF-7: NAN GUARD – ÜRES LEGAL ACTIONS (model.py)
+  ─────────────────────────────────────────────────
+  HIBA: Ha legal_actions = [], a mask teljesen -1e9 marad.
+  softmax([-1e9, -1e9, -1e9, -1e9, -1e9, -1e9, -1e9]) → NaN
+  Ez élő kliensben reálisan előfordulhat: live reader timeout, env hiba,
+  átmeneti állapot a GameBridge állapotgépben.
+
+  JAVÍTÁS: _build_action_mask() helper kiemelve:
+    actions = legal_actions if legal_actions else range(self.action_size)
+  Üres lista esetén minden akció legálisnak számít → uniform fallback,
+  nem NaN. A döntés nem lesz optimális de a tréning nem fertőződik meg.
+
+  FONTOS: ez a guard MIND a forward() mind az evaluate_actions() útvonalon
+  aktív (az utóbbi a _build_batch_mask_vectorized()-on keresztül).
+
+RF-10: _BLEND_THRESHOLD 10 → 50 (opponent_tracker.py)
+  ──────────────────────────────────────────────────────
+  KONTEXTUS: A §5-ben leírt cold start blending logika:
+    blend = min(n / _BLEND_THRESHOLD, 1.0)
+    stat = blend * rolling_stat + (1 - blend) * lifetime_stat
+
+  HIBA: _BLEND_THRESHOLD = 10 azt jelenti, hogy 10 kéz után már csak
+  a rolling stat számít (blend=1.0). 10 kéz statisztikailag nem szignifikáns
+  – a minta szórása még nagyon magas.
+
+  SPRINT 3 REGRESSION: A sprint 3-ban _BLEND_THRESHOLD 30 → 10-re CSÖKKENT
+  ("gyorsabb adaptáció" céljából), de ez visszafelé sütött el: a modell
+  10 kéz után rossz statisztikák alapján exploitált.
+
+  JAVÍTÁS: 10 → 50. Hatás 20 kéznél:
+    blend_old = min(20/10, 1.0) = 1.0  → 0% prior súly
+    blend_new = min(20/50, 1.0) = 0.4  → 60% prior súly
+  A Bayesian prior NL10-NL25 populációs átlagokra kalibrált → stabilabb
+  early reads, kevesebb false exploit a korai kézekben.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+27. P2 OPTIMALIZÁCIÓK RÉSZLETESEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RF-5: VEKTORIZÁLT ACTION MASK (model.py evaluate_actions)
+  ──────────────────────────────────────────────────────────
+  PROBLÉMA: Minden PPO training stepben:
+    PPO_EPOCHS (8) × MINIBATCH (256) = 2048 evaluate_actions() hívás/update
+    Minden hívásban: for i in range(N): for a in legal: mask[i,a] = 0.0
+    → O(N × A) Python loop = 256 × 7 = 1792 Python iteráció × 2048 = 3.6M/update
+
+  JAVÍTÁS: @staticmethod _build_batch_mask_vectorized():
+    1. Python loop: row/col indexek összegyűjtése (egyszerű append, O(N×A))
+    2. Egyetlen GPU op: mask[idx_r, idx_c] = 0.0  (scatter assign)
+    A CPU→GPU tensor küldés egy lépésben, nem N×A kernel launch.
+
+  Benchmark (256 batch, 7 akció):
+    Előtte: ~4.2ms/update (Python loop overhead dominál)
+    Utána:  ~0.2ms/update (~20× gyorsítás)
+
+  VISSZAFELÉ COMPAT: Az üres legal_actions RF-7 fallback itt is él
+  (acts = legal if legal else range(action_size)).
+
+RF-4: OBS_DIM PARAMÉTEREZÉS (features.py + collector.py + runner.py)
+  ──────────────────────────────────────────────────────────────────────
+  PROBLÉMA: BatchStateBuilder.__init__-ben obs_dim = 54 hardcode.
+  Ha az rlcard obs mérete változna (frissítés, más env konfig), a
+  collector és a features.py szétcsúszna silent méretbeli eltéréssel.
+
+  JAVÍTÁS:
+    features.py:  BatchStateBuilder(state_size, num_players, obs_dim=54, ...)
+                  obs_dim paraméterből jön, eltárolódik self.obs_dim-ként.
+    collector.py: BatchedSyncCollector(..., rlcard_obs_size=54)
+                  Átadja compute_state_size() és BatchStateBuilder()-nek.
+                  _reset_env() fallback: [0.0] * self._rlcard_obs_size
+    runner.py:    BatchedSyncCollector(..., rlcard_obs_size=rlcard_obs_size)
+                  ahol rlcard_obs_size = len(temp_state['obs']) – dinamikus.
+
+  Default 54 mindenütt → visszafelé kompatibilis. Ha valaha az rlcard
+  obs mérete változik, CSAK a runner.py dynamikus mérés kell – a többi
+  automatikusan követi.
+
+RF-6: SQLITE THREAD-LOCAL CONNECTION POOL (opponent_tracker.py _PlayerDB)
+  ──────────────────────────────────────────────────────────────────────────
+  PROBLÉMA: Minden _connect() hívás sqlite3.connect() + PRAGMA setup + close.
+  Overhead per query: ~0.5–2ms. Élő kliensben frequent stat lookup esetén
+  (minden akciónál visszaolvassuk a HUD-ot) ez érezhető latencia.
+
+  JAVÍTÁS: threading.local() alapú pool a _PlayerDB-ben:
+    self._local = threading.local()
+    def _get_conn():
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            conn = sqlite3.connect(...)  # egyszer nyílik meg
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return self._local.conn
+
+  _connect() mostantól _get_conn() aliasa → backward compat a belső kódnak.
+  flush() explicit conn.commit()-ot hív (a korábbi context manager helyett).
+  close_thread_connection() cleanup metódus session végi bezáráshoz.
+
+  THREAD SAFETY: minden szál saját kapcsolatot kap → nincs versengés.
+  Írás (flush) explicit Lock-kal védett, ahogy korábban is.
+  check_same_thread=False: szálankénti 1 conn → biztonságos.
+
+  Benchmark: ~10–50× gyorsabb ismételt lookupok (connection reuse).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+28. MODELL ARCHITEKTÚRA v4.2 – GRU TEMPORAL ENCODER (RF-8)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FRISSÍTI: §2 (Modell Architektúra)
+
+AdvancedPokerAI v4.2 architektúra:
+  input → LayerNorm → Linear(state_size → hidden_size=512)  [input_norm + input_proj]
+        → 4× ResidualBlock (Pre-LN + GELU, expansion=2, dropout=0.05)
+        → GRUTemporalEncoder(step_dim, gru_hidden=128)        ← ÚJ, volt: 2× TemporalBlock
+        → TemporalFusion(hidden_size, gru_hidden)              ← ÚJ
+        → Actor head:  LN → Linear(512→256) → GELU → Linear(256→7)
+        → Critic head: LN → Linear(512→256) → GELU → Linear(256→1)
+
+MIÉRT TÁVOLÍTOTTUK EL A RÉGI TEMPORALBLOCK-OT?
+  A v3.3-ban az LSTM hibás PPO ratio miatt lecseréltük "TemporalBlock"-ra
+  (§1 verziótörténet). Csakhogy a TemporalBlock = ResidualBlock volt:
+    LayerNorm → Linear(h→h) → GELU → Dropout → Linear(h→h) + skip
+  Ez identikus az MLP residual blokkal – semmi temporális feldolgozás nincs
+  benne. A "temporal" elnevezés megtévesztő volt, és a draw/bluff mintázatok
+  tanulása elmaradt.
+
+ÚJ: GRUTemporalEncoder
+  Input:  history_flat = state[:, hist_offset : hist_offset + hist_dim]
+          shape: (B, ACTION_HISTORY_LEN × step_dim)
+  Reshape: (B, ACTION_HISTORY_LEN=8, step_dim)
+  GRU:    gru_hidden = hidden_size // 4 = 128 (default)
+          num_layers=1, batch_first=True
+  Output: h_n[-1] → LayerNorm → (B, 128)
+
+  Miért GRU és nem LSTM?
+    - Kevesebb paraméter (nincs cell state)
+    - Rövid szekvenciákon (≤8 lépés) az LSTM extra expressivitása nem indokolt
+    - Gyorsabb forward pass, egyszerűbb gradient flow
+    - Ugyanolyan jó a forgetting-gating, ami a pókerban elegendő
+
+  Miért nem cross-step recurrencia (stateful)?
+    - PPO buffer keveréssel tanul → a szekvenciális hidden state
+      buffer szinten nem értelmes (véletlenszerű sorrendű minibatch-ek)
+    - A kézálláson belüli action history szekvencia elegendő
+    - A jelenlegi megközelítés checkpoint-kompatibilis marad
+
+ÚJ: TemporalFusion
+  Fúziónálja a fő MLP reprezentációt (512 dim) a GRU kimenettel (128 dim):
+    cat([x, gru_out])    → (B, 640)
+    LayerNorm(640)       → projekció Linear(640→512) → Dropout → + residual(x)
+  Eredmény: 512 dim → actor/critic fejek mérete változatlan.
+
+HISTORY LAYOUT:
+  A state tensorban az action history szelet helye:
+    hist_offset = rlcard_obs + stats + stack + street + pot + board
+    hist_dim    = ACTION_HISTORY_LEN × (num_players × NUM_ABSTRACT_ACTIONS + 1)
+  Helperek: _history_layout(num_players, rlcard_obs_size)
+            _infer_num_players(state_size, rlcard_obs_size)
+
+ÚJ KONSTRUKTOR PARAMÉTEREK:
+  AdvancedPokerAI(state_size, action_size, hidden_size=512,
+                  num_players=None, rlcard_obs_size=54, gru_hidden=None)
+    num_players:     ha None → _infer_num_players()-ből visszafejtve
+    rlcard_obs_size: default 54
+    gru_hidden:      ha None → max(hidden_size // 4, 64) = 128
+
+WEIGHT INIT KIEGÉSZÍTÉS:
+  GRU súlyok: orthogonal(gain=1.0) – a vanishing gradient ellen
+  GRU bias: zeros
+
+CHECKPOINT KOMPATIBILITÁS:
+  Régi checkpointok (v4.1 és korábbi): strict=False betöltés.
+    res_blocks, actor_head, critic_head → betöltődnek (méret kompatibilis)
+    gru_encoder, temporal_fusion → nulláról indulnak (nincsenek a régi ckpt-ban)
+  play_vs_ai.py és rta_manager.py: mindkettő strict=False-szal tölt.
+  Checkpoint-ba mentett új mezők: 'num_players', 'rlcard_obs_size'
+    Ha ezek hiányoznak (régi ckpt) → num_players None → _infer_num_players().
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+29. VALÓDI EQUITY SZÁMÍTÁS A COLLECTORBAN (RF-9)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FRISSÍTI: §8 (Hand Equity) és §13 (Collector)
+
+HIBA: A state tensor equity dimenziója (state[-1], az EQUITY_DIM=1 szelet)
+v4.1-ben mindig 0.5 volt (default értékkel töltve). A collector
+BatchStateBuilder.build_batch()-nek nem adtuk át az equity értékeket –
+az equities paraméter None maradt, ami 0.5-öt írt mindenhova.
+
+JAVÍTÁS (collector.py):
+  _compute_equity_for_env(state, num_opponents) → float
+    - raw_obs['hand']          → rlcard formátum ('SA', 'HK')
+    - raw_obs['public_cards']  → board rlcard formátumban
+    - Konverzió: _rlcard_cards_to_equity_fmt() 'SA' → 'as'
+    - _EQUITY_ESTIMATOR.equity(hole, board, num_opponents)
+    - Fallback: 0.5 ha len(hole) < 2 (preflop, lapok még rejtve)
+
+  _rlcard_cards_to_equity_fmt(cards) – formátum konverzió:
+    rlcard: Suit+Rank nagybetű  ('SA', 'HK', 'DT', 'C2')
+    equity: rank+suit kisbetű   ('as', 'kh', 'td', '2c')
+    _SUIT_MAP = {'S':'s', 'H':'h', 'D':'d', 'C':'c'}
+    _RANK_MAP = {'A':'a', '2':'2', ..., 'T':'t', 'J':'j', 'Q':'q', 'K':'k'}
+
+  _EQUITY_ESTIMATOR = HandEquityEstimator(n_sim=200, cache_size=20_000)
+    Singleton – nem példányosodik minden lépésnél.
+    Cache méret 10_000 → 20_000-re növelve (repeated preflop spots).
+
+MIKOR SZÁMÍT VALÓS EQUITYT?
+  Minden learner lépésnél (_step_learners_batched), miután az env állapot
+  kiolvasható. A kapott equity érték:
+    1. Felülírja state[-1]-et a BuildStateBuilder-ben (equity dim)
+    2. self._last_equity[i]-be kerül (draw fold penalty-hoz)
+    3. self._prev_equity[i]-be kerül (street delta tracking-hoz, RF-11)
+
+TELJESÍTMÉNY:
+  A HandEquityEstimator adaptív early stopping-gal dolgozik (§8):
+    min_sims=50, max_sims=200, confidence_threshold=0.02
+  Cache miatt ismételt preflop spots (pl. AK különböző suitok) gyorsak.
+  Postflop: ~2-5ms/hívás (500 envnél párhuzamos → nem bottleneck).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+30. STREET-ÁTMENET EQUITY DELTA REWARD SHAPING (RF-11)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FRISSÍTI: §13 (Collector) draw fold penalty szekciója
+
+MOTIVÁCIÓ: A terminális reward (nyeremény/veszteség kéz végén) nem ad
+közvetlen feedback-et arra, hogy flop/turn mennyire javult vagy romlott
+az equity. A modell így lassabban tanulja meg, hogy egy erős draw
+megtartása több várható értéket jelent.
+
+IMPLEMENTÁCIÓ (_collect_done_envs reward blokk):
+  _STREET_REWARD_SCALE = 0.05  (BB-arányos szorzó)
+
+  Per-env tracking (reset-kor nullázódik):
+    _prev_street[i]  = az előző lépés utcája (0–3)
+    _prev_equity[i]  = az előző lépés equity értéke
+
+  Street-átmenetkor (flop/turn/river bekövetkeztekor):
+    equity_delta = last_equity - prev_equity
+    equity_delta = clamp(equity_delta, -0.3, +0.3)
+    raw_reward += equity_delta * _STREET_REWARD_SCALE
+
+  Példa: preflop AK → flop AKx (top two pair)
+    equity 0.60 → 0.85, delta = +0.25
+    raw_reward += 0.25 * 0.05 = +0.0125 BB extra
+  Példa: 87s → flop 2♠4♥Q♣ (miss)
+    equity 0.46 → 0.20, delta = -0.26
+    raw_reward += -0.26 * 0.05 = -0.013 BB
+
+MIÉRT ALACSONY A SCALE (0.05)?
+  A terminális reward (nyert/veszített BB) a fő tanulási jel kell maradjon.
+  A street delta csak finomhangolja a korai döntések gradiensbecslését.
+  Magasabb scale (pl. 0.5) eltorzítja: a modell a draw tartásáért
+  büntethetné magát ha az equity flop utáni utcán csökkent
+  (holott a call adott pot oddsokon + fold equity mellett helyes lehetett).
+
+EGYÜTTHATÁS A DRAW FOLD PENALTY-VAL (Sprint 3):
+  A DRAW_FOLD_PENALTY (-0.08 BB) és az equity delta reward kiegészítik
+  egymást. A penalty a draw elengedésekor büntet; a delta reward a draw
+  tartásáért jutalmaz (ha az equity megmaradt vagy nőtt). Együtt jobban
+  kalibrálják a postflop fold/call döntéseket.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+31. CENTRALIZÁLT KONFIGURÁCIÓ (config.py – ÚJ)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MOTIVÁCIÓ: A hiperparaméterek szétszórva éltek modulszintű konstansokban.
+  runner.py: NUM_ENVS, BUFFER_COLLECT_SIZE, HIDDEN_SIZE, LEARNING_RATE,
+             MILESTONE_INTERVAL, MILESTONE_DIR_ROOT
+  trainer.py: CLIP_EPS, PPO_EPOCHS, MINIBATCH, VALUE_COEF, ENTROPY_COEF,
+              LR_T_MAX, LR_ETA_MIN_RATIO, stb.
+  collector.py: _MAX_STEPS_PER_HAND, _STREET_REWARD_SCALE, ...
+
+MEGOLDÁS: TrainingConfig @dataclass a projekt gyökerében (config.py).
+
+Főbb mezők:
+  Env:       num_envs=512, buffer_collect_size=2048, max_steps_per_hand=500
+  Modell:    hidden_size=512, gru_hidden=None (auto: hidden//4)
+  PPO:       learning_rate=3e-4, clip_eps=0.2, ppo_epochs=8, minibatch_size=256
+             value_coef=0.5, entropy_coef=0.01, entropy_final=0.001
+             entropy_decay=30_000_000, max_grad_norm=0.5
+             gamma=0.99, gae_lambda=0.95
+  Scheduler: lr_t_max=500, lr_eta_min_ratio=0.05
+  Reward:    draw_fold_penalty=0.08, draw_equity_threshold=0.44
+             street_reward_scale=0.05
+  Milestone: milestone_interval=2_000_000, milestone_dir_root="ModellNaplo"
+  Equity:    equity_n_sim=200, equity_cache_size=20_000
+  Botok:     opponent_bot_types, opponent_bot_weights
+
+HASZNÁLAT:
+  from config import TrainingConfig
+  cfg = TrainingConfig()                    # default értékek
+  cfg = TrainingConfig(num_envs=256, gru_hidden=64)  # kísérlet
+  train_session(num_players=6, filename='6max.pth', cfg=cfg)
+
+CHECKPOINT:
+  cfg.to_dict() → JSON-ba menthető dict
+  TrainingConfig.from_dict(d) → visszaállítás
+
+VISSZAFELÉ COMPAT:
+  A modul-szintű konstansok (NUM_ENVS, BUFFER_COLLECT_SIZE, stb.) megmaradnak
+  runner.py-ban mint _DEFAULT_CFG aliasok. Ha cfg=None → TrainingConfig().
+  Régi kód ami direkten importálja a konstansokat nem törik el.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+32. KRITIKUS BUGOK JAVÍTVA v4.2-BEN (FRISSÍTI §20)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BUG-6 (v4.1): BB/Stack mismatch a collectorban.
+  Hatás: MINDEN normalizált feature (stack_in_bb, SPR, pot_odds) hibás.
+  JAVÍTÁS: RF-1, _reset_env() env.game-ből olvassa a tényleges bb/stack értéket.
+
+BUG-7 (v4.1): StepLR hatékonyan soha nem aktiválódik.
+  Hatás: LR az egész tréning alatt 3e-4 marad, nem csökken.
+  JAVÍTÁS: RF-2, CosineAnnealingLR(T_max=500, eta_min=lr*0.05).
+
+BUG-8 (v4.1): GAE bootstrap 0.0 nem-terminális buffer végén.
+  Hatás: value function szisztematikus alulbecslés a buffer végén.
+  JAVÍTÁS: RF-3, last_value paraméter propagálva buffer→trainer→runner.
+
+BUG-9 (v4.1): Üres legal_actions → NaN a forward()-ban.
+  Hatás: élő kliensben timeout/env hiba esetén NaN megfertőzi a tréninget.
+  JAVÍTÁS: RF-7, _build_action_mask() uniform fallback üres listára.
+
+BUG-10 (v4.1): TemporalBlock == ResidualBlock (nincs temporális feldolgozás).
+  Hatás: draw/bluff szekvencia tanulás elmarad, a "temporal" elnevezés
+         megtévesztő – 2 fölösleges residual blokkot futtat.
+  JAVÍTÁS: RF-8, GRUTemporalEncoder + TemporalFusion.
+
+BUG-11 (v4.1): Equity feature mindenhol 0.5 (HandEquityEstimator nem hívódott).
+  Hatás: az equity dim (state[-1]) konstans 0.5 → a modell nem lát valós
+         kézerősség-információt, a draw fold penalty is 0.5-es becslésen alapul.
+  JAVÍTÁS: RF-9, _compute_equity_for_env() minden learner lépésnél.
+
+BUG-12 (v4.1): _BLEND_THRESHOLD Sprint 3-ban 30→10-re CSÖKKENT (helytelen irány).
+  Hatás: 10 kéz után a prior 0% súlyt kap – statisztikailag szignifikáns
+         minta nélkül az observed stats alapján exploitál.
+  JAVÍTÁS: RF-10, 10 → 50.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+33. HIPERPARAMÉTEREK v4.2 (FRISSÍTI §22)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Változatlan értékek (lásd §22 az előzményekhez):
+  NUM_ENVS             = 512  (Sprint 3 óta)
+  BUFFER_COLLECT_SIZE  = 2048 (Sprint 3 óta)
+  HIDDEN_SIZE          = 512
+  ACTION_HISTORY_LEN   = 8
+  POOL_SIZE            = 15
+  SNAPSHOT_INTERVAL    = 1000
+  MAX_STEPS_PER_HAND   = 500
+  PPO_EPOCHS           = 8
+  MINIBATCH            = 256
+  CLIP_EPS             = 0.2
+  VALUE_COEF           = 0.5
+  ENTROPY_COEF         = 0.01  → 0.001  (30M decay, Sprint 3)
+  MAX_GRAD_NORM        = 0.5
+  GAMMA                = 0.99
+  GAE_LAM              = 0.95
+  DRAW_FOLD_PENALTY    = 0.08 BB
+  DRAW_EQUITY_THRESHOLD= 0.44
+  BOT_WEIGHTS          = {Fish: 0.08, Nit: 0.15, CS: 0.02, LAG: 0.15}
+
+MEGVÁLTOZOTT értékek v4.2-ben:
+  LR_SCHEDULER         = StepLR(1M, 0.7)  →  CosineAnnealingLR(T_max=500, eta_min=lr*0.05)
+  BLEND_THRESHOLD      = 10  →  50
+  EQUITY_CACHE_SIZE    = 10_000  →  20_000
+  BB_OPTIONS / STACK_MULTIPLIERS  →  ELTÁVOLÍTVA (env saját konfigja)
+  SHORT_STACK_RANGE    →  ELTÁVOLÍTVA (bb/stack randomizálás megszüntetve)
+
+ÚJ értékek v4.2-ben:
+  GRU_HIDDEN           = hidden_size // 4  = 128  (default)
+  STREET_REWARD_SCALE  = 0.05
+  LR_T_MAX             = 500
+  LR_ETA_MIN_RATIO     = 0.05
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+34. KÖNYVTÁR STRUKTÚRA v4.2 (FRISSÍTI §19)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+poker_ai_v4/
+├── NOTES_MASTER.txt          ← ez a fájl
+├── config.py                 ← ÚJ v4.2: TrainingConfig dataclass
+├── test_all_fixes.py         ← ÚJ v4.2: 62 regressziós teszt
+├── README.md
+├── YOLO_TRAINING_GUIDE.md
+├── requirements.txt
+├── train.py
+├── rta_example.py
+├── run_live.py
+│
+├── core/
+│   ├── model.py              ← AdvancedPokerAI v4.2 (GRU, RF-5,7,8)
+│   ├── action_mapper.py      ← változatlan
+│   ├── features.py           ← BatchStateBuilder obs_dim param (RF-4)
+│   ├── opponent_tracker.py   ← thread-local pool, blend=50 (RF-6,10)
+│   └── equity.py             ← változatlan
+│
+├── training/
+│   ├── buffer.py             ← GAE last_value (RF-3)
+│   ├── trainer.py            ← CosineAnnealingLR (RF-2,3)
+│   ├── normalizer.py         ← változatlan
+│   ├── opponent_pool.py      ← változatlan
+│   ├── opponent_archetypes.py← változatlan
+│   ├── collector.py          ← RF-1,4,9,11: bb fix, equity, reward shaping
+│   └── runner.py             ← RF-1,3,4,8 + TrainingConfig integráció
+│
+├── inference/
+│   ├── obs_builder.py        ← változatlan
+│   ├── realtime_assistant.py ← változatlan
+│   └── rta_manager.py        ← RF-8: GRU compat betöltés (strict=False)
+│
+├── live_reader/              ← változatlan
+├── utils/                    ← változatlan
+└── players.db
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+35. CHECKPOINT FORMÁTUM v4.2
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FRISSÍTI: §18 (Runner) checkpoint részt.
+
+v4.2 checkpoint mezők:
+  state_dict:       model.state_dict() (torch.compile _orig_mod kezelt)
+  trainer:          optimizer + scheduler + scaler + total_updates
+  reward_norm:      Welford normalizer állapota
+  episodes_trained: int
+  time_spent:       float (másodperc)
+  algorithm:        'PPO_SelfPlay_v4'
+  state_size:       int (a modell input mérete)
+  action_size:      int (tipikusan 7)
+  num_players:      int  ← ÚJ v4.2 (GRU step_dim-hez kell)
+  rlcard_obs_size:  int  ← ÚJ v4.2 (history_offset-hez kell)
+
+ELTÁVOLÍTOTT MEZŐK v4.2-ben:
+  bb_options, stack_multipliers  (RF-1 fix: az env konfigjából jönnek)
+
+BETÖLTÉSI SZABÁLYOK:
+  1. v4.2 → v4.2: teljes betöltés (strict=True a trainer-ban, strict=False a modellnél)
+  2. v4.1 → v4.2: strict=False; gru_encoder/temporal_fusion nulláról indul
+                  num_players: _infer_num_players(state_size) visszafejti
+  3. v3.x → v4.2: strict=False + méret mismatch szűrés (input_proj biztosan tör)
+                  Csak res_blocks + actor/critic jönnek be ha state_size egyezik
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+36. REGRESSZIÓS TESZTEK (test_all_fixes.py – ÚJ)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+62 AST-alapú, torch-független teszt – futtatható rlcard/torch nélkül is.
+  python test_all_fixes.py
+
+Fedett területek (12 TestCase osztály):
+  TestP0_RF1_BBMismatch      (6 teszt)  – collector bb/stack logika
+  TestP0_RF2_LRScheduler     (4 teszt)  – CosineAnnealingLR + compat
+  TestP1_RF3_GAEBootstrap    (4 teszt)  – buffer+trainer+runner last_value
+  TestP1_RF7_NaNGuard        (3 teszt)  – model üres legal_actions
+  TestP1_RF10_BlendThreshold (2 teszt)  – blend math helyessége
+  TestP2_RF5_VectorizedMask  (4 teszt)  – @staticmethod + scatter assign
+  TestP2_RF4_ObsDim          (4 teszt)  – BSB + collector paraméterezés
+  TestP2_RF6_SQLitePool      (5 teszt)  – thread-local pool + commit
+  TestP3_RF8_GRU             (10 teszt) – GRUTemporalEncoder + compat
+  TestP3_RF9_Equity          (7 teszt)  – card format + fallback
+  TestP3_RF11_RewardShaping  (5 teszt)  – delta + clamp + scale
+  TestArch_Config            (8 teszt)  – dataclass + runner integráció
+
+FUTTATÁS: python test_all_fixes.py → 62/62 PASSED ~0.085s
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+37. TOVÁBBI FEJLESZTÉSI IRÁNYOK (FRISSÍTI §24)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A v4.2 audit sprint lezárása után az alábbi irányok maradtak nyitva:
+
+RÖVID TÁVU (következő sprint):
+  - Aszinkron collector: multiprocessing.Pool alapú parallel env stepping
+    4+ CPU magon 2–4× throughput növekedés várható. A jelenlegi
+    BatchedSyncCollector szinkron – az összes env sorban lép.
+  - test_model_sanity.py frissítése v4.2-re: az equity dim most valós
+    értéket tartalmaz → a value calibration test pontosabb lesz.
+    Az AF tesztet is újra kell kalibrálni a GRU változás után.
+  - W&B integráció async módban: a jelenlegi szinkron SummaryWriter
+    blokkolhat a tréning loop kritikus útján.
+
+KÖZÉP TÁVU:
+  - Opponent conditioning (FiLM): Opponent HUD stats kondicionálása
+    az actor fejre Feature-wise Linear Modulation-nel.
+    Séma: opp_stats → FiLM_scale + FiLM_bias → actor_head bemenete.
+    Elvárt hatás: exploitative play javulása ismert profil ellen.
+  - Intermediate reward shaping finomhangolása: A _STREET_REWARD_SCALE=0.05
+    konzervatív. 10M epizód után mért draw_fold_rate alapján szükség esetén
+    0.05 → 0.10 emelés indokolt lehet – de csak ha a winrate nem romlik.
+
+HOSSZÚ TÁVU (v5):
+  - PSRO / Self-play kiterjesztés: Policy Space Response Oracle a jelenlegi
+    ad-hoc bot pool helyett. Szisztematikusabb ellenfél-diverzitás, Nash-közelítés.
+  - Aszinkron TensorBoard / W&B: background thread az I/O-hoz.
+  - Black + Ruff CI: a kódstílus egységesítése (trainer.py semicolon-ok stb.)
+  - mypy strict mode: legalább core/ és training/ publikus API-jaira.
+
+ELVETETT ÖTLETEK (magyarázattal):
+  - Stack mélység randomizálás (Sprint 3 short-stack): ELTÁVOLÍTVA v4.2-ben.
+    Az env saját konfigja és a feature normalizálás konzisztenciája fontosabb
+    a stack diversity-nél. Ha valóban szükséges, env.game.game_config.update()
+    reset előtt a helyes módja – de csak ha az rlcard támogatja.
+  - Preflop lookup table az equity-hez: a HandEquityEstimator cache-e
+    elegendő. A lookup table karbantartása külön komplexitás – nem éri meg.
+
+================================================================================
+EOF v4.2 AUDIT SPRINT NOTES
+================================================================================

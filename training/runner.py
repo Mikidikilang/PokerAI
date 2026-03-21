@@ -30,8 +30,9 @@ from .buffer import PPOBuffer
 from .trainer import PPOTrainer
 from .normalizer import RunningMeanStd
 from .opponent_pool import OpponentPool
-from .collector import BatchedSyncCollector, BB_OPTIONS, STACK_MULTIPLIERS
+from .collector import BatchedSyncCollector
 from utils.checkpoint_utils import safe_load_checkpoint
+from config import TrainingConfig
 
 logger = logging.getLogger("PokerAI")
 
@@ -41,18 +42,18 @@ try:
 except ImportError:
     _TB = False
 
-# ── OPT-5 + OPT-6: Nagyobb batch méretek ────────────────────────────────────
-NUM_ENVS            = 512     # Volt: 256 → GPU jobban kihasználva
-BUFFER_COLLECT_SIZE = 2048    # Volt: 1024 → jobb gradiens becslés
-HIDDEN_SIZE         = 512
-LEARNING_RATE       = 3e-4
-
-# ── Mérföldkő rendszer ───────────────────────────────────────────────────────
-MILESTONE_INTERVAL  = 2_000_000   # Ennyi epizódonként ment + tesztel
-MILESTONE_HANDS     = 2000        # Szituációs + stat tesztek kézszáma
-MILESTONE_DIR_ROOT  = "ModellNaplo"  # Főmappa a mentésekhez
-# Megjegyzés: ha UTF-8 névvel gondod van a fájlrendszeren,
-# cseréld "ModellNaplo"-ra (ékezet nélkül).
+# ── Konfiguráció – defaults; override: train_session(cfg=TrainingConfig(...)) ─
+# [ARCH FIX] A konstansok a TrainingConfig dataclass-ba kerültek (config.py).
+# A modul-szintű változók visszafelé kompatibilitásból maradnak,
+# de a tényleges értékek a cfg objektumból jönnek train_session()-ban.
+_DEFAULT_CFG        = TrainingConfig()
+NUM_ENVS            = _DEFAULT_CFG.num_envs
+BUFFER_COLLECT_SIZE = _DEFAULT_CFG.buffer_collect_size
+HIDDEN_SIZE         = _DEFAULT_CFG.hidden_size
+LEARNING_RATE       = _DEFAULT_CFG.learning_rate
+MILESTONE_INTERVAL  = _DEFAULT_CFG.milestone_interval
+MILESTONE_HANDS     = 2000
+MILESTONE_DIR_ROOT  = _DEFAULT_CFG.milestone_dir_root
 
 
 def _get_model_info(filename):
@@ -128,7 +129,8 @@ def _try_compile(model, device):
 
 
 def _save_checkpoint(filename, model, trainer, reward_norm,
-                     episodes, time_spent, state_size, action_size):
+                     episodes, time_spent, state_size, action_size,
+                     num_players=2, rlcard_obs_size=54):
     """Checkpoint mentése. Kezeli a torch.compile _orig_mod prefixet."""
     try:
         if hasattr(model, '_orig_mod'):
@@ -137,16 +139,17 @@ def _save_checkpoint(filename, model, trainer, reward_norm,
             sd = model.state_dict()
 
         torch.save({
-            'state_dict': sd,
-            'trainer': trainer.state_dict(),
-            'reward_norm': reward_norm.state_dict(),
+            'state_dict':      sd,
+            'trainer':         trainer.state_dict(),
+            'reward_norm':     reward_norm.state_dict(),
             'episodes_trained': episodes,
-            'time_spent': time_spent,
-            'algorithm': 'PPO_SelfPlay_v4',
-            'state_size': state_size,
-            'action_size': action_size,
-            'bb_options': BB_OPTIONS,
-            'stack_multipliers': STACK_MULTIPLIERS,
+            'time_spent':      time_spent,
+            'algorithm':       'PPO_SelfPlay_v4',
+            'state_size':      state_size,
+            'action_size':     action_size,
+            # [RF-8] GRU architektúra paraméterei – betöltéshez szükségesek
+            'num_players':     num_players,
+            'rlcard_obs_size': rlcard_obs_size,
         }, filename)
         logger.debug(f"Checkpoint mentve: {filename}")
     except Exception as exc:
@@ -155,7 +158,7 @@ def _save_checkpoint(filename, model, trainer, reward_norm,
 
 def _run_milestone(filename, model, trainer, reward_norm,
                    episodes, time_spent, state_size, action_size,
-                   num_players, milestone_episodes):
+                   num_players, milestone_episodes, rlcard_obs_size=54):
     """
     Mérföldkő elérése: elmenti a modellt egy dedikált mappába,
     majd elindítja a test_model_sanity.py-t subprocessként.
@@ -190,6 +193,7 @@ def _run_milestone(filename, model, trainer, reward_norm,
     _save_checkpoint(
         milestone_model_path, model, trainer, reward_norm,
         episodes, time_spent, state_size, action_size,
+        num_players=num_players, rlcard_obs_size=rlcard_obs_size,
     )
     logger.info(
         f"🏆 Mérföldkő: {milestone_episodes:,} ep → {milestone_model_path}"
@@ -246,7 +250,10 @@ def _run_milestone(filename, model, trainer, reward_norm,
         )
 
 
-def run_training_session(num_players, filename, episodes_to_run):
+def run_training_session(num_players, filename, episodes_to_run,
+                         cfg: TrainingConfig = None):
+    if cfg is None:
+        cfg = TrainingConfig()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from utils.logging_setup import setup_logging
     setup_logging(log_file="training.log", num_players=num_players)
@@ -264,13 +271,16 @@ def run_training_session(num_players, filename, episodes_to_run):
                 f"TOTAL={STATE_SIZE}")
 
     model_kwargs = {
-        'state_size': STATE_SIZE,
-        'action_size': ACTION_SIZE,
-        'hidden_size': HIDDEN_SIZE,
+        'state_size':      STATE_SIZE,
+        'action_size':     ACTION_SIZE,
+        'hidden_size':     cfg.hidden_size,
+        'num_players':     num_players,
+        'rlcard_obs_size': rlcard_obs_size,
+        'gru_hidden':      cfg.gru_hidden,
     }
     learner = AdvancedPokerAI(**model_kwargs).to(device)
     buffer = PPOBuffer()
-    trainer = PPOTrainer(learner, lr=LEARNING_RATE, device=device)
+    trainer = PPOTrainer(learner, lr=cfg.learning_rate, device=device)
     pool = OpponentPool(
         AdvancedPokerAI,
         model_kwargs,
@@ -313,7 +323,16 @@ def run_training_session(num_players, filename, episodes_to_run):
                 start_episode = ck.get('episodes_trained', 0)
                 total_time_spent = ck.get('time_spent', 0.0)
                 if 'trainer' in ck:
-                    trainer.load_state_dict(ck['trainer'])
+                    # Trainer state külön try: ha az optimizer group mérete
+                    # nem egyezik (pl. GRU rétegek hozzáadva), csak WARNING,
+                    # nem ERROR – a model weights és start_episode megmaradnak.
+                    try:
+                        trainer.load_state_dict(ck['trainer'])
+                    except Exception as trainer_exc:
+                        logger.warning(
+                            f'Trainer state nem töltve (architektúra változás, '
+                            f'friss optimizerrel folytat): {trainer_exc}'
+                        )
                 if 'reward_norm' in ck:
                     reward_norm.load_state_dict(ck['reward_norm'])
             else:
@@ -329,27 +348,28 @@ def run_training_session(num_players, filename, episodes_to_run):
 
     logger.info(f"BatchedSyncCollector inicializálása ({NUM_ENVS} env)...")
     collector = BatchedSyncCollector(
-        num_envs=NUM_ENVS,
+        num_envs=cfg.num_envs,
         model=learner,
         device=device,
         num_players=num_players,
         action_mapper=action_mapper,
         model_kwargs=model_kwargs,
         pool=pool,
+        rlcard_obs_size=rlcard_obs_size,  # [RF-4 FIX] dinamikusan kiszámított fent
     )
 
-    target_episodes = start_episode + episodes_to_run
+    target_episodes   = start_episode + episodes_to_run
     total_collected = start_episode
 
     # ── Mérföldkő inicializálás ───────────────────────────────────────────
     # Ha folytatott tréning (pl. betöltöttük a 4M-es checkpointot),
     # a last_milestone = 4M lesz, így nem teszteli újra az already-done
     # mérföldköveket – csak a következőtől (6M) indul el.
-    last_milestone = (start_episode // MILESTONE_INTERVAL) * MILESTONE_INTERVAL
+    last_milestone = (start_episode // cfg.milestone_interval) * cfg.milestone_interval
     logger.info(
-        f"Mérföldkő rendszer: interval={MILESTONE_INTERVAL:,} | "
-        f"következő: {last_milestone + MILESTONE_INTERVAL:,} ep | "
-        f"mentési hely: {MILESTONE_DIR_ROOT}/"
+        f"Mérföldkő rendszer: interval={cfg.milestone_interval:,} | "
+        f"következő: {last_milestone + cfg.milestone_interval:,} ep | "
+        f"mentési hely: {cfg.milestone_dir_root}/"
     )
 
     session_start = time.time()
@@ -363,7 +383,7 @@ def run_training_session(num_players, filename, episodes_to_run):
     logger.info("=" * 70)
 
     while total_collected < target_episodes:
-        to_collect = min(BUFFER_COLLECT_SIZE, target_episodes - total_collected)
+        to_collect = min(cfg.buffer_collect_size, target_episodes - total_collected)
 
         # Snapshot az opponent pool-ba
         prev_snap = total_collected // OpponentPool.SNAPSHOT_INTERVAL
@@ -402,8 +422,23 @@ def run_training_session(num_players, filename, episodes_to_run):
         collected_this_batch = len(all_episodes)
         total_collected += collected_this_batch
 
+        # [RF-3 FIX] Kiszámítjuk V(s_{T+1})-t a buffer utolsó állapotához.
+        # Ha az utolsó epizód terminálisan zárult, last_value=0.0 (helyes).
+        # Ha nem (buffer tele lett, de az epizód még fut), a learner értéke
+        # pontosabb bootstrap-ot ad, mint a korábbi hardcode 0.0.
+        last_value = 0.0
+        if buffer.episode_ends and not buffer.episode_ends[-1]:
+            try:
+                last_state = buffer.states[-1].unsqueeze(0).to(device)
+                last_legal = buffer.legal_actions[-1]
+                with torch.inference_mode():
+                    _, lv, _ = learner.forward(last_state, last_legal)
+                last_value = float(lv.item())
+            except Exception as exc:
+                logger.debug(f"last_value bootstrap hiba (fallback 0.0): {exc}")
+
         try:
-            metrics = trainer.update(buffer)
+            metrics = trainer.update(buffer, last_value=last_value)
         except Exception as exc:
             logger.error(f"PPO update hiba: {exc}", exc_info=True)
             buffer.reset()
@@ -442,6 +477,7 @@ def run_training_session(num_players, filename, episodes_to_run):
                 filename, learner, trainer, reward_norm,
                 total_collected, total_time_spent + elapsed,
                 STATE_SIZE, ACTION_SIZE,
+                num_players=num_players, rlcard_obs_size=rlcard_obs_size,
             )
 
             # ── Mérföldkő ellenőrzés ──────────────────────────────────────
@@ -458,6 +494,7 @@ def run_training_session(num_players, filename, episodes_to_run):
                     total_collected, total_time_spent + elapsed,
                     STATE_SIZE, ACTION_SIZE,
                     num_players, current_milestone,
+                    rlcard_obs_size=rlcard_obs_size,
                 )
 
     if writer:
@@ -467,5 +504,6 @@ def run_training_session(num_players, filename, episodes_to_run):
         filename, learner, trainer, reward_norm,
         target_episodes, total_time_spent + elapsed,
         STATE_SIZE, ACTION_SIZE,
+        num_players=num_players, rlcard_obs_size=rlcard_obs_size,
     )
     logger.info(f"KÉSZ  →  {filename}  ({target_episodes:,} epizód)")

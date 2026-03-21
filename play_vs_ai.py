@@ -208,12 +208,16 @@ class GameSession:
         if not (isinstance(ck, dict) and 'state_dict' in ck):
             raise ValueError(f"Érvénytelen checkpoint: {model_path}")
 
-        state_size = ck.get('state_size', 492)
-        action_size = ck.get('action_size', 7)
+        state_size       = ck.get('state_size', 492)
+        action_size      = ck.get('action_size', 7)
+        # [RF-8] num_players és rlcard_obs_size a checkpoint-ból, vagy inferálva
+        num_players      = ck.get('num_players', None)   # None → auto-infer
+        rlcard_obs_size  = ck.get('rlcard_obs_size', 54)
         self.model = AdvancedPokerAI(
-            state_size=state_size, action_size=action_size
+            state_size=state_size, action_size=action_size,
+            num_players=num_players, rlcard_obs_size=rlcard_obs_size,
         ).to(self.device)
-        self.model.load_state_dict(ck['state_dict'])
+        self.model.load_state_dict(ck['state_dict'], strict=False)
         self.model.eval()
         self._state_size = state_size
         logger.info(f"Modell kész: state_size={state_size}, device={self.device}")
