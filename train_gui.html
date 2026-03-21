@@ -630,18 +630,33 @@ async function api(path, body=null) {
   const opts = post
     ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}
     : {method:'GET'};
-  const res = await fetch('/api/'+path, opts);
-  return res.json().catch(()=>({}));
+  try {
+    const res = await fetch('/api/'+path, opts);
+    return res.json().catch(()=>({}));
+  } catch(e) {
+    // Hálózati hiba (szerver nem elérhető) – ne törje meg az init blokkot
+    console.warn('API hiba ('+path+'):', e.message);
+    return {};
+  }
 }
 
 // ═══════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════
 (async()=>{
-  const d = await api('defaults');
-  window._defaults = d.defaults || {};
-  await loadModels();
-  startPoll();
+  try {
+    const d = await api('defaults');
+    window._defaults = d.defaults || {};
+    await loadModels();
+    startPoll();
+  } catch(e) {
+    console.error('Init hiba:', e);
+    // Megjelenítjük hogy valami baj van, nem ragad "Betöltés…" állapotban
+    const el = document.getElementById('modelScroll');
+    if (el) el.innerHTML = '<div class="empty-sel" style="height:200px"><div class="ei">⚠️</div><p>Szerver nem elérhető.<br>Indítsd el: python train_gui.py</p></div>';
+    const cnt = document.getElementById('modelCount');
+    if (cnt) cnt.textContent = 'hiba';
+  }
 })();
 
 async function loadModels() {
@@ -830,7 +845,7 @@ function sec(id, title, sub, body) {
     <div class="sec-head" onclick="toggleSec('${id}')">
       <div class="sec-title">${title}${sub?`<span class="sec-sub">${sub}</span>`:''}
       </div>
-      <span class="chev ${open?'open'}" id="chev-${id}">▾</span>
+      <span class="chev ${open?'open':''}" id="chev-${id}">▾</span>
     </div>
     <div class="sec-body ${open?'open':''}" id="sec-${id}">${body}</div>
   </div>`;
