@@ -21,7 +21,7 @@ Ha minden OK, ezt látod a végén:
 
 import sys, os, glob, time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def main():
     if len(sys.argv) < 2:

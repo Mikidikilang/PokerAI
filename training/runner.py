@@ -201,7 +201,7 @@ def _run_milestone(filename, model, trainer, reward_norm,
 
     # test_model_sanity.py elérési útja (projekt gyökérben van)
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    test_script = os.path.join(project_root, "test_model_sanity.py")
+    test_script = os.path.join(project_root, "tests", "test_model_sanity.py")
 
     if not os.path.exists(test_script):
         logger.warning(

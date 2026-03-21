@@ -97,7 +97,7 @@ Használat:
 import sys, os, argparse, collections, random, json, math, time
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch, numpy as np
 from core.model import AdvancedPokerAI

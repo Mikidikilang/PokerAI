@@ -22,7 +22,7 @@ import os
 import tempfile
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mock setup (éles kódban nem kell – valódi .pth fájlokat tölt be)

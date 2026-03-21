@@ -1,0 +1,1227 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Poker AI v4 – Training Manager</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,600;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:          #070a07;
+  --surface:     #0d120d;
+  --surface2:    #121a12;
+  --surface3:    #182018;
+  --border:      rgba(255,255,255,0.06);
+  --border2:     rgba(255,255,255,0.11);
+  --gold:        #c9aa5a;
+  --gold-hi:     #e8cc7a;
+  --gold-glow:   rgba(201,170,90,0.12);
+  --gold-dim:    rgba(201,170,90,0.35);
+  --green:       #5bbf7a;
+  --green-dim:   rgba(91,191,122,0.12);
+  --red:         #d95f5f;
+  --red-dim:     rgba(217,95,95,0.12);
+  --blue:        #5fa8d9;
+  --blue-dim:    rgba(95,168,217,0.12);
+  --amber:       #d99b5f;
+  --purple:      #9b7fd9;
+  --text:        #ccd4cc;
+  --text-dim:    rgba(204,212,204,0.38);
+  --text-mid:    rgba(204,212,204,0.62);
+  --mono:        'IBM Plex Mono', monospace;
+  --sans:        'Syne', sans-serif;
+  --r:           8px;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* scanlines */
+body::after {
+  content:''; position:fixed; inset:0; pointer-events:none; z-index:9999;
+  background: repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.025) 2px,rgba(0,0,0,0.025) 4px);
+}
+
+/* ─── HEADER ─── */
+header {
+  flex-shrink: 0;
+  height: 50px;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border2);
+  z-index: 50;
+}
+.logo {
+  font-family: var(--mono); font-weight: 700; font-size: 12px;
+  color: var(--gold); letter-spacing: 3px; display: flex; align-items: center; gap: 10px;
+}
+.logo-pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--gold);
+  animation: gpulse 2.5s ease-in-out infinite;
+}
+@keyframes gpulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.3;transform:scale(.8)} }
+
+.status-badge {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px;
+  padding: 3px 12px; border-radius: 12px; border: 1px solid; text-transform: uppercase;
+  transition: all .3s;
+}
+.status-badge.idle    { border-color: var(--border2); color: var(--text-dim); }
+.status-badge.running { border-color: var(--green); color: var(--green); background: var(--green-dim); animation: rblink 1.5s infinite; }
+.status-badge.stopped { border-color: var(--red); color: var(--red); background: var(--red-dim); }
+@keyframes rblink { 0%,100%{box-shadow:none} 50%{box-shadow:0 0 8px rgba(91,191,122,.3)} }
+
+/* ─── LAYOUT ─── */
+.app-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 268px 1fr;
+  min-height: 0;
+}
+
+/* ─── SIDEBAR ─── */
+.sidebar {
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--border2);
+  min-height: 0;
+}
+.sidebar-head {
+  flex-shrink: 0;
+  padding: 12px 14px 10px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-label { font-family: var(--mono); font-size: 10px; color: var(--gold); letter-spacing: 2px; text-transform: uppercase; }
+.sidebar-count { font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+
+.model-scroll { flex: 1; overflow-y: auto; padding: 6px; }
+.model-scroll::-webkit-scrollbar { width: 3px; }
+.model-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+.model-card {
+  padding: 9px 11px; border-radius: var(--r); cursor: pointer;
+  border: 1px solid transparent; margin-bottom: 3px;
+  transition: all .15s; position: relative;
+}
+.model-card:hover { background: var(--surface2); border-color: var(--border); }
+.model-card.sel {
+  background: var(--gold-glow); border-color: var(--gold-dim);
+}
+.model-card.sel::before {
+  content:''; position:absolute; left:0; top:22%; bottom:22%;
+  width: 2px; background: var(--gold); border-radius: 0 2px 2px 0;
+}
+.model-card.running-card { border-color: rgba(91,191,122,.3); background: rgba(91,191,122,.04); }
+
+.mc-name { font-weight: 700; font-size: 13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:2px; }
+.mc-meta { font-family: var(--mono); font-size: 10px; color: var(--text-dim); line-height: 1.7; }
+.mc-ep   { color: var(--gold-dim); }
+.mc-np   { color: var(--blue); }
+.mc-badge {
+  display: inline-block; font-family: var(--mono); font-size: 9px;
+  padding: 1px 7px; border-radius: 3px; margin-top: 3px; letter-spacing: 1px; text-transform: uppercase;
+}
+.badge-exploitative { background: rgba(201,170,90,.1); color: var(--gold-dim); border: 1px solid rgba(201,170,90,.2); }
+.badge-self_play    { background: var(--blue-dim); color: var(--blue); border: 1px solid rgba(95,168,217,.25); }
+.badge-aggressive   { background: var(--red-dim);  color: var(--red);  border: 1px solid rgba(217,95,95,.25); }
+.badge-custom       { background: rgba(155,127,217,.1); color: var(--purple); border: 1px solid rgba(155,127,217,.25); }
+.badge-running      { background: var(--green-dim); color: var(--green); border: 1px solid rgba(91,191,122,.3); animation: rblink 1.5s infinite; }
+.badge-warning      { background: rgba(217,155,95,.1); color: var(--amber); border: 1px solid rgba(217,155,95,.25); }
+
+.new-model-btn {
+  flex-shrink: 0;
+  margin: 6px;
+  padding: 9px; border-radius: var(--r);
+  border: 1px dashed var(--border2); background: transparent;
+  color: var(--text-dim); font-family: var(--sans); font-size: 12px;
+  cursor: pointer; text-align: center; transition: all .15s;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+}
+.new-model-btn:hover { border-color: var(--gold-dim); color: var(--gold); background: var(--gold-glow); }
+
+/* ─── RIGHT PANEL ─── */
+.right-panel { display: flex; flex-direction: column; min-height: 0; }
+
+.tabs-bar {
+  flex-shrink: 0;
+  display: flex; align-items: center; gap: 2px;
+  padding: 8px 16px 0;
+  border-bottom: 1px solid var(--border2);
+  background: var(--surface);
+}
+.tab-btn {
+  padding: 7px 16px; font-family: var(--sans); font-size: 12px; font-weight: 600;
+  cursor: pointer; border: none; background: transparent; color: var(--text-dim);
+  border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all .15s;
+  letter-spacing: .3px;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--gold); border-bottom-color: var(--gold); }
+.tab-btn .tab-badge {
+  display: inline-block; background: var(--gold-dim); color: var(--bg);
+  border-radius: 8px; font-size: 9px; padding: 1px 6px; margin-left: 4px;
+  font-weight: 700; font-family: var(--mono);
+}
+
+.tab-content { flex: 1; overflow-y: auto; padding: 16px 20px 16px; min-height: 0; }
+.tab-content::-webkit-scrollbar { width: 4px; }
+.tab-content::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+.tab-pane { display: none; flex-direction: column; gap: 14px; }
+.tab-pane.active { display: flex; }
+
+/* ─── SECTION CARDS ─── */
+.section {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden;
+}
+.sec-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 14px; cursor: pointer; user-select: none; transition: background .15s;
+}
+.sec-head:hover { background: var(--surface2); }
+.sec-title { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13px; }
+.sec-sub   { font-family: var(--mono); font-size: 9px; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; margin-left: 4px; }
+.chev      { color: var(--text-dim); font-size: 11px; transition: transform .2s; }
+.chev.open { transform: rotate(180deg); }
+.sec-body  { padding: 2px 14px 14px; display: none; }
+.sec-body.open { display: block; }
+
+/* ─── INFO BAR ─── */
+.info-bar {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+  padding: 12px 14px;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+}
+.ib-stat { text-align: center; }
+.ib-label { font-family: var(--mono); font-size: 9px; color: var(--text-dim); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 3px; }
+.ib-value { font-family: var(--mono); font-size: 16px; font-weight: 700; color: var(--gold); }
+.ib-value.blue   { color: var(--blue); }
+.ib-value.green  { color: var(--green); }
+.ib-value.sm     { font-size: 11px; color: var(--text-mid); }
+
+/* ─── PLAYERS ROW ─── */
+.players-row { display: flex; gap: 5px; flex-wrap: wrap; padding: 10px 0 4px; }
+.np-btn {
+  width: 36px; height: 36px; border-radius: 7px; border: 1px solid var(--border2);
+  background: transparent; color: var(--text-dim); font-family: var(--sans); font-size: 13px; font-weight: 700;
+  cursor: pointer; transition: all .15s;
+}
+.np-btn:hover { border-color: var(--gold-dim); color: var(--text); }
+.np-btn.on { border-color: var(--gold); color: var(--gold-hi); background: var(--gold-glow); box-shadow: 0 0 10px rgba(201,170,90,.15); }
+
+/* ─── PRESET ROW ─── */
+.preset-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 10px 0 4px; }
+.preset-btn {
+  padding: 10px 6px; border-radius: 7px; border: 1px solid var(--border2);
+  background: transparent; cursor: pointer; transition: all .15s; text-align: center; font-family: var(--sans);
+}
+.preset-icon  { font-size: 18px; display: block; margin-bottom: 3px; }
+.preset-label { font-size: 11px; font-weight: 700; letter-spacing: .4px; color: var(--text-mid); }
+.preset-desc  { font-family: var(--mono); font-size: 9px; color: var(--text-dim); margin-top: 2px; }
+.preset-btn:hover { background: var(--surface2); }
+.preset-btn.on[data-style="self_play"]    { border-color: var(--blue); background: var(--blue-dim); }
+.preset-btn.on[data-style="self_play"] .preset-label { color: var(--blue); }
+.preset-btn.on[data-style="exploitative"]{ border-color: var(--gold); background: var(--gold-glow); }
+.preset-btn.on[data-style="exploitative"] .preset-label { color: var(--gold-hi); }
+.preset-btn.on[data-style="aggressive"]  { border-color: var(--red);  background: var(--red-dim); }
+.preset-btn.on[data-style="aggressive"] .preset-label { color: var(--red); }
+
+/* ─── EP ROW ─── */
+.ep-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 10px 0 4px; }
+.ep-chip {
+  padding: 5px 13px; border-radius: 16px; border: 1px solid var(--border2);
+  background: transparent; color: var(--text-dim); font-family: var(--mono); font-size: 11px;
+  cursor: pointer; transition: all .15s;
+}
+.ep-chip:hover { border-color: var(--gold-dim); color: var(--gold); background: var(--gold-glow); }
+.ep-chip.on { border-color: var(--gold); color: var(--gold-hi); background: var(--gold-glow); }
+.ep-input {
+  background: var(--bg); border: 1px solid var(--border2); border-radius: 6px;
+  color: var(--text); font-family: var(--mono); font-size: 12px;
+  padding: 5px 9px; outline: none; width: 110px; transition: border-color .15s;
+}
+.ep-input:focus { border-color: var(--gold-dim); }
+
+/* ─── SLIDERS ─── */
+.param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 10px 0 4px; }
+.param-row  { display: flex; flex-direction: column; gap: 5px; }
+.param-label { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+.param-val   { color: var(--gold-hi); font-weight: 700; }
+
+input[type=range] {
+  -webkit-appearance: none; width: 100%; height: 3px;
+  background: var(--border2); border-radius: 2px; outline: none;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--gold); border: 2px solid var(--bg);
+  box-shadow: 0 0 6px rgba(201,170,90,.45); cursor: pointer; transition: transform .1s;
+}
+input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.3); }
+input[type=range].sl-blue::-webkit-slider-thumb  { background: var(--blue); box-shadow: 0 0 6px rgba(95,168,217,.45); }
+input[type=range].sl-red::-webkit-slider-thumb   { background: var(--red);  box-shadow: 0 0 6px rgba(217,95,95,.45); }
+input[type=range].sl-green::-webkit-slider-thumb { background: var(--green);box-shadow: 0 0 6px rgba(91,191,122,.45); }
+
+/* ─── BOT POOL ─── */
+.bot-list { display: flex; flex-direction: column; gap: 7px; padding: 10px 0 4px; }
+.bot-row  {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center;
+  padding: 10px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg);
+  transition: border-color .15s, opacity .2s;
+}
+.bot-row.off { opacity: .4; }
+.bot-left   { display: flex; align-items: center; gap: 8px; }
+.bot-icon   { font-size: 18px; }
+.bot-name   { font-weight: 700; font-size: 12px; }
+.bot-desc   { font-family: var(--mono); font-size: 9px; color: var(--text-dim); }
+.bot-mid    { display: flex; align-items: center; gap: 8px; }
+.bot-pct    { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--gold-hi); min-width: 34px; text-align: right; }
+
+/* Toggle */
+.tog { position: relative; width: 34px; height: 18px; flex-shrink: 0; }
+.tog input { opacity:0; width:0; height:0; }
+.tog-track {
+  position: absolute; inset: 0;
+  background: var(--border2); border-radius: 18px; cursor: pointer; transition: .2s;
+}
+.tog-track::after {
+  content:''; position:absolute; width:12px; height:12px; left:3px; top:3px;
+  background: var(--text-dim); border-radius:50%; transition:.2s;
+}
+.tog input:checked + .tog-track { background: rgba(201,170,90,.4); }
+.tog input:checked + .tog-track::after { left:19px; background: var(--gold); }
+
+.add-bot-btn {
+  display: flex; align-items: center; gap: 7px;
+  padding: 8px 12px; border-radius: 7px;
+  border: 1px dashed var(--border2); background: transparent;
+  color: var(--text-dim); font-family: var(--sans); font-size: 11px;
+  cursor: pointer; transition: all .15s; width: 100%;
+}
+.add-bot-btn:hover { border-color: var(--gold-dim); color: var(--gold); background: var(--gold-glow); }
+
+/* ─── DIVIDER ─── */
+.divider { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+
+/* ─── NAPLÓ TAB ─── */
+.naplo-header {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+  padding: 14px 16px; display: flex; gap: 16px; align-items: center;
+}
+.naplo-stat { text-align: center; flex: 1; }
+.naplo-stat-label { font-family: var(--mono); font-size: 9px; color: var(--text-dim); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 3px; }
+.naplo-stat-val   { font-family: var(--mono); font-size: 18px; font-weight: 700; color: var(--gold); }
+
+.session-list { display: flex; flex-direction: column; gap: 8px; }
+.session-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+  overflow: hidden; cursor: pointer; transition: border-color .15s;
+}
+.session-card:hover { border-color: var(--border2); }
+.session-card.completed   { border-left: 3px solid var(--green); }
+.session-card.interrupted { border-left: 3px solid var(--amber); }
+.session-head {
+  padding: 10px 14px;
+  display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+}
+.sess-id   { font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+.sess-date { font-family: var(--mono); font-size: 10px; color: var(--text-dim); text-align: right; }
+.sess-ep   { font-family: var(--mono); font-size: 14px; font-weight: 700; color: var(--gold); }
+.sess-style-badge {
+  font-family: var(--mono); font-size: 9px; padding: 2px 8px; border-radius: 4px;
+  text-transform: uppercase; letter-spacing: 1px;
+}
+.sess-metrics {
+  padding: 6px 14px 10px;
+  display: flex; gap: 14px; flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+}
+.sess-metric { font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+.sess-metric span { color: var(--text-mid); }
+
+.sess-note-area { padding: 8px 14px 10px; border-top: 1px solid var(--border); display: none; }
+.sess-note-input {
+  width: 100%; background: var(--bg); border: 1px solid var(--border2);
+  color: var(--text); font-family: var(--mono); font-size: 11px;
+  border-radius: 5px; padding: 6px 9px; outline: none; resize: vertical; min-height: 48px;
+}
+.sess-note-input:focus { border-color: var(--gold-dim); }
+.sess-note-save {
+  margin-top: 5px; padding: 4px 12px; border-radius: 5px;
+  background: var(--gold-glow); border: 1px solid var(--gold-dim);
+  color: var(--gold); font-family: var(--mono); font-size: 10px; cursor: pointer;
+  transition: background .15s;
+}
+.sess-note-save:hover { background: rgba(201,170,90,.25); }
+
+.empty-naplo {
+  text-align: center; padding: 48px 20px; color: var(--text-dim);
+}
+.empty-naplo .ei { font-size: 40px; margin-bottom: 10px; opacity: .4; }
+
+/* ─── TESTS TAB ─── */
+.test-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+  overflow: hidden;
+}
+.test-head {
+  padding: 10px 14px; display: grid; grid-template-columns: 1fr auto auto;
+  gap: 10px; align-items: center; cursor: pointer; transition: background .15s;
+}
+.test-head:hover { background: var(--surface2); }
+.test-filename { font-family: var(--mono); font-size: 11px; color: var(--text-mid); }
+.test-grade    { font-family: var(--mono); font-size: 13px; font-weight: 700; }
+.test-meta     { font-family: var(--mono); font-size: 10px; color: var(--text-dim); text-align: right; }
+.test-log-area {
+  border-top: 1px solid var(--border); padding: 12px 14px; display: none;
+}
+.test-log-area.open { display: block; }
+.log-pre {
+  font-family: var(--mono); font-size: 10px; color: var(--text-mid);
+  white-space: pre-wrap; max-height: 320px; overflow-y: auto;
+  line-height: 1.6;
+}
+.log-pre::-webkit-scrollbar { width: 3px; }
+.log-pre::-webkit-scrollbar-thumb { background: var(--border2); }
+
+/* ─── FOOTER ─── */
+footer {
+  flex-shrink: 0; height: 48px;
+  border-top: 1px solid var(--border2);
+  background: var(--surface);
+  display: flex; align-items: center; justify-content: space-between; padding: 0 20px;
+}
+.footer-left  { display: flex; align-items: center; gap: 14px; }
+.footer-right { display: flex; align-items: center; gap: 7px; }
+
+.metrics {
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--mono); font-size: 10px; color: var(--text-dim);
+}
+.m-chip { display: flex; align-items: center; gap: 4px; }
+.m-k    { color: var(--text-dim); }
+.m-v    { color: var(--gold); font-weight: 700; }
+.m-v.g  { color: var(--green); }
+.m-v.r  { color: var(--red); }
+.prog   { width: 72px; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+.prog-f { height: 100%; background: linear-gradient(90deg, var(--gold-dim), var(--gold)); border-radius: 2px; transition: width .6s; }
+
+/* ─── BUTTONS ─── */
+.btn {
+  padding: 7px 18px; border-radius: 7px; font-size: 12px; font-weight: 700;
+  cursor: pointer; font-family: var(--sans); transition: all .15s;
+  border: 1px solid; display: flex; align-items: center; gap: 5px; letter-spacing: .3px;
+}
+.btn-primary {
+  background: linear-gradient(135deg, rgba(201,170,90,.22), rgba(201,170,90,.08));
+  border-color: var(--gold); color: var(--gold);
+}
+.btn-primary:hover { background: rgba(201,170,90,.3); transform: translateY(-1px); }
+.btn-primary:disabled { opacity: .3; cursor: not-allowed; transform: none; }
+.btn-danger  { background: var(--red-dim); border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: rgba(217,95,95,.22); }
+.btn-ghost   { background: transparent; border-color: var(--border2); color: var(--text-dim); }
+.btn-ghost:hover { border-color: var(--border2); color: var(--text); background: var(--surface2); }
+
+/* ─── MODAL ─── */
+.overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.75);
+  display: flex; align-items: center; justify-content: center; z-index: 200;
+  opacity: 0; pointer-events: none; transition: opacity .2s;
+}
+.overlay.open { opacity: 1; pointer-events: all; }
+.modal {
+  background: var(--surface); border: 1px solid var(--border2);
+  border-radius: 12px; padding: 26px 30px; min-width: 360px;
+  transform: scale(.96); transition: transform .2s;
+}
+.overlay.open .modal { transform: scale(1); }
+.modal h3 { font-size: 15px; font-weight: 800; margin-bottom: 6px; }
+.modal p  { font-size: 11px; color: var(--text-dim); margin-bottom: 16px; line-height: 1.6; }
+.modal-foot { display: flex; gap: 7px; justify-content: flex-end; margin-top: 14px; }
+.field-label { font-family: var(--mono); font-size: 10px; color: var(--gold); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 5px; }
+.text-input {
+  width: 100%; background: var(--bg); border: 1px solid var(--border2); border-radius: 6px;
+  color: var(--text); font-family: var(--mono); font-size: 12px;
+  padding: 7px 10px; outline: none; margin-bottom: 10px; transition: border-color .15s;
+}
+.text-input:focus { border-color: var(--gold-dim); }
+
+/* ─── TOAST ─── */
+.toasts { position: fixed; bottom: 58px; right: 16px; z-index: 300; display: flex; flex-direction: column; gap: 5px; align-items: flex-end; }
+.toast  { padding: 9px 16px; border-radius: 7px; font-size: 12px; border: 1px solid; animation: tslide .22s ease-out; max-width: 280px; font-family: var(--sans); }
+.toast.success { background: var(--green-dim); border-color: var(--green); color: var(--green); }
+.toast.error   { background: var(--red-dim);   border-color: var(--red);   color: var(--red); }
+.toast.info    { background: var(--gold-glow);  border-color: var(--gold-dim); color: var(--gold); }
+@keyframes tslide { from{opacity:0;transform:translateX(14px)} to{opacity:1;transform:translateX(0)} }
+
+/* ─── EMPTY STATE ─── */
+.empty-sel { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 10px; color: var(--text-dim); text-align: center; padding: 40px; }
+.empty-sel .ei { font-size: 44px; opacity: .3; }
+
+/* ─── MISC ─── */
+.kv-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; font-size: 11px; border-bottom: 1px solid rgba(255,255,255,.03); }
+.kv-k { font-family: var(--mono); color: var(--text-dim); }
+.kv-v { font-family: var(--mono); color: var(--gold); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-pulse"></div>
+    ♠ POKER AI v4 &nbsp;·&nbsp; Training Manager
+  </div>
+  <span class="status-badge idle" id="statusBadge">IDLE</span>
+</header>
+
+<div class="app-body">
+
+  <!-- ─── SIDEBAR ─── -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <span class="sidebar-label">Modellek</span>
+      <span class="sidebar-count" id="modelCount">0 db</span>
+    </div>
+    <div class="model-scroll" id="modelScroll">
+      <div class="empty-sel" style="height:200px"><div class="ei">📂</div><p>Betöltés…</p></div>
+    </div>
+    <button class="new-model-btn" onclick="openCreateModal()">
+      <span style="font-size:16px;font-weight:300">+</span>
+      Új modell létrehozása
+    </button>
+  </aside>
+
+  <!-- ─── RIGHT PANEL ─── -->
+  <div class="right-panel">
+
+    <!-- Tabs -->
+    <div class="tabs-bar">
+      <button class="tab-btn active" data-tab="settings" onclick="switchTab('settings')">⚙️ Beállítások</button>
+      <button class="tab-btn" data-tab="naplo"    onclick="switchTab('naplo')">📓 Napló</button>
+      <button class="tab-btn" data-tab="tests"    onclick="switchTab('tests')">🧪 Tesztek</button>
+    </div>
+
+    <!-- Tab: Settings -->
+    <div class="tab-content">
+      <div class="tab-pane active" id="tab-settings">
+        <div class="empty-sel" id="settingsEmpty">
+          <div class="ei">🎯</div>
+          <p>Válassz egy modellt a bal oldali listából.</p>
+        </div>
+        <div id="settingsContent" style="display:none;flex-direction:column;gap:14px"></div>
+      </div>
+
+      <!-- Tab: Napló -->
+      <div class="tab-pane" id="tab-naplo">
+        <div class="empty-sel" id="naploEmpty">
+          <div class="ei">📓</div>
+          <p>Válassz egy modellt a napló megtekintéséhez.</p>
+        </div>
+        <div id="naploContent" style="display:none;flex-direction:column;gap:14px"></div>
+      </div>
+
+      <!-- Tab: Tests -->
+      <div class="tab-pane" id="tab-tests">
+        <div class="empty-sel" id="testsEmpty">
+          <div class="ei">🧪</div>
+          <p>Válassz egy modellt a tesztek megtekintéséhez.</p>
+        </div>
+        <div id="testsContent" style="display:none;flex-direction:column;gap:10px"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Footer -->
+<footer>
+  <div class="footer-left">
+    <div class="metrics" id="metricsBar">
+      <span style="font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:1.5px;text-transform:uppercase">LIVE</span>
+      <span class="m-chip"><span class="m-k">EP:</span><span class="m-v" id="mEp">–</span></span>
+      <span class="m-chip"><span class="m-k">ACTOR:</span><span class="m-v" id="mAct">–</span></span>
+      <span class="m-chip"><span class="m-k">CRIT:</span><span class="m-v" id="mCrit">–</span></span>
+      <span class="m-chip"><span class="m-k">ENT:</span><span class="m-v" id="mEnt">–</span></span>
+      <span class="m-chip"><span class="m-k">ETA:</span><span class="m-v" id="mEta">–</span></span>
+      <div class="prog"><div class="prog-f" id="progFill" style="width:0%"></div></div>
+    </div>
+  </div>
+  <div class="footer-right">
+    <button class="btn btn-ghost" onclick="saveConfig()">💾 Mentés</button>
+    <button class="btn btn-danger" id="stopBtn" onclick="stopTraining()" style="display:none">⏹ Stop</button>
+    <button class="btn btn-primary" id="startBtn" onclick="startTraining()">🚀 Indítás</button>
+  </div>
+</footer>
+
+<!-- Modal: Create model -->
+<div class="overlay" id="createModal" onclick="closeOnBg(event,'createModal')">
+  <div class="modal">
+    <h3>Új modell létrehozása</h3>
+    <p>Létrejön a <code>models/{name}/</code> mappa config.json-nal és napló.json-nal.<br>A .pth checkpoint az első tréning indításakor keletkezik.</p>
+    <div class="field-label">Modell neve</div>
+    <input class="text-input" id="newModelName" placeholder="pl. 6max" oninput="previewName()">
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);margin-bottom:10px" id="namePreview"></div>
+    <div class="field-label">Játékosszám</div>
+    <div class="players-row" id="modalPlayersRow">
+      <button class="np-btn" onclick="setModalPlayers(2)">2</button>
+      <button class="np-btn" onclick="setModalPlayers(3)">3</button>
+      <button class="np-btn" onclick="setModalPlayers(4)">4</button>
+      <button class="np-btn" onclick="setModalPlayers(5)">5</button>
+      <button class="np-btn on" onclick="setModalPlayers(6)">6</button>
+      <button class="np-btn" onclick="setModalPlayers(7)">7</button>
+      <button class="np-btn" onclick="setModalPlayers(8)">8</button>
+      <button class="np-btn" onclick="setModalPlayers(9)">9</button>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="closeModal('createModal')">Mégsem</button>
+      <button class="btn btn-primary" onclick="confirmCreate()">Létrehozás</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Migrate -->
+<div class="overlay" id="migrateModal" onclick="closeOnBg(event,'migrateModal')">
+  <div class="modal">
+    <h3>Modell migrálása</h3>
+    <p>Ez a modell a projekt gyökerében van. Átmásolod a <code>models/</code> mappába?</p>
+    <div class="field-label">Modell neve (mappa neve)</div>
+    <input class="text-input" id="migrateNameInput" placeholder="pl. 6max">
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="closeModal('migrateModal')">Mégsem</button>
+      <button class="btn btn-primary" onclick="confirmMigrate()">Migráció</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toastContainer"></div>
+
+<script>
+// ═══════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════
+let models       = [];
+let selModel     = null;
+let curCfg       = null;
+let episodesToRun = 100_000;
+let isRunning    = false;
+let modalPlayers = 6;
+let migrateModel = null;
+let pollTimer    = null;
+const openSecs   = new Set(['basic','bots']);
+
+// ═══════════════════════════════════════════════
+// API
+// ═══════════════════════════════════════════════
+async function api(path, body=null) {
+  const post = body !== null;
+  const opts = post
+    ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}
+    : {method:'GET'};
+  const res = await fetch('/api/'+path, opts);
+  return res.json().catch(()=>({}));
+}
+
+// ═══════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════
+(async()=>{
+  const d = await api('defaults');
+  window._defaults = d.defaults || {};
+  await loadModels();
+  startPoll();
+})();
+
+async function loadModels() {
+  const d = await api('models');
+  models = d.models || [];
+  renderSidebar();
+}
+
+// ═══════════════════════════════════════════════
+// TABS
+// ═══════════════════════════════════════════════
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab===tab));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id==='tab-'+tab));
+  if (tab==='naplo'  && selModel) loadNaplo();
+  if (tab==='tests'  && selModel) loadTests();
+}
+
+// ═══════════════════════════════════════════════
+// SIDEBAR
+// ═══════════════════════════════════════════════
+function renderSidebar() {
+  const el = document.getElementById('modelScroll');
+  document.getElementById('modelCount').textContent = models.length + ' db';
+  if (!models.length) {
+    el.innerHTML = '<div class="empty-sel" style="height:200px"><div class="ei">📦</div><p>Nincs modell. Hozz létre egyet!</p></div>';
+    return;
+  }
+  const styleLabels = {self_play:'Self-Play', exploitative:'Exploitative', aggressive:'Aggressive', custom:'Custom'};
+  el.innerHTML = models.map(m => {
+    const s = selModel && selModel.name === m.name;
+    const style = m.config?.config?.training_style || 'exploitative';
+    const np = m.num_players || '?';
+    const ep = (m.episodes||0).toLocaleString('hu');
+    const running = isRunning && window._runningModel === m.name;
+    return `<div class="model-card ${s?'sel':''} ${running?'running-card':''}"
+        onclick="selectModel('${m.name}')">
+      <div class="mc-name">${m.name}</div>
+      <div class="mc-meta">
+        <span class="mc-ep">${ep} ep</span> · <span class="mc-np">${np}max</span>
+        ${!m.in_models_dir ? ' · <span style="color:var(--amber)">⚠ gyökér</span>' : ''}
+      </div>
+      <span class="mc-badge badge-${running?'running':style}">${running?'▶ FUT':styleLabels[style]||style}</span>
+    </div>`;
+  }).join('');
+}
+
+// ═══════════════════════════════════════════════
+// SELECT MODEL
+// ═══════════════════════════════════════════════
+async function selectModel(name) {
+  const m = models.find(x=>x.name===name);
+  if (!m) return;
+  selModel = m;
+  curCfg   = null;
+  renderSidebar();
+
+  // Config betöltés
+  const cfgData = await api('config/'+name);
+  curCfg = cfgData;
+
+  renderSettings();
+
+  // Ha épp a napló/tesztek tab aktív, azt is frissítjük
+  const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
+  if (activeTab==='naplo') loadNaplo();
+  if (activeTab==='tests') loadTests();
+
+  // Migráció ajánlat ha nem a models/ alatt van
+  if (!m.in_models_dir) {
+    toast('Ez a modell a gyökérben van. Érdemes migrálni a models/ mappába.', 'info');
+  }
+}
+
+// ═══════════════════════════════════════════════
+// SETTINGS TAB
+// ═══════════════════════════════════════════════
+function renderSettings() {
+  const empty = document.getElementById('settingsEmpty');
+  const cont  = document.getElementById('settingsContent');
+  empty.style.display = 'none';
+  cont.style.display  = 'flex';
+
+  const m   = selModel;
+  const cfg = curCfg?.config || {};
+  const np  = curCfg?.num_players || m?.num_players || 6;
+  const ep  = m?.episodes || 0;
+  const style = cfg.training_style || 'exploitative';
+
+  cont.innerHTML = `
+    <!-- INFO BAR -->
+    <div class="info-bar">
+      <div class="ib-stat"><div class="ib-label">Epizód</div><div class="ib-value">${(ep/1e6).toFixed(2)}M</div></div>
+      <div class="ib-stat"><div class="ib-label">Játékos</div><div class="ib-value blue" id="ib-np">${np}max</div></div>
+      <div class="ib-stat"><div class="ib-label">State size</div><div class="ib-value green">${m?.state_size||'?'}</div></div>
+      <div class="ib-stat"><div class="ib-label">Stílus</div><div class="ib-value sm" id="ib-style">${style}</div></div>
+    </div>
+
+    <!-- BASIC -->
+    ${sec('basic','🎮 Alap beállítások','',`
+      <div style="margin:10px 0 6px"><div class="field-label" style="margin-bottom:8px">Játékosszám</div>
+        <div class="players-row" id="npRow">
+          ${[2,3,4,5,6,7,8,9].map(n=>`<button class="np-btn ${n===np?'on':''}" onclick="setNp(${n})">${n}</button>`).join('')}
+        </div>
+      </div>
+      <hr class="divider">
+      <div class="field-label" style="margin:8px 0">Tréning stílus</div>
+      <div class="preset-row">
+        ${pBtn('self_play','🤝','Self-Play','50/50 önmaga',style)}
+        ${pBtn('exploitative','⚔️','Exploitative','Bot mix',style)}
+        ${pBtn('aggressive','🔥','Aggressive','Nitás botok',style)}
+      </div>
+      <hr class="divider">
+      <div class="field-label" style="margin:8px 0">Epizódok száma</div>
+      <div class="ep-row" id="epRow">
+        ${[50_000,100_000,500_000,1_000_000,5_000_000].map(n=>{
+          const lbl = n>=1e6?(n/1e6)+'M':(n/1000)+'k';
+          return `<button class="ep-chip ${episodesToRun===n?'on':''}" data-ep="${n}" onclick="setEp(${n})">${lbl}</button>`;
+        }).join('')}
+        <input type="number" class="ep-input" id="epCustom" value="${episodesToRun}" min="1000" step="1000"
+               oninput="setEpCustom(this.value)" placeholder="egyéni">
+      </div>
+    `)}
+
+    <!-- PPO -->
+    ${sec('ppo','⚙️ PPO Paraméterek','tanulási dinamika',`
+      <div class="param-grid">
+        ${sl('learning_rate','LR',cfg.learning_rate??3e-4,1e-5,1e-3,1e-5,'sl-gold')}
+        ${sl('clip_eps','Clip ε',cfg.clip_eps??0.2,0.05,0.5,0.01,'')}
+        ${sl('entropy_coef','Entropy coef',cfg.entropy_coef??0.01,0,0.05,0.001,'')}
+        ${sl('gae_lambda','GAE λ',cfg.gae_lambda??0.95,0.8,0.99,0.01,'')}
+        ${sl('gamma','Gamma γ',cfg.gamma??0.99,0.9,0.999,0.001,'')}
+        ${sl('max_grad_norm','Grad clip',cfg.max_grad_norm??0.5,0.1,2,0.05,'sl-blue')}
+        ${sl('value_coef','Value coef',cfg.value_coef??0.5,0.1,1,0.05,'sl-blue')}
+        ${sl('ppo_epochs','PPO epochok',cfg.ppo_epochs??8,2,16,1,'sl-blue')}
+      </div>
+      <hr class="divider">
+      <div class="param-grid">
+        ${sl('num_envs','Env-ek',cfg.num_envs??512,64,1024,64,'sl-blue')}
+        ${sl('buffer_collect_size','Buffer méret',cfg.buffer_collect_size??2048,256,8192,256,'sl-blue')}
+        ${sl_m('entropy_decay','Entropy decay (M)',(cfg.entropy_decay??30e6)/1e6,5,100,5,'',1e6)}
+      </div>
+    `)}
+
+    <!-- BOTS -->
+    ${sec('bots','🤖 Bot Pool','ellenfél mix',renderBots(cfg))}
+
+    <!-- REWARD -->
+    ${sec('reward','🎁 Reward Shaping','tanulási jelzések',`
+      <div class="param-grid">
+        ${sl('draw_fold_penalty','Draw fold (-BB)',cfg.draw_fold_penalty??0.08,0,0.3,0.01,'sl-red')}
+        ${sl('draw_equity_threshold','Draw küszöb',cfg.draw_equity_threshold??0.44,0.3,0.7,0.01,'sl-red')}
+        ${sl('street_reward_scale','Street delta scale',cfg.street_reward_scale??0.05,0,0.3,0.01,'')}
+      </div>
+    `)}
+
+    <!-- MILESTONE -->
+    ${sec('milestone','🏆 Mérföldkő','auto mentés + teszt',`
+      <div class="param-grid">
+        ${sl_m('milestone_interval','Mérföldkő (M ep)',(cfg.milestone_interval??2e6)/1e6,0.5,10,0.5,'',1e6)}
+      </div>
+      <div style="margin-top:8px">
+        <div class="kv-row"><span class="kv-k">Mentési hely</span><span class="kv-v">models/${m?.name||'?'}/tests/</span></div>
+        <div class="kv-row"><span class="kv-k">Auto teszt</span><span class="kv-v">test_model_sanity.py</span></div>
+      </div>
+    `)}
+
+    <!-- FOLDER INFO -->
+    ${sec('folder','📁 Modell mappa','fájlok',`
+      <div style="margin-top:6px">
+        <div class="kv-row"><span class="kv-k">Mappa</span><span class="kv-v">models/${m?.name||'?'}/</span></div>
+        <div class="kv-row"><span class="kv-k">Checkpoint</span><span class="kv-v">${m?.name||'?'}_ppo_v4.pth</span></div>
+        <div class="kv-row"><span class="kv-k">Konfig</span><span class="kv-v">config.json</span></div>
+        <div class="kv-row"><span class="kv-k">Napló</span><span class="kv-v">naplo.json</span></div>
+        <div class="kv-row"><span class="kv-k">Tesztek</span><span class="kv-v">tests/</span></div>
+      </div>
+      ${!m?.in_models_dir?`<button class="add-bot-btn" style="margin-top:10px" onclick="openMigrateModal()">📦 Migrálás models/ mappába</button>`:''}
+    `)}
+  `;
+}
+
+// ─── Section helper ───
+function sec(id, title, sub, body) {
+  const open = openSecs.has(id);
+  return `<div class="section">
+    <div class="sec-head" onclick="toggleSec('${id}')">
+      <div class="sec-title">${title}${sub?`<span class="sec-sub">${sub}</span>`:''}
+      </div>
+      <span class="chev ${open?'open'}" id="chev-${id}">▾</span>
+    </div>
+    <div class="sec-body ${open?'open':''}" id="sec-${id}">${body}</div>
+  </div>`;
+}
+function toggleSec(id) {
+  const b = document.getElementById('sec-'+id);
+  const c = document.getElementById('chev-'+id);
+  const o = b.classList.contains('open');
+  b.classList.toggle('open',!o); c.classList.toggle('open',!o);
+  if (!o) openSecs.add(id); else openSecs.delete(id);
+}
+
+// ─── Preset button ───
+function pBtn(style,icon,label,desc,current) {
+  return `<button class="preset-btn ${current===style?'on':''}" data-style="${style}"
+           onclick="applyPreset('${style}')">
+    <span class="preset-icon">${icon}</span>
+    <span class="preset-label">${label}</span>
+    <span class="preset-desc">${desc}</span>
+  </button>`;
+}
+async function applyPreset(style) {
+  if (!curCfg) return;
+  const r = await api('apply_preset',{style,config:curCfg.config});
+  if (r.config) { curCfg.config=r.config; renderSettings(); toast(style+' alkalmazva','info'); }
+}
+
+// ─── Sliders ───
+function sl(key,label,val,min,max,step,cls) {
+  const fmt = v => step<0.01?parseFloat(v).toExponential(2):step<0.1?parseFloat(v).toFixed(3):step<1?parseFloat(v).toFixed(2):Math.round(v);
+  return `<div class="param-row">
+    <div class="param-label"><span>${label}</span><span class="param-val" id="pv-${key}">${fmt(val)}</span></div>
+    <input type="range" class="${cls}" id="sl-${key}" min="${min}" max="${max}" step="${step}" value="${val}"
+           oninput="onSl('${key}',this.value,1,${step})">
+  </div>`;
+}
+function sl_m(key,label,val,min,max,step,cls,mult) {
+  const fmt = v => step<1?parseFloat(v).toFixed(2):Math.round(v);
+  return `<div class="param-row">
+    <div class="param-label"><span>${label}</span><span class="param-val" id="pv-${key}">${fmt(val)}</span></div>
+    <input type="range" class="${cls}" id="sl-${key}" min="${min}" max="${max}" step="${step}" value="${val}"
+           oninput="onSl('${key}',this.value,${mult},${step})">
+  </div>`;
+}
+function onSl(key,raw,mult,step) {
+  const v=parseFloat(raw); const store=v*mult;
+  let display;
+  if(step<0.01)      display=v.toExponential(2);
+  else if(step<0.1)  display=v.toFixed(3);
+  else if(step<1)    display=v.toFixed(2);
+  else               display=Math.round(v);
+  const el=document.getElementById('pv-'+key); if(el) el.textContent=display;
+  if(curCfg?.config) curCfg.config[key]=store;
+}
+
+// ─── Bots ───
+const BOT_ICONS={fish:'🐟',nit:'🎯',calling_station:'📞',lag:'💣'};
+const BOT_DESCS={fish:'VPIP 55%, passzív call station',nit:'VPIP 12%, csak prémium',calling_station:'Mindent callol',lag:'Wide range, sok raise'};
+function renderBots(cfg) {
+  const pool=cfg.bot_pool||{fish:{enabled:true,weight:0.8},nit:{enabled:true,weight:1.5},calling_station:{enabled:true,weight:0.2},lag:{enabled:true,weight:1.5}};
+  const total=Object.values(pool).reduce((s,b)=>s+(b.enabled?b.weight:0),0);
+  let h='<div class="bot-list" id="botList">';
+  for(const[k,b] of Object.entries(pool)){
+    const pct=total>0&&b.enabled?Math.round(b.weight/total*100):0;
+    h+=`<div class="bot-row ${b.enabled?'':'off'}" id="brow-${k}">
+      <div class="bot-left">
+        <label class="tog"><input type="checkbox" ${b.enabled?'checked':''} onchange="toggleBot('${k}',this.checked)"><span class="tog-track"></span></label>
+        <span class="bot-icon">${BOT_ICONS[k]||'🤖'}</span>
+        <div><div class="bot-name">${k.replace(/_/g,' ')}</div><div class="bot-desc">${BOT_DESCS[k]||''}</div></div>
+      </div>
+      <div class="bot-mid">
+        <input type="range" min="0" max="5" step="0.1" value="${b.weight}" id="bw-${k}" ${!b.enabled?'disabled':''}
+               oninput="onBotW('${k}',this.value)" style="width:120px">
+        <span style="font-family:var(--mono);font-size:9px;color:var(--text-dim)">súly</span>
+      </div>
+      <span class="bot-pct" id="bpct-${k}">${pct}%</span>
+    </div>`;
+  }
+  h+=`</div>
+  <button class="add-bot-btn" style="margin-top:8px" onclick="toast('Hamarosan: egyéni bot hozzáadása 🚧','info')">
+    <span>+</span> Egyéni bot hozzáadása <span style="font-size:9px;font-family:var(--mono)">(hamarosan)</span>
+  </button>`;
+  return h;
+}
+function toggleBot(k,on) {
+  if(!curCfg?.config?.bot_pool) return;
+  curCfg.config.bot_pool[k]={...curCfg.config.bot_pool[k],enabled:on};
+  const row=document.getElementById('brow-'+k); if(row){row.classList.toggle('off',!on);}
+  const sl=document.getElementById('bw-'+k); if(sl) sl.disabled=!on;
+  recalcBots();
+}
+function onBotW(k,val) {
+  if(!curCfg?.config?.bot_pool) return;
+  curCfg.config.bot_pool[k]={...curCfg.config.bot_pool[k],weight:parseFloat(val)};
+  recalcBots();
+}
+function recalcBots() {
+  const pool=curCfg?.config?.bot_pool||{};
+  const t=Object.values(pool).reduce((s,b)=>s+(b.enabled?b.weight:0),0);
+  for(const[k,b] of Object.entries(pool)){
+    const p=t>0&&b.enabled?Math.round(b.weight/t*100):0;
+    const el=document.getElementById('bpct-'+k); if(el) el.textContent=p+'%';
+  }
+}
+
+// ─── Players ───
+function setNp(n) {
+  if(curCfg) curCfg.num_players=n;
+  document.querySelectorAll('#npRow .np-btn').forEach(b=>b.classList.toggle('on',parseInt(b.textContent)===n));
+  const ib=document.getElementById('ib-np'); if(ib) ib.textContent=n+'max';
+}
+
+// ─── Episodes ───
+function setEp(n) {
+  episodesToRun=n;
+  document.querySelectorAll('#epRow .ep-chip').forEach(c=>c.classList.toggle('on',parseInt(c.dataset.ep)===n));
+  const inp=document.getElementById('epCustom'); if(inp) inp.value=n;
+}
+function setEpCustom(v) {
+  episodesToRun=Math.max(1000,parseInt(v)||100000);
+  document.querySelectorAll('#epRow .ep-chip').forEach(c=>c.classList.remove('on'));
+}
+
+// ═══════════════════════════════════════════════
+// NAPLÓ TAB
+// ═══════════════════════════════════════════════
+async function loadNaplo() {
+  if(!selModel) return;
+  const el=document.getElementById('naploContent');
+  const emp=document.getElementById('naploEmpty');
+  emp.style.display='none'; el.style.display='flex';
+
+  const n=await api('naplo/'+selModel.name);
+  const sessions=(n.sessions||[]).slice().reverse();
+
+  const totEp=(n.total_episodes||0).toLocaleString('hu');
+  const totSess=sessions.length;
+  const totalSec=sessions.reduce((s,x)=>s+(x.duration_sec||0),0);
+  const totalH=totalSec>0?(totalSec/3600).toFixed(1):'–';
+
+  let html=`<div class="naplo-header">
+    <div class="naplo-stat"><div class="naplo-stat-label">Összes Ep</div><div class="naplo-stat-val">${(n.total_episodes||0)>=1e6?((n.total_episodes||0)/1e6).toFixed(2)+'M':totEp}</div></div>
+    <div class="naplo-stat"><div class="naplo-stat-label">Sessionök</div><div class="naplo-stat-val">${totSess}</div></div>
+    <div class="naplo-stat"><div class="naplo-stat-label">Összes idő</div><div class="naplo-stat-val">${totalH}h</div></div>
+  </div>`;
+
+  if(!sessions.length) {
+    html+=`<div class="empty-naplo"><div class="ei">📋</div><p>Még nem volt tréning session ehhez a modellhez.</p></div>`;
+  } else {
+    html+=`<div class="session-list">`;
+    for(const s of sessions) {
+      const added=(s.episodes_added||0).toLocaleString('hu');
+      const start=s.started?s.started.replace('T',' ').replace('Z',''):'?';
+      const end=s.ended?s.ended.replace('T',' ').replace('Z',''):'folyamatban';
+      const dur=s.duration_sec?Math.floor(s.duration_sec/60)+'m':'–';
+      const style=s.style||'?';
+      const m=s.metrics_final||{};
+      const cls=s.completed===false?'interrupted':'completed';
+      html+=`<div class="session-card ${cls}" onclick="toggleSession('${s.id}')">
+        <div class="session-head">
+          <div>
+            <div class="sess-id">${s.id}</div>
+            <div class="sess-ep">+${added} ep</div>
+            <span class="sess-style-badge badge-${style}">${style}</span>
+            ${s.completed===false?'<span class="sess-style-badge badge-warning" style="margin-left:4px">megszakítva</span>':''}
+          </div>
+          <div class="sess-date">${start}<br><span style="color:var(--text-dim)">${end}</span><br><span style="color:var(--text-dim)">⏱ ${dur}</span></div>
+        </div>
+        ${Object.keys(m).length?`<div class="sess-metrics">
+          ${m.actor_loss!=null?`<div class="sess-metric">ACTOR <span>${m.actor_loss.toFixed(4)}</span></div>`:''}
+          ${m.critic_loss!=null?`<div class="sess-metric">CRITIC <span>${m.critic_loss.toFixed(4)}</span></div>`:''}
+          ${m.entropy!=null?`<div class="sess-metric">ENT <span>${m.entropy.toFixed(4)}</span></div>`:''}
+        </div>`:''}
+        <div class="sess-note-area" id="note-${s.id}">
+          <textarea class="sess-note-input" placeholder="Megjegyzés ehhez a sessionhöz…">${s.notes||''}</textarea>
+          <button class="sess-note-save" onclick="saveNote('${s.id}',event)">💾 Mentés</button>
+        </div>
+      </div>`;
+    }
+    html+=`</div>`;
+  }
+  el.innerHTML=html;
+}
+
+function toggleSession(id) {
+  const el=document.getElementById('note-'+id);
+  if(el) el.style.display=el.style.display==='block'?'none':'block';
+}
+
+async function saveNote(sessionId,e) {
+  e.stopPropagation();
+  const area=document.querySelector(`#note-${sessionId} .sess-note-input`);
+  if(!area||!selModel) return;
+  await api('naplo_note/'+selModel.name,{session_id:sessionId,note:area.value});
+  toast('Megjegyzés mentve','success');
+}
+
+// ═══════════════════════════════════════════════
+// TESTS TAB
+// ═══════════════════════════════════════════════
+async function loadTests() {
+  if(!selModel) return;
+  const el=document.getElementById('testsContent');
+  const emp=document.getElementById('testsEmpty');
+  emp.style.display='none'; el.style.display='flex';
+
+  const d=await api('tests/'+selModel.name);
+  const tests=d.tests||[];
+
+  // Update tab badge
+  const tabBtn=document.querySelector('.tab-btn[data-tab="tests"]');
+  if(tabBtn&&tests.length) {
+    if(!tabBtn.querySelector('.tab-badge')) tabBtn.innerHTML+='<span class="tab-badge">'+tests.length+'</span>';
+  }
+
+  if(!tests.length) {
+    el.innerHTML=`<div class="empty-sel"><div class="ei">🔬</div><p>Még nincsenek tesztek. Az első mérföldkő elérésekor automatikusan lefut.</p></div>`;
+    return;
+  }
+
+  const gradeColor={'🟢 JÓ':'var(--green)','🟡 ELFOGADHATÓ':'var(--gold)','🟠 PROBLÉMÁS':'var(--amber)','🔴 KOMOLY HIBÁK':'var(--red)'};
+  el.innerHTML=tests.map(t=>`
+    <div class="test-card">
+      <div class="test-head" onclick="toggleTestLog('${t.filename}')">
+        <div>
+          <div style="font-weight:700;font-size:13px">${t.filename.replace('.json','')}</div>
+          <div class="test-filename">${t.timestamp||'?'}</div>
+        </div>
+        <div class="test-grade" style="color:${gradeColor[t.grade]||'var(--text-mid)'}">${t.grade||'?'}</div>
+        <div class="test-meta">
+          ✅ ${t.passed} &nbsp; ❌ ${t.failed}<br>
+          Penalty: ${t.penalty??'?'}<br>
+          ${t.has_log?'📄 log elérhető':''}
+        </div>
+      </div>
+      <div class="test-log-area" id="tlog-${t.filename}">
+        <div style="text-align:center;padding:10px;font-family:var(--mono);font-size:10px;color:var(--text-dim)" id="tlog-loading-${t.filename}">
+          Log betöltése…
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function toggleTestLog(filename) {
+  const el=document.getElementById('tlog-'+filename);
+  if(!el) return;
+  const isOpen=el.classList.contains('open');
+  if(isOpen){el.classList.remove('open');return;}
+  el.classList.add('open');
+  if(!selModel) return;
+  const d=await api('test_log/'+selModel.name+'/'+filename);
+  const logEl=document.getElementById('tlog-loading-'+filename);
+  if(!d.log) {el.innerHTML='<p style="font-family:var(--mono);font-size:10px;color:var(--text-dim);padding:10px">Log fájl nem elérhető.</p>'; return;}
+  el.innerHTML=`<pre class="log-pre">${d.log.replace(/</g,'&lt;')}</pre>`;
+}
+
+// ═══════════════════════════════════════════════
+// START / STOP
+// ═══════════════════════════════════════════════
+async function startTraining() {
+  if(!selModel||!curCfg){toast('Válassz modellt!','error');return;}
+  const r=await api('start',{
+    model_name:  selModel.name,
+    num_players: curCfg.num_players,
+    episodes:    episodesToRun,
+    config:      curCfg.config,
+  });
+  if(r.error){toast(r.error,'error');return;}
+  window._runningModel=selModel.name;
+  toast(`Tréning indítva (PID: ${r.pid})`, 'success');
+  isRunning=true; updateUI(true);
+}
+async function stopTraining() {
+  await api('stop',{});
+  isRunning=false; window._runningModel=null; updateUI(false);
+  toast('Tréning leállítva','info');
+  await loadModels();
+}
+
+function updateUI(running) {
+  const badge=document.getElementById('statusBadge');
+  const start=document.getElementById('startBtn');
+  const stop =document.getElementById('stopBtn');
+  if(running){
+    badge.textContent='FUT'; badge.className='status-badge running';
+    start.disabled=true; stop.style.display='';
+  } else {
+    badge.textContent='IDLE'; badge.className='status-badge idle';
+    start.disabled=false; stop.style.display='none';
+  }
+}
+
+// ═══════════════════════════════════════════════
+// SAVE CONFIG
+// ═══════════════════════════════════════════════
+async function saveConfig() {
+  if(!selModel||!curCfg){toast('Nincs kijelölt modell','error');return;}
+  const r=await api('config/'+selModel.name,curCfg);
+  if(r.ok) toast('Konfiguráció mentve ✓','success');
+  else toast('Mentési hiba: '+(r.error||'?'),'error');
+}
+
+// ═══════════════════════════════════════════════
+// POLLING
+// ═══════════════════════════════════════════════
+function startPoll() {
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer=setInterval(async()=>{
+    const d=await api('status');
+    const running=d.running||false;
+    if(running!==isRunning){
+      isRunning=running; updateUI(running);
+      if(!running){await loadModels();window._runningModel=null;}
+    }
+    if(running) window._runningModel=d.model;
+    renderSidebar();
+    const m=d.metrics||{};
+    if(m.current_ep){
+      const pct=m.target_ep>0?Math.min(100,Math.round(m.current_ep/m.target_ep*100)):0;
+      document.getElementById('mEp').textContent=m.current_ep>=1e6?(m.current_ep/1e6).toFixed(2)+'M':(m.current_ep/1000).toFixed(0)+'k';
+      document.getElementById('progFill').style.width=pct+'%';
+    }
+    if(m.actor!=null){const e=document.getElementById('mAct');e.textContent=m.actor.toFixed(4);e.className='m-v'+(m.actor<0?' g':' r');}
+    if(m.critic!=null) document.getElementById('mCrit').textContent=m.critic.toFixed(4);
+    if(m.entropy!=null) document.getElementById('mEnt').textContent=m.entropy.toFixed(3);
+    if(m.eta)  document.getElementById('mEta').textContent=m.eta;
+  },2000);
+}
+
+// ═══════════════════════════════════════════════
+// MODALS
+// ═══════════════════════════════════════════════
+function openCreateModal(){document.getElementById('createModal').classList.add('open');}
+function closeModal(id){document.getElementById(id).classList.remove('open');}
+function closeOnBg(e,id){if(e.target===document.getElementById(id))closeModal(id);}
+
+function setModalPlayers(n){
+  modalPlayers=n;
+  document.querySelectorAll('#modalPlayersRow .np-btn').forEach(b=>b.classList.toggle('on',parseInt(b.textContent)===n));
+}
+function previewName(){
+  const v=document.getElementById('newModelName').value.trim();
+  document.getElementById('namePreview').textContent=v?`→ models/${v}/ (${v}_ppo_v4.pth)`:'';
+}
+async function confirmCreate(){
+  const name=document.getElementById('newModelName').value.trim();
+  if(!name){toast('Adj meg egy nevet!','error');return;}
+  const r=await api('create_model',{name,num_players:modalPlayers});
+  if(r.error){toast(r.error,'error');return;}
+  closeModal('createModal');
+  document.getElementById('newModelName').value='';
+  document.getElementById('namePreview').textContent='';
+  toast(`models/${r.name}/ létrehozva ✓`,'success');
+  await loadModels();
+  selectModel(r.name);
+}
+
+function openMigrateModal(){
+  if(!selModel) return;
+  document.getElementById('migrateNameInput').value=selModel.name||'';
+  migrateModel=selModel;
+  document.getElementById('migrateModal').classList.add('open');
+}
+async function confirmMigrate(){
+  if(!migrateModel) return;
+  const name=document.getElementById('migrateNameInput').value.trim();
+  if(!name){toast('Adj meg nevet!','error');return;}
+  const r=await api('migrate',{rel_pth:migrateModel.rel_pth,name,num_players:migrateModel.num_players||6});
+  if(r.error){toast(r.error,'error');return;}
+  closeModal('migrateModal');
+  toast(`Migrálva: models/${r.name}/ ✓`,'success');
+  await loadModels();
+  selectModel(r.name);
+}
+
+// ═══════════════════════════════════════════════
+// TOAST
+// ═══════════════════════════════════════════════
+function toast(msg,type='info') {
+  const c=document.getElementById('toastContainer');
+  const el=document.createElement('div');
+  el.className='toast '+type; el.textContent=msg; c.appendChild(el);
+  setTimeout(()=>el.remove(),3500);
+}
+
+// ─── keyboard ───
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){closeModal('createModal');closeModal('migrateModal');}
+  if(e.key==='Enter'&&document.getElementById('createModal').classList.contains('open')) confirmCreate();
+});
+</script>
+</body>
+</html>
