@@ -77,6 +77,20 @@ _UNKNOWN_PREFIX  = "unknown_seat_"
 _BLEND_THRESHOLD = 10    # rolling esemény alatt lifetime blending aktív
 _FLUSH_INTERVAL  = 50    # ennyi akció után auto-flush SQLite-ba
 
+# Bayesian prior – tipikus microstakes/low-stakes stat értékek
+# Ismeretlen játékosnál ez az alap-feltételezés (jobb mint a 0.5 mindenhol).
+# Forrás: általános NL10-NL25 populációs átlagok.
+# NEUTRAL_PRIOR (0.5) marad fallback ismeretlen stat_id-re.
+STAT_PRIORS = {
+    STAT_VPIP:         0.24,   # átlagos VPIP ~24%
+    STAT_PFR:          0.16,   # átlagos PFR ~16%
+    STAT_AF:           0.35,   # közepes AF (normalizálva 0-1 skálán)
+    STAT_3BET:         0.07,   # 3bet % ~7%
+    STAT_FOLD_TO_3BET: 0.55,   # fold to 3bet ~55%
+    STAT_CBET:         0.58,   # cbet % ~58%
+    STAT_FOLD_TO_CBET: 0.46,   # fold to cbet ~46%
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -126,12 +140,18 @@ class PlayerStats:
 
     # ── Számítások ────────────────────────────────────────────────────────────
 
-    def _ratio(self, acts, opps, lt_acts: int, lt_opps: int) -> float:
+    def _ratio(self, acts, opps, lt_acts: int, lt_opps: int,
+               prior: float = NEUTRAL_PRIOR) -> float:
+        """
+        Rolling + lifetime blending Bayesian prior-ral.
+        Ha nincs semmilyen adat, prior-t ad vissza (tipikus populációs érték)
+        a 0.5 semleges érték helyett.
+        """
         n = len(opps)
         if n == 0 and lt_opps == 0:
-            return NEUTRAL_PRIOR
-        rolling_r  = sum(acts) / n if n > 0 else NEUTRAL_PRIOR
-        lifetime_r = lt_acts / lt_opps if lt_opps > 0 else NEUTRAL_PRIOR
+            return prior
+        rolling_r  = sum(acts) / n if n > 0 else prior
+        lifetime_r = lt_acts / lt_opps if lt_opps > 0 else prior
         if n >= _BLEND_THRESHOLD:
             return rolling_r
         blend = n / _BLEND_THRESHOLD
@@ -148,31 +168,42 @@ class PlayerStats:
                 return NEUTRAL_PRIOR if agg == 0 else min(agg, 5.0) / 5.0
             return min(agg / pas, 5.0) / 5.0
 
+        _AF_PRIOR = STAT_PRIORS.get(STAT_AF, NEUTRAL_PRIOR)
         if r_n == 0 and lt_n == 0:
-            return NEUTRAL_PRIOR
+            return _AF_PRIOR
         r_af  = _val(r_agg, r_pas)
         lt_af = _val(self.lt_aggressive, self.lt_passive)
         if r_n >= _BLEND_THRESHOLD:
             return r_af
         blend = r_n / _BLEND_THRESHOLD
-        return blend * r_af + (1.0 - blend) * lt_af
+        # Kevés adatnál prior felé húz
+        base = blend * r_af + (1.0 - blend) * lt_af
+        prior_blend = min(r_n / _BLEND_THRESHOLD, 1.0)
+        return prior_blend * base + (1.0 - prior_blend) * _AF_PRIOR
 
     def vector(self) -> list:
-        """7 float [0-1] – feature vector a modellnek."""
+        """7 float [0-1] – feature vector a modellnek (Bayesian prior-ral)."""
+        p = STAT_PRIORS  # rövidítés
         return [
             self._ratio(self.vpip_acts, self.vpip_opps,
-                        self.lt_vpip_acts, self.lt_vpip_opps),
+                        self.lt_vpip_acts, self.lt_vpip_opps,
+                        prior=p.get(STAT_VPIP, NEUTRAL_PRIOR)),
             self._ratio(self.pfr_acts,  self.pfr_opps,
-                        self.lt_pfr_acts,  self.lt_pfr_opps),
+                        self.lt_pfr_acts,  self.lt_pfr_opps,
+                        prior=p.get(STAT_PFR, NEUTRAL_PRIOR)),
             self._af(),
             self._ratio(self.bet3_acts, self.bet3_opps,
-                        self.lt_bet3_acts, self.lt_bet3_opps),
+                        self.lt_bet3_acts, self.lt_bet3_opps,
+                        prior=p.get(STAT_3BET, NEUTRAL_PRIOR)),
             self._ratio(self.f3b_acts,  self.f3b_opps,
-                        self.lt_f3b_acts,  self.lt_f3b_opps),
+                        self.lt_f3b_acts,  self.lt_f3b_opps,
+                        prior=p.get(STAT_FOLD_TO_3BET, NEUTRAL_PRIOR)),
             self._ratio(self.cbet_acts, self.cbet_opps,
-                        self.lt_cbet_acts, self.lt_cbet_opps),
+                        self.lt_cbet_acts, self.lt_cbet_opps,
+                        prior=p.get(STAT_CBET, NEUTRAL_PRIOR)),
             self._ratio(self.fcb_acts,  self.fcb_opps,
-                        self.lt_fcb_acts,  self.lt_fcb_opps),
+                        self.lt_fcb_acts,  self.lt_fcb_opps,
+                        prior=p.get(STAT_FOLD_TO_CBET, NEUTRAL_PRIOR)),
         ]
 
     def summary(self) -> dict:
@@ -444,20 +475,24 @@ class GlobalPlayerTracker:
         self._cache:    dict[str, PlayerStats] = {}   # session cache
         self._lt_cache: dict[str, dict]        = {}   # lifetime batch cache
         self._actions_since_flush = 0
+        # Thread-safe cache hozzáférés – RLock, mert flush() rekurzívan hívja
+        # a _get_or_create-t a dirty check előtt (re-entrant szükséges)
+        self._lock = threading.RLock()
 
     # ── Belső ────────────────────────────────────────────────────────────────
 
     def _get_or_create(self, username: str) -> PlayerStats:
-        if username in self._cache:
-            return self._cache[username]
-        ps = PlayerStats(self.memory)
-        if self._db is not None:
-            row = self._lt_cache.get(username) or self._db.load_player(username)
-            if row:
-                ps.load_lt_from_row(row)
-                self._lt_cache[username] = row
-        self._cache[username] = ps
-        return ps
+        with self._lock:
+            if username in self._cache:
+                return self._cache[username]
+            ps = PlayerStats(self.memory)
+            if self._db is not None:
+                row = self._lt_cache.get(username) or self._db.load_player(username)
+                if row:
+                    ps.load_lt_from_row(row)
+                    self._lt_cache[username] = row
+            self._cache[username] = ps
+            return ps
 
     # ── Asztal preload (batch DB query) ───────────────────────────────────────
 
@@ -469,15 +504,18 @@ class GlobalPlayerTracker:
         """
         if self._db is None:
             return
-        to_load = [
-            u for u in seat_map.values()
-            if u and not u.startswith(_UNKNOWN_PREFIX)
-            and u not in self._lt_cache
-        ]
+        with self._lock:
+            to_load = [
+                u for u in seat_map.values()
+                if u and not u.startswith(_UNKNOWN_PREFIX)
+                and u not in self._lt_cache
+            ]
         if not to_load:
             return
+        # DB lekérdezés a lock-on KÍVÜL (I/O nem blokkolja a cache-t)
         rows = self._db.load_players(to_load)
-        self._lt_cache.update(rows)
+        with self._lock:
+            self._lt_cache.update(rows)
         logger.debug(f"Preload: {len(rows)}/{len(to_load)} játékos betöltve")
 
     # ── Akció rögzítés ────────────────────────────────────────────────────────
@@ -552,15 +590,23 @@ class GlobalPlayerTracker:
         """
         Dirty lifetime értékek → SQLite.
         RTAManager session végén automatikusan hívja.
+        DB írás a lock-on KÍVÜL történik (I/O holtpont elkerülése).
         """
         if self._db is None:
             return
-        dirty = {u: ps for u, ps in self._cache.items() if ps._dirty}
+        # Dirty játékosok snapshot lock alatt
+        with self._lock:
+            dirty = {u: ps for u, ps in self._cache.items() if ps._dirty}
+        # DB írás lock-on kívül (SQLite-nak saját lockja van)
         if dirty:
             self._db.flush(dirty)
-            for ps in dirty.values():
-                ps._dirty = False
-        self._actions_since_flush = 0
+            with self._lock:
+                for ps in dirty.values():
+                    ps._dirty = False
+                self._actions_since_flush = 0
+        else:
+            with self._lock:
+                self._actions_since_flush = 0
 
     # ── State vector ──────────────────────────────────────────────────────────
 
@@ -591,19 +637,22 @@ class GlobalPlayerTracker:
 
     def reset(self):
         """Memória cache törlése. DB NEM érintett."""
-        self._cache.clear()
-        self._lt_cache.clear()
-        self._actions_since_flush = 0
+        with self._lock:
+            self._cache.clear()
+            self._lt_cache.clear()
+            self._actions_since_flush = 0
 
     def reset_player(self, username: str):
         """Cache-ből törlés (DB-ből nem)."""
-        self._cache.pop(username, None)
-        self._lt_cache.pop(username, None)
+        with self._lock:
+            self._cache.pop(username, None)
+            self._lt_cache.pop(username, None)
 
     def reset_rolling_only(self, username: str):
         """Csak rolling window törlése, lifetime megmarad."""
-        if username in self._cache:
-            self._cache[username].clear_rolling()
+        with self._lock:
+            if username in self._cache:
+                self._cache[username].clear_rolling()
 
     # ── Lekérdezések ──────────────────────────────────────────────────────────
 

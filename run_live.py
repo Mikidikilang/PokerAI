@@ -236,8 +236,9 @@ def main():
     # Próbáljuk kitalálni a játékosszámot a modell state_size-ából
     import torch
     from core.features import compute_state_size
+    from utils.checkpoint_utils import safe_load_checkpoint
 
-    ck = torch.load(args.model, map_location='cpu', weights_only=False)
+    ck = safe_load_checkpoint(args.model, map_location='cpu')
     state_size = ck.get('state_size', 475)
     guessed_players = 9  # default
     for np_ in range(2, 10):

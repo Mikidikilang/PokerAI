@@ -17,9 +17,13 @@ NUM_ABSTRACT_ACTIONS = 7
 STREET_PREFLOP=0; STREET_FLOP=1; STREET_TURN=2; STREET_RIVER=3
 BOARD_TEXTURE_DIM=6; STACK_FEATURE_DIM=8; POT_ODDS_DIM=4; STREET_DIM=4; EQUITY_DIM=1
 
+# NUM_HUD_STATS importálva az opponent_tracker-ből – szemantikailag helyes
+# (jelenleg NUM_HUD_STATS == NUM_ABSTRACT_ACTIONS == 7, de jövőbiztos)
+from core.opponent_tracker import NUM_HUD_STATS
+
 def compute_state_size(rlcard_obs_size, num_players):
     return (rlcard_obs_size
-            + num_players * NUM_ABSTRACT_ACTIONS
+            + num_players * NUM_HUD_STATS
             + STACK_FEATURE_DIM + STREET_DIM + POT_ODDS_DIM + BOARD_TEXTURE_DIM
             + ACTION_HISTORY_LEN * (num_players * NUM_ABSTRACT_ACTIONS + 1)
             + 2 * num_players + EQUITY_DIM)

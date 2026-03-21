@@ -34,6 +34,20 @@ v4.1 (ÚJ): Szabály-alapú Bot Pool (Fish, Nit, Calling Station, LAG) integrál
            OCR/YOLO alapú élő kliens olvasó (live_reader), 
            Szigorú teszt-infrastruktúra (test_model_sanity.py v3 FINAL).
 
+v4.1 Sprint 3: Célzott tanulási anomáliák kezelése.
+      collector.py: 15%-os explicit short-stack (8-15 BB) jelenet generálás
+        reset-kor a push/fold zóna jobb megtanulása érdekében.
+        DRAW_FOLD_PENALTY (-0.08 BB) reward shaping: postflop erős húzó
+        (equity >= 0.44) eldobásakor büntetés.
+      opponent_pool.py / runner.py: Súlyozott bot kiválasztás (bot_weights).
+        Arányok: Fish 8%, Nit 15%, Calling Station 2%, LAG 15%.
+      trainer.py: Csökkentett entrópia (ENTROPY_COEF: 0.01 → 0.001,
+        ENTROPY_DECAY: 30M lépés). Határozottabb döntések elősegítéséhez.
+      NUM_ENVS: 256 → 512, BUFFER_COLLECT_SIZE: 1024 → 2048.
+      opponent_tracker.py: _BLEND_THRESHOLD 30 → 10 (HUD hamarabb adaptív).
+      test_model_sanity.py: v3.3 SPRINT 3 – Bootstrap CI, ScenarioGenerator,
+        run_value_calibration_test(), szigorított Grade formula.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 2. MODELL ARCHITEKTÚRA (ai_model.py → core/model.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -174,6 +188,10 @@ KÉT OSZTÁLY:
     - COLD START BLENDING:
         Ha rolling < 30 esemény: lifetime stat lineárisan bekeveredik
         Így egy régen látott ellenfél adatai azonnal hasznosak
+        SPRINT 3: _BLEND_THRESHOLD 30 → 10. A modell így már 10 hand
+        után is a rolling memóriára támaszkodik, a lifetime adatok
+        befolyása hamarabb csökken → gyorsabb adaptáció az aktuális
+        asztal dinamikájához.
     - SKÁLÁZHATÓSÁG:
         50k játékos → ~8 MB SQLite, <1ms/játékos lookup
         500k játékos → ~80 MB SQLite, azonos sebesség
@@ -244,6 +262,11 @@ PPO_EPOCHS    = 8
 MINIBATCH     = 256
 VALUE_COEF    = 0.5
 ENTROPY_COEF  = 0.02  (→ 0.002 lineáris decay 50M update alatt)
+              [SPRINT 3 OVERRIDE: 0.01 → 0.001, decay 30M lépés alatt.
+               A korábbi 0.02 indokolatlanul magas volt, az AF>6 agressziós
+               spirált részben ez okozta. A gyorsabb decay határozottabb
+               döntésekre szorítja a modellt, miközben megőrzi az exploration
+               elegendő szintjét a korai fázisban.]
 MAX_GRAD_NORM = 0.5
 GAMMA         = 0.99
 GAE_LAM       = 0.95
@@ -293,11 +316,21 @@ get_opponent(current_model):
 
 Indok: Ha csak önmaga ellen tanul, agressziós spirálba kerül (AF > 6.0). A fix botok rákényszerítik a modellünket, hogy megvizsgálja a HUD értékeket és exploitálja az adott ellenfelet.
 
+SPRINT 3 – SÚLYOZOTT BOT KIVÁLASZTÁS:
+  A korábbi egyenletes eloszlás helyett runner.py-ban konfigurálható
+  bot_weights dict vezérli a kiválasztást:
+    Fish: 8%, Nit: 15%, Calling Station: 2%, LAG: 15%
+  Indok: a CallingStation triviálisan exploitálható (passival konvergált a
+  modell ellene), a Nit és LAG viszont a HUD-reaktivitást és a raise-sizing
+  érzékenységet kényszerítik ki. A Fish megtartja a baseline varianciát.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 13. BATCHED SYNC COLLECTOR (training/collector.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 NUM_ENVS = 256 (benchmark alapján optimális)
+         [SPRINT 3: 512-re emelve a hatékonyabb GPU kihasználás és
+          a jobb gradiens becslés érdekében.]
 MAX_STEPS_PER_HAND = 500
 
 Per-env state:
@@ -339,6 +372,20 @@ _reset_env(i):
     bb = random.choice([1,2,5,10,25])
     sb = bb // 2
     stack = bb * random.choice([20,30,40,60,80,100,150,200])
+  SPRINT 3 ÚJ: 15% eséllyel explicit short-stack jelenet generálás:
+    stack = bb * random.randint(8, 15)
+    Indok: a modell a v4.1 alapján push/fold szituációkban gyengén
+    teljesített (a draw-fold hiba részben a deep-stack bias miatt is
+    fennáll). A 15%-os forced short-stack reset egyenletesebben fedi
+    le a stack depth teret, és a push/fold döntések megtanulását
+    kifejezetten ösztönzi.
+  SPRINT 3 ÚJ: DRAW_FOLD_PENALTY = -0.08 BB
+    Ha postflop a modell fold-ot választ és az aktuális equity >= 0.44:
+    reward -= 0.08 BB
+    Indok: a test_model_sanity.py v3 60%-os draw-fold hibát mért. Ez a
+    shaping signal célzottan arra kényszeríti a modellt, hogy tartsa meg
+    az erős húzókat. Az equity küszöb (0.44) konzervatív: csak a valóban
+    nyereséges callokat jutalmazza, a marginálisat nem.
   Fallback obs: [0.0] * 54  (54 dim, NEM 72!)
   action_history.clear()
 
@@ -528,6 +575,24 @@ Mivel a botokat bekötöttük, kellett egy objektív mérőrendszer. A `test_mod
 - PFR: Csak 23%, nagyon alacsony. (Cél: 65%+)
 - HUD-vakság: Teszteli a bluffing ratiót egy Nit vs Maniac ellenfél profil esetén.
 
+SPRINT 3 – v3.3 FRISSÍTÉSEK:
+  - Bootstrap konfidencia-intervallum (95% CI) a BB/100 winrate teszthez.
+    Indok: 1000 kézből számolt winrate +/-40 BB/100 konfidencia-intervallummal
+    bír; a CI nélküli szám félrevezető. A bootstrap (n=1000 resample) adja a
+    helyes statisztikai képet.
+  - ScenarioGenerator: Programmatikus szituáció-sweepek.
+      Stack depth sweep (10, 20, 40, 60, 80, 100, 150, 200 BB)
+      Board texture sweep (paired, monotone, two-tone, dry rainbow)
+      River spots (value betting, bluff catching, check-raise)
+    Indok: A korábbi véletlenszerű tesztek nem fedték le egyenletesen a
+    kritikus spot-okat. A sweep garantálja, hogy minden edge case látható.
+  - run_value_calibration_test(): Ellenőrzi, hogy a value head EV iránya
+    helyes-e. Erős kézzel pozitív, gyenge kézzel negatív EV-t kell becsülni.
+    Ha ez fordított → a critic divergált, újratanítás szükséges.
+  - Szigorított Penalty-alapú Grade formula: Az eddigi Grade lineáris
+    összeadás helyett szorzópenaltykat alkalmaz (pl. ha draw-fold hiba > 40%,
+    az összes grade egy szinttel csökken függetlenül a többi metriktól).
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 18. TRAINING RUNNER (training/runner.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -545,6 +610,7 @@ run_training_session(num_players, filename, episodes_to_run):
        log + checkpoint 1000 epizódonként
 
 BUFFER_COLLECT_SIZE = 1024 (4 × NUM_ENVS)
+                    [SPRINT 3: 2048-ra emelve (4 × 512).]
 HIDDEN_SIZE = 512
 LEARNING_RATE = 3e-4
 CHECKPOINT: state_dict + episodes_trained + time_spent + algorithm +
@@ -642,8 +708,8 @@ Ha valaki v3.x checkpoint-ot tölt be → warning + részleges betöltés.
 22. HIPERPARAMÉTEREK ÖSSZEFOGLALÓJA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-NUM_ENVS             = 256
-BUFFER_COLLECT_SIZE  = 1024
+NUM_ENVS             = 256  → 512  (Sprint 3)
+BUFFER_COLLECT_SIZE  = 1024 → 2048 (Sprint 3)
 HIDDEN_SIZE          = 512
 LEARNING_RATE        = 3e-4
 ACTION_HISTORY_LEN   = 8
@@ -654,8 +720,9 @@ PPO_EPOCHS           = 8
 MINIBATCH            = 256
 CLIP_EPS             = 0.2
 VALUE_COEF           = 0.5
-ENTROPY_COEF         = 0.02  → 0.002 (50M update alatt)
-ENTROPY_DECAY_STEPS  = 50_000_000
+ENTROPY_COEF         = 0.02  → 0.002 (50M, eredeti)
+                     → 0.01  → 0.001 (30M, Sprint 3 override)
+ENTROPY_DECAY_STEPS  = 50_000_000 → 30_000_000 (Sprint 3)
 MAX_GRAD_NORM        = 0.5
 GAMMA                = 0.99
 GAE_LAM              = 0.95
@@ -665,6 +732,11 @@ EQUITY_SIM_N         = 200
 EQUITY_CACHE_SIZE    = 10000
 BB_OPTIONS           = [1, 2, 5, 10, 25]
 STACK_MULTIPLIERS    = [20, 30, 40, 60, 80, 100, 150, 200]
+SHORT_STACK_RANGE    = [8, 15]  BB (Sprint 3, 15% reset eséllyel)
+DRAW_FOLD_PENALTY    = -0.08 BB (Sprint 3, equity >= 0.44 küszöb)
+BLEND_THRESHOLD      = 10      (Sprint 3, volt: 30)
+BOT_WEIGHTS          = {Fish: 0.08, Nit: 0.15, CallingStation: 0.02, LAG: 0.15}
+                       (Sprint 3, volt: egyenletes eloszlás)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 23. RLCARD SPECIFIKUS ISMERETEK (forráskód alapján)

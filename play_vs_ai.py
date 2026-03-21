@@ -39,6 +39,7 @@ from core.features import (
 )
 from core.opponent_tracker import OpponentHUDTracker
 from core.equity import HandEquityEstimator
+from utils.checkpoint_utils import safe_load_checkpoint
 
 import rlcard
 
@@ -137,7 +138,7 @@ def scan_models(base_dir='.'):
     models = []
     for f in sorted(files):
         try:
-            ck = torch.load(f, map_location='cpu', weights_only=False)
+            ck = safe_load_checkpoint(f, map_location='cpu')
             if isinstance(ck, dict) and 'state_dict' in ck:
                 state_size = ck.get('state_size', '?')
                 action_size = ck.get('action_size', 7)
@@ -203,7 +204,7 @@ class GameSession:
     def load_model(self, model_path):
         """Modell betöltése."""
         logger.info(f"Modell betöltése: {model_path}")
-        ck = torch.load(model_path, map_location=self.device, weights_only=False)
+        ck = safe_load_checkpoint(model_path, map_location=self.device)
         if not (isinstance(ck, dict) and 'state_dict' in ck):
             raise ValueError(f"Érvénytelen checkpoint: {model_path}")
 
@@ -468,17 +469,25 @@ class GameSession:
         if is_over:
             try:
                 p = self.env.get_payoffs()
-                payoffs = {i: float(p[i]) for i in range(len(p))}
-                human_result = float(p[self.human_seat])
-                self.total_results['hands'] += 1
-                if human_result > 0:
-                    self.total_results['player'] += 1
-                elif human_result < 0:
-                    self.total_results['ai'] += 1
+                if p is None or len(p) == 0:
+                    logger.warning("get_payoffs() üres vagy None értéket adott vissza")
+                elif len(p) <= self.human_seat:
+                    logger.warning(
+                        f"get_payoffs() csak {len(p)} értéket adott, "
+                        f"de human_seat={self.human_seat}"
+                    )
+                else:
+                    payoffs = {i: float(p[i]) for i in range(len(p))}
+                    human_result = float(p[self.human_seat])
+                    self.total_results['hands'] += 1
+                    if human_result > 0:
+                        self.total_results['player'] += 1
+                    elif human_result < 0:
+                        self.total_results['ai'] += 1
 
-                # Update stacks
-                for i in range(min(len(p), self.num_players)):
-                    self.stacks[i] += float(p[i])
+                    # Update stacks
+                    for i in range(min(len(p), self.num_players)):
+                        self.stacks[i] += float(p[i])
 
             except Exception as e:
                 logger.error(f"Payoffs hiba: {e}")
@@ -569,6 +578,59 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length))
         return {}
 
+    def _validate_start_params(self, body: dict) -> list:
+        """
+        /api/start paraméterek validálása.
+        Visszatér: hibalista (üres = minden OK).
+        """
+        errors = []
+        # num_players
+        try:
+            num_players = int(body.get('num_players', 6))
+        except (TypeError, ValueError):
+            errors.append("num_players nem egész szám")
+            return errors  # többi check ettől függ
+        if not 2 <= num_players <= 9:
+            errors.append(
+                f"num_players={num_players} érvénytelen (2–9 között kell)"
+            )
+
+        # human_seat
+        try:
+            human_seat = int(body.get('human_seat', 0))
+        except (TypeError, ValueError):
+            errors.append("human_seat nem egész szám")
+            human_seat = -1
+        if human_seat < 0 or human_seat >= num_players:
+            errors.append(
+                f"human_seat={human_seat} érvénytelen "
+                f"(0 és {num_players - 1} között kell)"
+            )
+
+        # bb
+        try:
+            bb = float(body.get('bb', 2))
+        except (TypeError, ValueError):
+            errors.append("bb nem szám")
+            bb = 0.0
+        if bb <= 0:
+            errors.append(f"bb={bb} érvénytelen (pozitív kell)")
+
+        # stack
+        try:
+            stack = float(body.get('stack', 100))
+        except (TypeError, ValueError):
+            errors.append("stack nem szám")
+            stack = 0.0
+        if stack <= 0:
+            errors.append(f"stack={stack} érvénytelen (pozitív kell)")
+        elif bb > 0 and stack < bb * 2:
+            errors.append(
+                f"stack={stack} túl kicsi (legalább 2×bb={bb * 2:.1f} kell)"
+            )
+
+        return errors
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -606,6 +668,15 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
 
             if path == '/api/start':
                 logger.info(f"POST /api/start: {body}")
+
+                # Input validáció
+                validation_errors = self._validate_start_params(body)
+                if validation_errors:
+                    msg = "; ".join(validation_errors)
+                    logger.warning(f"Érvénytelen /api/start paraméterek: {msg}")
+                    self._send_json({'error': f'Érvénytelen paraméterek: {msg}'}, 400)
+                    return
+
                 model_path = body.get('model_path', '')
                 num_players = int(body.get('num_players', 6))
                 human_seat = int(body.get('human_seat', 0))

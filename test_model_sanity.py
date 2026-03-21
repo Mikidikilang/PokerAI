@@ -107,6 +107,7 @@ from core.features import (ActionHistoryEncoder, build_state_tensor,
 from core.opponent_tracker import OpponentHUDTracker
 from core.equity import HandEquityEstimator
 from inference.obs_builder import ObsBuilder
+from utils.checkpoint_utils import safe_load_checkpoint
 
 RANKS = 'AKQJT98765432'
 SUITS = 'shdc'
@@ -1503,7 +1504,7 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
     """Egyetlen modell teljes tesztelése, visszaadja az összesített dict-et."""
     device = torch.device(device_str)
     try:
-        ck = torch.load(model_path, map_location=device, weights_only=False)
+        ck = safe_load_checkpoint(model_path, map_location=device)
     except Exception as e:
         print(f"  ❌ Nem tölthető: {model_path}: {e}")
         return None

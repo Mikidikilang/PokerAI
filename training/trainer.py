@@ -5,7 +5,7 @@ import collections, numpy as np, torch, torch.nn.functional as F, torch.optim as
 from .buffer import PPOBuffer
 
 class PPOTrainer:
-    CLIP_EPS=0.2; PPO_EPOCHS=4; MINIBATCH=256; VALUE_COEF=0.5
+    CLIP_EPS=0.2; PPO_EPOCHS=8; MINIBATCH=256; VALUE_COEF=0.5
     ENTROPY_COEF=0.01; ENTROPY_FINAL=0.001; ENTROPY_DECAY=30_000_000
     MAX_GRAD_NORM=0.5; GAMMA=0.99; GAE_LAM=0.95
 

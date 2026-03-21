@@ -21,6 +21,7 @@ from core.features import (
 )
 from core.opponent_tracker import OpponentHUDTracker
 from core.equity import HandEquityEstimator
+from utils.checkpoint_utils import safe_load_checkpoint
 
 logger = logging.getLogger("PokerAI")
 
@@ -34,7 +35,7 @@ class RealtimePokerAssistant:
         self.equity_est    = HandEquityEstimator(n_sim=equity_sims)
 
         logger.info(f"Modell betöltése: {model_path}")
-        ck = torch.load(model_path, map_location=self.device, weights_only=False)
+        ck = safe_load_checkpoint(model_path, map_location=self.device)
 
         if isinstance(ck, dict) and 'state_dict' in ck:
             state_size  = ck.get('state_size',  492)

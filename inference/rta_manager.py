@@ -87,6 +87,7 @@ from core.features import (
 from core.opponent_tracker import GlobalPlayerTracker
 from core.equity import HandEquityEstimator
 from inference.obs_builder import ObsBuilder
+from utils.checkpoint_utils import safe_load_checkpoint
 
 logger = logging.getLogger("PokerAI")
 
@@ -140,7 +141,7 @@ class ModelPool:
             raise FileNotFoundError(f"Modell fájl nem található: {path}")
 
         logger.info(f"ModelPool: betöltés {num_players}p → {path}")
-        ck = torch.load(path, map_location=self._device, weights_only=False)
+        ck = safe_load_checkpoint(path, map_location=self._device)
         if not (isinstance(ck, dict) and 'state_dict' in ck):
             raise ValueError(f"Érvénytelen checkpoint formátum: {path}")
 

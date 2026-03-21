@@ -251,6 +251,11 @@ class BatchedSyncCollector:
                         self._active[i] = False
 
                     if self._step_cnt[i] >= _MAX_STEPS_PER_HAND:
+                        logger.warning(
+                            f"Env {i}: max lépésszám elérve "
+                            f"({_MAX_STEPS_PER_HAND} lépés/kéz), "
+                            f"opp loop deaktiválva – valószínű végtelen kéz"
+                        )
                         self._active[i] = False
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -345,6 +350,11 @@ class BatchedSyncCollector:
                 self._active[i] = False
 
             if self._step_cnt[i] >= _MAX_STEPS_PER_HAND:
+                logger.warning(
+                    f"Env {i}: max lépésszám elérve "
+                    f"({_MAX_STEPS_PER_HAND} lépés/kéz), "
+                    f"learner loop deaktiválva – valószínű végtelen kéz"
+                )
                 self._active[i] = False
 
     # ═══════════════════════════════════════════════════════════════════════

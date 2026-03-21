@@ -48,31 +48,76 @@ def _best_5_from_7(cards):
 
 class HandEquityEstimator:
     def __init__(self, n_sim=200, cache_size=10_000):
-        self.n_sim=n_sim; self.cache_size=cache_size; self._cache={}
+        self.n_sim = n_sim          # maximális szimulációk száma
+        self.cache_size = cache_size
+        self._cache = {}
 
     def _cache_key(self, hole, board, num_opp):
         return f"{','.join(sorted(hole))}|{','.join(board)}|{num_opp}"
 
-    def equity(self, hole_cards, board=None, num_opponents=1):
+    def equity(self, hole_cards, board=None, num_opponents=1,
+               confidence_threshold=0.02, min_sims=50):
+        """
+        Monte Carlo equity becslés adaptív early stopping-gal.
+
+        Paraméterek:
+            hole_cards:           saját lapok (pl. ['As', 'Kh'])
+            board:                board lapok ([] ha preflop)
+            num_opponents:        ellenfelek száma
+            confidence_threshold: ha a rolling std < küszöb ÉS min_sims lefutott,
+                                  early stop – felesleges szimulációk elkerülése
+            min_sims:             legalább ennyi szimuláció fut (default: 50)
+
+        Megjegyzés: self.n_sim MAXIMUM, nem fix szám.
+                    A cache kulcs változatlan → visszafelé kompatibilis.
+        """
         board = board or []
         key = self._cache_key(hole_cards, board, num_opponents)
-        if key in self._cache: return self._cache[key]
-        known = set(hole_cards) | set(board)
-        deck  = [c for c in FULL_DECK if c not in known]
-        need  = 5 - len(board)
+        if key in self._cache:
+            return self._cache[key]
+
+        known    = set(hole_cards) | set(board)
+        deck     = [c for c in FULL_DECK if c not in known]
+        need     = 5 - len(board)
+        sample_n = need + num_opponents * 2
+
         wins  = 0
-        for _ in range(self.n_sim):
-            sample_n = need + num_opponents * 2
-            if sample_n > len(deck): continue
-            drawn = random.sample(deck, sample_n)
+        valid = 0   # érvényes szimulációk száma (sample_n <= deck)
+
+        # Early stopping változók
+        # Wilson-score helyett egyszerű rolling variance: utolsó 20 sim win/loss
+        _window = []
+        _WIN_WINDOW = 20  # ennyi utolsó eredményből számítjuk a stabilitást
+
+        for sim_i in range(self.n_sim):
+            if sample_n > len(deck):
+                continue
+            drawn   = random.sample(deck, sample_n)
             run_out = board + drawn[:need]
             my_rank = _best_5_from_7(hole_cards + run_out)
             win = True
             for o in range(num_opponents):
                 opp_hole = drawn[need + o*2 : need + o*2 + 2]
-                if _best_5_from_7(opp_hole + run_out) >= my_rank: win = False; break
-            if win: wins += 1
-        result = wins / max(self.n_sim, 1)
+                if _best_5_from_7(opp_hole + run_out) >= my_rank:
+                    win = False
+                    break
+            wins  += int(win)
+            valid += 1
+
+            # Rolling window frissítése
+            _window.append(int(win))
+            if len(_window) > _WIN_WINDOW:
+                _window.pop(0)
+
+            # Early stopping: legalább min_sims lefutott ÉS a window stabil
+            if valid >= min_sims and len(_window) == _WIN_WINDOW:
+                w_mean = sum(_window) / _WIN_WINDOW
+                # Variancia = p*(1-p)/N – ha p közel 0 vagy 1, hamar megáll
+                std = (w_mean * (1.0 - w_mean) / _WIN_WINDOW) ** 0.5
+                if std < confidence_threshold:
+                    break
+
+        result = wins / max(valid, 1)
         if len(self._cache) >= self.cache_size:
             del self._cache[next(iter(self._cache))]
         self._cache[key] = result

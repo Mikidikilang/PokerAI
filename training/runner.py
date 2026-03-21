@@ -31,6 +31,7 @@ from .trainer import PPOTrainer
 from .normalizer import RunningMeanStd
 from .opponent_pool import OpponentPool
 from .collector import BatchedSyncCollector, BB_OPTIONS, STACK_MULTIPLIERS
+from utils.checkpoint_utils import safe_load_checkpoint
 
 logger = logging.getLogger("PokerAI")
 
@@ -58,7 +59,7 @@ def _get_model_info(filename):
     if not os.path.exists(filename):
         return "[ Üres / Új modell ]"
     try:
-        ck = torch.load(filename, map_location='cpu', weights_only=False)
+        ck = safe_load_checkpoint(filename, map_location='cpu')
         if isinstance(ck, dict) and 'episodes_trained' in ck:
             eps = ck['episodes_trained']
             t = ck.get('time_spent', 0.0)
@@ -78,7 +79,7 @@ def menu_system():
     print("=" * 70)
     print("\n  Játékosszám:")
     print("    2 = Heads-Up  |  6 = 6-max  |  9 = Full ring  |  A = összes")
-    print(f"\n  Env-ek: {NUM_ENVS} | Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 4")
+    print(f"\n  Env-ek: {NUM_ENVS} | Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 8")
     print(f"  Mérföldkő: minden {MILESTONE_INTERVAL:,} ep → mentés + auto-teszt")
     print("=" * 70)
     choice = input("\n  Választás [2/6/9/A]: ").strip().upper()
@@ -218,17 +219,26 @@ def _run_milestone(filename, model, trainer, reward_norm,
         f"Teszt indítása (tréning szünetel, max 10 perc):\n"
         f"  {' '.join(cmd)}"
     )
+    _TAIL = 800  # ennyi karaktert logolunk stdout/stderr végéből hiba esetén
     try:
-        subprocess.run(cmd, check=True, timeout=600)
-        logger.info(f"✅ {milestone_str} teszt kész → eredmények: {milestone_dir}")
+        result = subprocess.run(
+            cmd, check=False, timeout=600,
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logger.info(f"✅ {milestone_str} teszt kész → eredmények: {milestone_dir}")
+        else:
+            stdout_tail = result.stdout[-_TAIL:] if result.stdout else "(üres)"
+            stderr_tail = result.stderr[-_TAIL:] if result.stderr else "(üres)"
+            logger.error(
+                f"❌ {milestone_str} teszt hibával zárult "
+                f"(returncode={result.returncode}) – tréning folytatódik\n"
+                f"  stdout (vége): {stdout_tail}\n"
+                f"  stderr (vége): {stderr_tail}"
+            )
     except subprocess.TimeoutExpired:
         logger.error(
             f"❌ {milestone_str} teszt timeout (>10 perc) – tréning folytatódik"
-        )
-    except subprocess.CalledProcessError as e:
-        logger.error(
-            f"❌ {milestone_str} teszt hibával zárult (returncode={e.returncode}) "
-            f"– tréning folytatódik"
         )
     except Exception as e:
         logger.error(
@@ -285,7 +295,7 @@ def run_training_session(num_players, filename, episodes_to_run):
     if os.path.exists(filename):
         logger.info(f"Checkpoint betöltése: {filename}")
         try:
-            ck = torch.load(filename, map_location=device, weights_only=False)
+            ck = safe_load_checkpoint(filename, map_location=device)
             if isinstance(ck, dict) and 'state_dict' in ck:
                 model_dict = learner.state_dict()
                 pretrained = {
@@ -349,7 +359,7 @@ def run_training_session(num_players, filename, episodes_to_run):
     logger.info(f"Tréning indul | {num_players}p | PPO + Self-Play v4 OPTIMIZED")
     logger.info(f"Cél: {target_episodes:,} | State: {STATE_SIZE} | "
                 f"Device: {device} | Envs: {NUM_ENVS} | "
-                f"Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 4")
+                f"Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 8")
     logger.info("=" * 70)
 
     while total_collected < target_episodes:

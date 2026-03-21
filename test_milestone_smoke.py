@@ -44,8 +44,9 @@ def main():
     from training.normalizer import RunningMeanStd
     from training.trainer import PPOTrainer
     from training.runner import _run_milestone, _save_checkpoint, MILESTONE_DIR_ROOT
+    from utils.checkpoint_utils import safe_load_checkpoint
 
-    ck = torch.load(model_path, map_location='cpu', weights_only=False)
+    ck = safe_load_checkpoint(model_path, map_location='cpu')
     state_size  = ck.get('state_size', 475)
     action_size = ck.get('action_size', 7)
     episodes    = ck.get('episodes_trained', 0)
