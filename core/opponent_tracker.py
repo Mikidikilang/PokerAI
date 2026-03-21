@@ -74,7 +74,7 @@ STAT_FOLD_TO_CBET = 6
 NUM_HUD_STATS    = 7
 NEUTRAL_PRIOR    = 0.5
 _UNKNOWN_PREFIX  = "unknown_seat_"
-_BLEND_THRESHOLD = 30    # rolling esemény alatt lifetime blending aktív
+_BLEND_THRESHOLD = 10    # rolling esemény alatt lifetime blending aktív
 _FLUSH_INTERVAL  = 50    # ennyi akció után auto-flush SQLite-ba
 
 

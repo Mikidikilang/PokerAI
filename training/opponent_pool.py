@@ -45,6 +45,7 @@ class OpponentPool:
                  phase: int = PHASE_SELF_PLAY,
                  bot_ratio: float = 0.0,
                  bot_types: list = None,
+                 bot_weights: list = None,
                  num_players: int = None,
                  state_size: int = None):
         """
@@ -81,6 +82,14 @@ class OpponentPool:
                 except ValueError as e:
                     logger.warning(f"Bot létrehozási hiba ({bt}): {e}")
 
+        # A bot_weights alapértelmezése: egyenlő eloszlás
+        if bot_weights is not None and len(bot_weights) == len(self._bots):
+            total = sum(bot_weights)
+            self._bot_weights = [w / total for w in bot_weights]
+        else:
+            n = max(len(self._bots), 1)
+            self._bot_weights = [1.0 / n] * len(self._bots)
+
         if self._phase == self.PHASE_EXPLOITATIVE:
             logger.info(
                 f"OpponentPool Phase 2 – EXPLOITATIVE | "
@@ -90,9 +99,8 @@ class OpponentPool:
                 f"{self._P2_BOTS:.0%} botok"
             )
             if self._bots:
-                per_bot = self._P2_BOTS / len(self._bots)
-                for b in self._bots:
-                    logger.info(f"  {b.__class__.__name__}: {per_bot:.0%}")
+                for j, b in enumerate(self._bots):
+                    logger.info(f"  {b.__class__.__name__}: {self._bot_weights[j] * self._P2_BOTS:.0%}")
         elif self._bot_ratio > 0 and self._bots:
             logger.info(
                 f"OpponentPool Phase 1 | bot_ratio={self._bot_ratio:.0%} | "
@@ -174,11 +182,15 @@ class OpponentPool:
             return current_model  # fallback ha még nincs snapshot
 
         else:
-            # 40%: botok – egyenletesen elosztva
-            bot_fraction = self._P2_BOTS / len(self._bots)
-            bot_idx = int((r - self._P2_SELF_PLAY - self._P2_SNAPSHOT) / bot_fraction)
-            bot_idx = min(bot_idx, len(self._bots) - 1)
-            return self._bots[bot_idx]
+            # 40%: botok – súlyozott véletlenszerű kiválasztás
+            # Súlyozott véletlenszerű bot kiválasztás
+            rnd = random.random()
+            cumulative = 0.0
+            for bot_idx, weight in enumerate(self._bot_weights):
+                cumulative += weight
+                if rnd <= cumulative:
+                    return self._bots[bot_idx]
+            return self._bots[-1]  # fallback
 
     def _get_opponent_phase1(self, current_model):
         """
@@ -215,11 +227,13 @@ class OpponentPool:
     def stats(self) -> dict:
         n_bots = len(self._bots)
         if self._phase == self.PHASE_EXPLOITATIVE and n_bots > 0:
-            per_bot = self._P2_BOTS / n_bots
             dist = {
                 'self_play': f"{self._P2_SELF_PLAY:.0%}",
                 'snapshot':  f"{self._P2_SNAPSHOT:.0%}",
-                **{b.__class__.__name__: f"{per_bot:.0%}" for b in self._bots},
+                **{
+                    b.__class__.__name__: f"{self._bot_weights[j] * self._P2_BOTS:.0%}"
+                    for j, b in enumerate(self._bots)
+                },
             }
         else:
             half = (1 - self._bot_ratio) / 2

@@ -74,6 +74,7 @@ class BatchedSyncCollector:
         self._sb = [1.0] * num_envs
         self._initial_stack = [100.0] * num_envs
         self._street = [0] * num_envs
+        self._last_equity = [0.5] * num_envs
 
         # ── OPT-2: BatchStateBuilder pre-allokált tömbökkel ───────────────
         state_size = compute_state_size(54, num_players)
@@ -109,9 +110,16 @@ class BatchedSyncCollector:
             self._reset_env(i)
 
     def _reset_env(self, i):
-        bb = random.choice(BB_OPTIONS)
-        sb = bb // 2
-        stack = bb * random.choice(STACK_MULTIPLIERS)
+        # 15% valószínűséggel explicit short-stack szituáció
+        if random.random() < 0.15:
+            bb = random.choice([1, 2, 5])          # csak kisebb vakokat
+            sb = max(1, bb // 2)
+            short_multiplier = random.choice([8, 10, 12, 15])  # 8-15 BB mélység
+            stack = bb * short_multiplier
+        else:
+            bb = random.choice(BB_OPTIONS)
+            sb = bb // 2
+            stack = bb * random.choice(STACK_MULTIPLIERS)
         self._bb[i] = float(bb)
         self._sb[i] = float(sb)
         self._initial_stack[i] = float(stack)
@@ -131,6 +139,7 @@ class BatchedSyncCollector:
         if self._trackers[i] is None:
             self._trackers[i] = OpponentHUDTracker(self.num_players)
         self._action_histories[i].clear()
+        self._last_equity[i] = 0.5
 
     # ═══════════════════════════════════════════════════════════════════════
     # OPT-1: BATCHED OPPONENT STEPPING
@@ -322,6 +331,9 @@ class BatchedSyncCollector:
                 (state_before, legal, action.cpu(), lp.cpu(), value.cpu())
             )
 
+            # Equity kinyerése a state tensor utolsó eleméből (equity dim = state[-1])
+            self._last_equity[i] = float(state_before[-1].item())
+
             try:
                 ns, np_ = self.envs[i].step(ea)
                 self._states[i] = ns
@@ -353,6 +365,26 @@ class BatchedSyncCollector:
                     except Exception as exc:
                         logger.debug(f"Env {i} payoffs hiba: {exc}")
                         raw_reward = 0.0
+
+                    # ── Draw fold reward shaping ─────────────────────────────────────────────
+                    # Ha a modell utolsó akciója fold volt, postflop, és az equity erős volt
+                    # (8+ outos draw szintje: equity >= 0.44), büntetjük.
+                    # A büntetés mértéke -0.08 BB, ami a pot méretéhez képest kis összeg,
+                    # de elegendő gradienst ad a draw-ok megtanulásához.
+                    if self._steps[i]:
+                        last_state, last_legal, last_action, last_lp, last_val = self._steps[i][-1]
+                        last_action_int = int(last_action.item())
+                        last_street = self._street[i]
+                        last_eq = self._last_equity[i]
+
+                        DRAW_FOLD_PENALTY = 0.08   # BB-ben mért büntetés
+                        DRAW_EQUITY_THRESHOLD = 0.44  # ~8-9 outos draw szintje
+
+                        if (last_action_int == 0           # 0 = Fold
+                                and last_street >= 1       # Postflop (flop/turn/river)
+                                and last_eq >= DRAW_EQUITY_THRESHOLD):
+                            raw_reward -= DRAW_FOLD_PENALTY
+                    
                     bb_reward = raw_reward / max(self._bb[i], 1e-6)
                     completed.append((self._steps[i], bb_reward))
                 self._reset_env(i)

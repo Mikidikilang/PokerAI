@@ -267,6 +267,7 @@ def run_training_session(num_players, filename, episodes_to_run):
         device=device,
         phase=OpponentPool.PHASE_EXPLOITATIVE,    # 30/30/10/10/10/10 eloszlás
         bot_types=['fish', 'nit', 'calling_station', 'lag'],
+        bot_weights=[0.8, 1.5, 0.2, 1.5],  # fish:8%, nit:15%, cs:2%, lag:15%
         num_players=num_players,
         state_size=STATE_SIZE,
     )

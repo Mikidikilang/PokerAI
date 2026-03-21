@@ -3,6 +3,7 @@ __pycache__/
 logs/
 runs/
 screenshots/
+ModellNaplo/
 
 # SQLite ellenfél adatbázis
 players.db
