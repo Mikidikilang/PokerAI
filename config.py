@@ -19,6 +19,9 @@ Előnyök:
     - Type safety: mypy strict mode kompatibilis
     - Dokumentált: minden paraméternek van docstring-je
     - Checkpoint-ba menthető: cfg.__dict__ → JSON
+
+[COLAB MOD v1] Új mezők:
+    milestone_hands  -- mérföldkő-teszthez használt kézszám (default: 2000)
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -101,10 +104,18 @@ class TrainingConfig:
 
     # ── Mérföldkő rendszer ────────────────────────────────────────────────────
     milestone_interval: int = 2_000_000
-    """Ennyi epizódonként ment snapshot + futtat sanity tesztet."""
+    """Ennyi epizódonként ment snapshot + futtat sanity tesztet.
+    Colab futtatáshoz ajánlott érték: 500_000."""
 
     milestone_dir_root: str = "ModellNaplo"
-    """Mérföldkő mentések gyökérmappája."""
+    """Mérföldkő mentések gyökérmappája.
+    Colab esetén ez automatikusan a Drive modellmappa tests/ almappájára
+    van beállítva a _train_session_cli.py által."""
+
+    milestone_hands: int = 2000
+    """[COLAB MOD v1] Sanity teszt kézszám mérföldkőnél.
+    Lokálisan: 2000 (default). Colab-on csökkenthető pl. 500-ra ha
+    a GPU időt kezzel akarod optimalizálni."""
 
     # ── Opponent pool ─────────────────────────────────────────────────────────
     opponent_bot_types: list = field(default_factory=lambda: [

@@ -14,11 +14,15 @@ MÉRFÖLDKŐ RENDSZER:
 
   MILESTONE_INTERVAL epizódonként (default: 2_000_000) a runner:
     1. Elmenti a modellt: ModellNaplo/{modellnev}_{N}M/{modellnev}_{N}M.pth
+       vagy ha < 1M: ModellNaplo/{modellnev}_{N}k/{modellnev}_{N}k.pth
     2. Elindítja a test_model_sanity.py-t subprocessként – a tréning
        erre az időre szünetel (így a teszt megkapja a GPU erőforrásokat)
     3. A teszt eredménye (.log + .json) ugyanabba a mappába kerül
 
   CHECKPOINT FORMÁTUM: VÁLTOZATLAN – régi .pth fájlok betölthetők.
+
+[COLAB MOD v1] milestone_str fix: sub-million intervallumoknál (pl. 500k)
+  a mappa neve most helyesen {N}k formátumú, nem 0M.
 """
 import os, sys, time, logging, subprocess
 import rlcard, torch
@@ -52,7 +56,7 @@ BUFFER_COLLECT_SIZE = _DEFAULT_CFG.buffer_collect_size
 HIDDEN_SIZE         = _DEFAULT_CFG.hidden_size
 LEARNING_RATE       = _DEFAULT_CFG.learning_rate
 MILESTONE_INTERVAL  = _DEFAULT_CFG.milestone_interval
-MILESTONE_HANDS     = 2000
+MILESTONE_HANDS     = _DEFAULT_CFG.milestone_hands
 MILESTONE_DIR_ROOT  = _DEFAULT_CFG.milestone_dir_root
 
 
@@ -156,6 +160,21 @@ def _save_checkpoint(filename, model, trainer, reward_norm,
         logger.error(f"Checkpoint mentési hiba: {exc}", exc_info=True)
 
 
+def _milestone_str(milestone_episodes: int) -> str:
+    """
+    [COLAB MOD v1] Mérföldkő string generálása.
+    1_000_000 alatt: '{N}k' formátum (pl. 500k, 1500k)
+    1_000_000 felett: '{N}M' formátum (pl. 2M, 4M)
+
+    Korábban minden esetben `milestone_episodes // 1_000_000` M-et használt,
+    ami 500 000-nél '0M'-et adott. Ez a fix biztosítja a helyes mappaneveket.
+    """
+    if milestone_episodes < 1_000_000:
+        return f"{milestone_episodes // 1_000}k"
+    else:
+        return f"{milestone_episodes // 1_000_000}M"
+
+
 def _run_milestone(filename, model, trainer, reward_norm,
                    episodes, time_spent, state_size, action_size,
                    num_players, milestone_episodes, rlcard_obs_size=54,
@@ -168,21 +187,27 @@ def _run_milestone(filename, model, trainer, reward_norm,
     megkapja az összes erőforrást és nem akad be memóriahiány miatt.
     Max timeout: 10 perc. Ha tovább tart, a tréning továbblép.
 
-    Mappa struktúra:
-        ModellNaplo/
-        └── 2max_ppo_v4_4M/
-            ├── 2max_ppo_v4_4M.pth   ← modell snapshot
-            ├── test_...log           ← részletes log
-            └── test_...json          ← géppel olvasható eredmény
+    Mappa struktúra (lokális, 2M mérföldkő):
+        tests/
+        └── 2max_ppo_v4_2M/
+            ├── 2max_ppo_v4_2M.pth
+            ├── test_...log
+            └── test_...json
+
+    Mappa struktúra (Colab, 500k mérföldkő):
+        Drive/MyDrive/PokerAI_Models/models/2max/tests/
+        └── 2max_ppo_v4_500k/
+            ├── 2max_ppo_v4_500k.pth
+            ├── test_...log
+            └── test_...json
     """
-    milestone_m = milestone_episodes // 1_000_000
-    milestone_str = f"{milestone_m}M"
+    ms_str = _milestone_str(milestone_episodes)
     base_name = os.path.splitext(os.path.basename(filename))[0]
     # [FIX P0-2] Fallback a modul-szintű konstansra csak ha nem érkezik cfg érték
     _hands = milestone_hands if milestone_hands is not None else MILESTONE_HANDS
 
     # Mappa létrehozása
-    milestone_dir = os.path.join(MILESTONE_DIR_ROOT, f"{base_name}_{milestone_str}")
+    milestone_dir = os.path.join(MILESTONE_DIR_ROOT, f"{base_name}_{ms_str}")
     try:
         os.makedirs(milestone_dir, exist_ok=True)
     except OSError as e:
@@ -191,7 +216,7 @@ def _run_milestone(filename, model, trainer, reward_norm,
 
     # Modell snapshot mentése
     milestone_model_path = os.path.join(
-        milestone_dir, f"{base_name}_{milestone_str}.pth"
+        milestone_dir, f"{base_name}_{ms_str}.pth"
     )
     _save_checkpoint(
         milestone_model_path, model, trainer, reward_norm,
@@ -216,7 +241,7 @@ def _run_milestone(filename, model, trainer, reward_norm,
         sys.executable, test_script,
         milestone_model_path,
         "--num-players", str(num_players),
-        "--hands", str(_hands),     # [FIX P0-2] cfg.milestone_hands ha van, különben default
+        "--hands", str(_hands),
         "--out-dir", milestone_dir,
     ]
 
@@ -231,23 +256,23 @@ def _run_milestone(filename, model, trainer, reward_norm,
             capture_output=True, text=True,
         )
         if result.returncode == 0:
-            logger.info(f"✅ {milestone_str} teszt kész → eredmények: {milestone_dir}")
+            logger.info(f"✅ {ms_str} teszt kész → eredmények: {milestone_dir}")
         else:
             stdout_tail = result.stdout[-_TAIL:] if result.stdout else "(üres)"
             stderr_tail = result.stderr[-_TAIL:] if result.stderr else "(üres)"
             logger.error(
-                f"❌ {milestone_str} teszt hibával zárult "
+                f"❌ {ms_str} teszt hibával zárult "
                 f"(returncode={result.returncode}) – tréning folytatódik\n"
                 f"  stdout (vége): {stdout_tail}\n"
                 f"  stderr (vége): {stderr_tail}"
             )
     except subprocess.TimeoutExpired:
         logger.error(
-            f"❌ {milestone_str} teszt timeout (>10 perc) – tréning folytatódik"
+            f"❌ {ms_str} teszt timeout (>10 perc) – tréning folytatódik"
         )
     except Exception as e:
         logger.error(
-            f"❌ {milestone_str} teszt ismeretlen hiba: {e} – tréning folytatódik"
+            f"❌ {ms_str} teszt ismeretlen hiba: {e} – tréning folytatódik"
         )
 
 
@@ -286,9 +311,9 @@ def run_training_session(num_players, filename, episodes_to_run,
         AdvancedPokerAI,
         model_kwargs,
         device=device,
-        phase=OpponentPool.PHASE_EXPLOITATIVE,    # 30/30/10/10/10/10 eloszlás
+        phase=OpponentPool.PHASE_EXPLOITATIVE,
         bot_types=['fish', 'nit', 'calling_station', 'lag'],
-        bot_weights=[0.8, 1.5, 0.2, 1.5],  # fish:8%, nit:15%, cs:2%, lag:15%
+        bot_weights=[0.8, 1.5, 0.2, 1.5],
         num_players=num_players,
         state_size=STATE_SIZE,
     )
@@ -324,9 +349,6 @@ def run_training_session(num_players, filename, episodes_to_run,
                 start_episode = ck.get('episodes_trained', 0)
                 total_time_spent = ck.get('time_spent', 0.0)
                 if 'trainer' in ck:
-                    # Trainer state külön try: ha az optimizer group mérete
-                    # nem egyezik (pl. GRU rétegek hozzáadva), csak WARNING,
-                    # nem ERROR – a model weights és start_episode megmaradnak.
                     try:
                         trainer.load_state_dict(ck['trainer'])
                     except Exception as trainer_exc:
@@ -356,22 +378,25 @@ def run_training_session(num_players, filename, episodes_to_run,
         action_mapper=action_mapper,
         model_kwargs=model_kwargs,
         pool=pool,
-        rlcard_obs_size=rlcard_obs_size,  # [RF-4 FIX] dinamikusan kiszámított fent
+        rlcard_obs_size=rlcard_obs_size,
     )
 
     target_episodes   = start_episode + episodes_to_run
     total_collected = start_episode
 
     # ── Mérföldkő inicializálás ───────────────────────────────────────────
-    # Ha folytatott tréning (pl. betöltöttük a 4M-es checkpointot),
-    # a last_milestone = 4M lesz, így nem teszteli újra az already-done
-    # mérföldköveket – csak a következőtől (6M) indul el.
     last_milestone = (start_episode // cfg.milestone_interval) * cfg.milestone_interval
     logger.info(
         f"Mérföldkő rendszer: interval={cfg.milestone_interval:,} | "
         f"következő: {last_milestone + cfg.milestone_interval:,} ep | "
         f"mentési hely: {cfg.milestone_dir_root}/"
     )
+
+    # ── Globál milestone_dir_root beállítása a _run_milestone számára ─────
+    # A _run_milestone() modul-szintű MILESTONE_DIR_ROOT-ot használja ha
+    # nincs közvetlen paraméter. A cfg.milestone_dir_root átírja ezt.
+    global MILESTONE_DIR_ROOT
+    MILESTONE_DIR_ROOT = cfg.milestone_dir_root
 
     session_start = time.time()
     metrics = {}
@@ -381,7 +406,6 @@ def run_training_session(num_players, filename, episodes_to_run,
     logger.info(
         f"Cél: {target_episodes:,} | State: {STATE_SIZE} | "
         f"Device: {device} | "
-        # [FIX P3-1] cfg-ből olvassuk a tényleges értékeket (nem a stale modul-konstansokat)
         f"Envs: {cfg.num_envs} | "
         f"Buffer: {cfg.buffer_collect_size} | PPO epochs: {PPOTrainer.PPO_EPOCHS}"
     )
@@ -427,10 +451,6 @@ def run_training_session(num_players, filename, episodes_to_run,
         collected_this_batch = len(all_episodes)
         total_collected += collected_this_batch
 
-        # [RF-3 FIX] Kiszámítjuk V(s_{T+1})-t a buffer utolsó állapotához.
-        # Ha az utolsó epizód terminálisan zárult, last_value=0.0 (helyes).
-        # Ha nem (buffer tele lett, de az epizód még fut), a learner értéke
-        # pontosabb bootstrap-ot ad, mint a korábbi hardcode 0.0.
         last_value = 0.0
         if buffer.episode_ends and not buffer.episode_ends[-1]:
             try:
@@ -486,11 +506,6 @@ def run_training_session(num_players, filename, episodes_to_run,
             )
 
             # ── Mérföldkő ellenőrzés ──────────────────────────────────────
-            # [FIX P0-2] cfg.milestone_interval-t használunk a modul-szintű
-            # MILESTONE_INTERVAL konstans HELYETT. Előtte: a GUI-ból beállított
-            # custom interval teljesen figyelmen kívül maradt – a loop mindig
-            # a default 2_000_000-os értékkel számolt, mert a modul-szintű
-            # konstans _DEFAULT_CFG-ből töltődik, nem a futásidőbeli cfg-ből.
             current_milestone = (
                 (total_collected // cfg.milestone_interval) * cfg.milestone_interval
             )
@@ -502,7 +517,7 @@ def run_training_session(num_players, filename, episodes_to_run,
                     STATE_SIZE, ACTION_SIZE,
                     num_players, current_milestone,
                     rlcard_obs_size=rlcard_obs_size,
-                    milestone_hands=cfg.milestone_hands if hasattr(cfg, 'milestone_hands') else MILESTONE_HANDS,
+                    milestone_hands=cfg.milestone_hands,
                 )
 
     if writer:
