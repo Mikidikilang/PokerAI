@@ -43,6 +43,20 @@ _training_session_id = None
 _training_lock       = threading.Lock()
 _last_metrics        = {}
 _metrics_lock        = threading.Lock()
+_training_err_file   = None   # stderr fájl handle a subprocess-hez
+_training_err_path   = None   # stderr log fájl elérési útja
+
+
+def _read_training_error() -> str:
+    """Visszaadja a tréning subprocess stderr log utolsó 20 sorát (ha van)."""
+    try:
+        if _training_err_path and os.path.exists(_training_err_path):
+            with open(_training_err_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-20:]).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _parse_latest_log() -> dict:
@@ -59,7 +73,13 @@ def _parse_latest_log() -> dict:
         for line in reversed(lines[-80:]):
             if "Ep " in line and "Actor" in line:
                 m = {}
-                for part in line.split("|"):
+                # [FIX P0-1] A logging formátum: "TIMESTAMP [LEVEL] MESSAGE"
+                # A "] " token után következik a tényleges log üzenet.
+                # Nélküle a split("|") első eleme a timestamp-et is tartalmazza,
+                # pl. "2026-03-21 16:26:00 [INFO] Ep    1,000/100,000"
+                # ami NEM kezdődik "Ep "-vel → current_ep soha nem töltődött be.
+                raw_msg = line.split("] ", 1)[-1] if "] " in line else line
+                for part in raw_msg.split("|"):
                     part = part.strip()
                     if part.startswith("Ep "):
                         try:
@@ -254,14 +274,22 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/presets":
             self._send_json(STYLE_PRESETS)
         elif path == "/api/status":
-            running = False
+            # [FIX P1-1] Az összes _training_* globálist egyszerre olvassuk a lock
+            # alatt – race condition volt, mikor a lock felszabadult és a /api/stop
+            # kinullázta a globálisokat, mielőtt a válasz összeállt volna.
             with _training_lock:
                 if _training_proc is not None:
                     running = _training_proc.poll() is None
+                else:
+                    running = False
+                snap_model      = _training_model
+                snap_session_id = _training_session_id
             with _metrics_lock:
                 metrics = dict(_last_metrics)
-            self._send_json({"running": running, "model": _training_model,
-                             "session_id": _training_session_id, "metrics": metrics})
+            err_msg = "" if running else _read_training_error()
+            self._send_json({"running": running, "model": snap_model,
+                             "session_id": snap_session_id, "metrics": metrics,
+                             "last_error": err_msg})
         else:
             self.send_error(404)
 
@@ -296,6 +324,7 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "new_path": new_pth, "name": name})
 
             elif path == "/api/start":
+                global _training_err_file, _training_err_path
                 model_name  = body.get("model_name", "")
                 num_players = int(body.get("num_players", 6))
                 episodes    = int(body.get("episodes", 100_000))
@@ -326,9 +355,29 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                        "--players", str(num_players), "--episodes", str(episodes),
                        "--config-json", json.dumps(config), "--session-id", session_id]
 
+                # [FIX P1-2] stderr fájlba irányítva, nem DEVNULL.
+                # Crash esetén a hibaszöveg a /api/status "last_error" mezőjén
+                # keresztül kiolvasható a GUI-ban is.
+                os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
+                err_path = os.path.join(BASE_DIR, "logs", "training_err.log")
+                # Előző handle lezárása ha maradt nyitva
+                if _training_err_file is not None:
+                    try: _training_err_file.close()
+                    except Exception: pass
+                _training_err_file = open(err_path, "w", encoding="utf-8")
+                _training_err_path = err_path
+
                 with _training_lock:
-                    _training_proc       = subprocess.Popen(cmd, cwd=BASE_DIR,
-                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # [FIX P1-3] start_new_session=True: új process group-ba kerül
+                    # a subprocess, így stop-kor az egész fa (beleértve a milestone
+                    # teszt subprocesszt is) egy os.killpg() hívással leölhető –
+                    # nem marad orphan/zombie a GPU-n.
+                    _training_proc = subprocess.Popen(
+                        cmd, cwd=BASE_DIR,
+                        stdout=subprocess.DEVNULL,
+                        stderr=_training_err_file,
+                        start_new_session=True,   # ← új process group
+                    )
                     _training_model      = model_name
                     _training_session_id = session_id
 
@@ -342,9 +391,23 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/stop":
                 with _training_lock:
                     if _training_proc is not None and _training_proc.poll() is None:
-                        _training_proc.terminate()
-                        try: _training_proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired: _training_proc.kill()
+                        # [FIX P1-3] Process group kill: a milestone teszt
+                        # subprocess-t is leöli, nem csak a CLI wrapper-t.
+                        # Unix-on os.killpg()-vel, Windows-on fallback terminate().
+                        try:
+                            import os as _os, signal as _sig
+                            _os.killpg(_os.getpgid(_training_proc.pid), _sig.SIGTERM)
+                        except (AttributeError, ProcessLookupError, OSError):
+                            _training_proc.terminate()
+                        try:
+                            _training_proc.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                import os as _os, signal as _sig
+                                _os.killpg(_os.getpgid(_training_proc.pid), _sig.SIGKILL)
+                            except (AttributeError, ProcessLookupError, OSError):
+                                _training_proc.kill()
+                            _training_proc.wait()
                         if _training_model and _training_session_id:
                             try:
                                 from utils.checkpoint_utils import safe_load_checkpoint
@@ -420,7 +483,23 @@ def main():
         print("\n  Leállítva.")
         with _training_lock:
             if _training_proc and _training_proc.poll() is None:
-                _training_proc.terminate()
+                # [FIX P1-4] terminate() + wait() párban – nélküle Unix-on
+                # zombie process marad (SIGTERM elküldve, de szülő soha nem
+                # hívja wait()-et, a kernel nem tudja felszabadítani az entry-t).
+                try:
+                    import os as _os, signal as _sig
+                    _os.killpg(_os.getpgid(_training_proc.pid), _sig.SIGTERM)
+                except (AttributeError, ProcessLookupError, OSError):
+                    _training_proc.terminate()
+                try:
+                    _training_proc.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    try:
+                        import os as _os, signal as _sig
+                        _os.killpg(_os.getpgid(_training_proc.pid), _sig.SIGKILL)
+                    except (AttributeError, ProcessLookupError, OSError):
+                        _training_proc.kill()
+                    _training_proc.wait()
         server.server_close()
 
 

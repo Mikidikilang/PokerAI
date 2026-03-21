@@ -158,7 +158,8 @@ def _save_checkpoint(filename, model, trainer, reward_norm,
 
 def _run_milestone(filename, model, trainer, reward_norm,
                    episodes, time_spent, state_size, action_size,
-                   num_players, milestone_episodes, rlcard_obs_size=54):
+                   num_players, milestone_episodes, rlcard_obs_size=54,
+                   milestone_hands=None):
     """
     Mérföldkő elérése: elmenti a modellt egy dedikált mappába,
     majd elindítja a test_model_sanity.py-t subprocessként.
@@ -177,6 +178,8 @@ def _run_milestone(filename, model, trainer, reward_norm,
     milestone_m = milestone_episodes // 1_000_000
     milestone_str = f"{milestone_m}M"
     base_name = os.path.splitext(os.path.basename(filename))[0]
+    # [FIX P0-2] Fallback a modul-szintű konstansra csak ha nem érkezik cfg érték
+    _hands = milestone_hands if milestone_hands is not None else MILESTONE_HANDS
 
     # Mappa létrehozása
     milestone_dir = os.path.join(MILESTONE_DIR_ROOT, f"{base_name}_{milestone_str}")
@@ -213,10 +216,8 @@ def _run_milestone(filename, model, trainer, reward_norm,
         sys.executable, test_script,
         milestone_model_path,
         "--num-players", str(num_players),
-        "--hands", str(MILESTONE_HANDS),
+        "--hands", str(_hands),     # [FIX P0-2] cfg.milestone_hands ha van, különben default
         "--out-dir", milestone_dir,
-        # --winrate NEM fut automatikusan (túl lassú lenne minden 2M-nél).
-        # Ha manuálisan akarod: python test_model_sanity.py <pth> --winrate
     ]
 
     logger.info(
@@ -377,9 +378,13 @@ def run_training_session(num_players, filename, episodes_to_run,
 
     logger.info("=" * 70)
     logger.info(f"Tréning indul | {num_players}p | PPO + Self-Play v4 OPTIMIZED")
-    logger.info(f"Cél: {target_episodes:,} | State: {STATE_SIZE} | "
-                f"Device: {device} | Envs: {NUM_ENVS} | "
-                f"Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 8")
+    logger.info(
+        f"Cél: {target_episodes:,} | State: {STATE_SIZE} | "
+        f"Device: {device} | "
+        # [FIX P3-1] cfg-ből olvassuk a tényleges értékeket (nem a stale modul-konstansokat)
+        f"Envs: {cfg.num_envs} | "
+        f"Buffer: {cfg.buffer_collect_size} | PPO epochs: {PPOTrainer.PPO_EPOCHS}"
+    )
     logger.info("=" * 70)
 
     while total_collected < target_episodes:
@@ -481,11 +486,13 @@ def run_training_session(num_players, filename, episodes_to_run,
             )
 
             # ── Mérföldkő ellenőrzés ──────────────────────────────────────
-            # Pl: total_collected=2_001_500 → current_milestone=2_000_000
-            # Ha last_milestone=0, akkor 2M > 0 → trigger!
-            # Ha last_milestone=2M, akkor 2M > 2M → False, nem triggerel újra.
+            # [FIX P0-2] cfg.milestone_interval-t használunk a modul-szintű
+            # MILESTONE_INTERVAL konstans HELYETT. Előtte: a GUI-ból beállított
+            # custom interval teljesen figyelmen kívül maradt – a loop mindig
+            # a default 2_000_000-os értékkel számolt, mert a modul-szintű
+            # konstans _DEFAULT_CFG-ből töltődik, nem a futásidőbeli cfg-ből.
             current_milestone = (
-                (total_collected // MILESTONE_INTERVAL) * MILESTONE_INTERVAL
+                (total_collected // cfg.milestone_interval) * cfg.milestone_interval
             )
             if current_milestone > last_milestone and current_milestone > 0:
                 last_milestone = current_milestone
@@ -495,6 +502,7 @@ def run_training_session(num_players, filename, episodes_to_run,
                     STATE_SIZE, ACTION_SIZE,
                     num_players, current_milestone,
                     rlcard_obs_size=rlcard_obs_size,
+                    milestone_hands=cfg.milestone_hands if hasattr(cfg, 'milestone_hands') else MILESTONE_HANDS,
                 )
 
     if writer:

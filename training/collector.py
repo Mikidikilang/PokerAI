@@ -53,6 +53,10 @@ from core.opponent_tracker import OpponentHUDTracker
 logger = logging.getLogger("PokerAI")
 _MAX_STEPS_PER_HAND = 500
 _LEARNER_ID = 0
+# [FIX P2-3] Explicit fold akció index – PokerActionMapper.ACTION_NAMES alapján:
+# 0=Fold, 1=Call/Check, 2-6=Raise szintek. Magic number helyett konstans,
+# hogy architektúra változáskor ne legyen silent bug.
+_FOLD_ACTION = 0
 # BB_OPTIONS / STACK_MULTIPLIERS eltávolítva (RF-1 fix): az env saját konfigja
 # kerül kiolvasásra reset után – véletlenszerű, soha nem alkalmazott értékek helyett.
 
@@ -246,8 +250,14 @@ class BatchedSyncCollector:
         self._active[i] = True
         self._street[i] = detect_street(s)
         self._opp_models[i] = self.pool.get_opponent(self.model)
-        if self._trackers[i] is None:
-            self._trackers[i] = OpponentHUDTracker(self.num_players)
+        # [FIX P2-1] HUD tracker MINDIG új példány kézváltáskor.
+        # Korábbi hiba: "if self._trackers[i] is None" → csak az első kéznél
+        # jött létre új tracker. Ezután az összes következő kézben a régi
+        # ellenfél(ek) stale statisztikái maradtak (pl. VPIP, AF, PFR),
+        # miközben az OpponentPool rotált – ez okozta a "HUD-vakság" bugot,
+        # ami az AF agressziós spirálhoz is hozzájárult (a learner félreolvasta
+        # az ellenfél típusát a régi HUD adatok alapján).
+        self._trackers[i] = OpponentHUDTracker(self.num_players)
         self._action_histories[i].clear()
         self._last_equity[i] = 0.5
         self._prev_street[i]  = 0
@@ -454,9 +464,10 @@ class BatchedSyncCollector:
                 self._states[i], num_opponents=self.num_players - 1
             )
             self._last_equity[i] = equity_now
-            # [RF-11] Street-átmenet equity delta tracking
-            # A delta-t a _collect_done_envs-ben használjuk intermediate reward-hoz
-            self._prev_equity[i] = self._prev_equity[i]  # megőrizzük az előzőt
+            # [FIX P2-2] A _prev_equity[i] frissítése a street-váltás ágban
+            # történik (lentebb, a step() utáni new_street != street feltételben).
+            # A korábbi "self._prev_equity[i] = self._prev_equity[i]" no-op sor
+            # félrevezető volt – törölve.
 
             try:
                 ns, np_ = self.envs[i].step(ea)
@@ -518,7 +529,8 @@ class BatchedSyncCollector:
                         # 1) Draw fold penalty
                         DRAW_FOLD_PENALTY     = 0.08
                         DRAW_EQUITY_THRESHOLD = 0.44  # ~8-9 outos draw szintje
-                        if (last_action_int == 0
+                        # [FIX P2-3] _FOLD_ACTION konstans, nem magic 0
+                        if (last_action_int == _FOLD_ACTION
                                 and last_street >= 1
                                 and last_eq >= DRAW_EQUITY_THRESHOLD):
                             raw_reward -= DRAW_FOLD_PENALTY

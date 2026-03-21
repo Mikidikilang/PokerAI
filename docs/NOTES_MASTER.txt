@@ -1,5 +1,5 @@
 ================================================================================
-POKER AI v4.1 – MASTER NOTES
+POKER AI v4.2.1 – MASTER NOTES
 Minden ami a v4 fejlesztéséhez kell. Ez az "agy" – mindig ebből dolgozz!
 ================================================================================
 
@@ -1408,3 +1408,99 @@ ELVETETT ÖTLETEK (magyarázattal):
 ================================================================================
 EOF v4.2 AUDIT SPRINT NOTES
 ================================================================================
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+38. GUI & PROCESS MANAGEMENT BUGFIX SPRINT (v4.2.1)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dátum: 2026-03-21
+Érintett fájlok: train_gui.py, training/runner.py, training/collector.py
+
+10 bug javítva (2 kritikus, 4 magas, 3 közepes, 1 alacsony).
+
+── P0 – KRITIKUS ────────────────────────────────────────────────────────────────
+
+[P0-1] train_gui.py – Log parsing: progress bar soha nem töltődött be
+  A _parse_latest_log() a teljes nyers sort "|"-vel darabolva kereste az
+  "Ep " prefixet. A log formátum "TIMESTAMP [LEVEL] Ep ..." alakú, tehát
+  az első szegmens mindig a timestampet is tartalmazza → current_ep / target_ep
+  sosem töltődött be. A többi mező (Actor, Critic, Ent, LR, ETA) véletlenül
+  működött, mert azok nem az első szegmensben vannak.
+  Javítás: line.split("] ", 1)[-1] levágja a logging prefixet a "|" split előtt.
+
+[P0-2] training/runner.py – GUI milestone interval figyelmen kívül maradt
+  A while loop MILESTONE_INTERVAL modul-szintű konstanst használt a futásidőbeli
+  cfg.milestone_interval helyett. Következmény: bármilyen GUI-ból beállított
+  custom milestone interval teljesen inaktív maradt, a loop mindig a default
+  2_000_000-os értékkel triggelt. Ugyanígy MILESTONE_HANDS sem érkezett el
+  a milestone subprocess-hez.
+  Javítás: cfg.milestone_interval és cfg.milestone_hands (hasattr guard) a
+  konstans helyett; _run_milestone() kap egy milestone_hands paramétert.
+
+── P1 – MAGAS ───────────────────────────────────────────────────────────────────
+
+[P1-1] train_gui.py – Race condition az /api/status válaszban
+  A _training_model és _training_session_id globálisokat a lock elengedése
+  UTÁN olvastuk – egy párhuzamos /api/stop hívás kinullázhatja őket a
+  JSON összeállítása előtt.
+  Javítás: snap_model / snap_session_id snapshot a lock belsejében.
+
+[P1-2] train_gui.py – stderr=DEVNULL → crashek láthatatlanok
+  Import hiba vagy runtime crash esetén a GUI csak annyit látott, hogy
+  a process leállt. Semmilyen diagnosztikai info nem volt elérhető.
+  Javítás: stderr → logs/training_err.log fájlba irányítva; az /api/status
+  "last_error" mezőben visszaadja az utolsó 20 sort ha a process leállt.
+
+[P1-3] train_gui.py – Orphan subprocess a mérföldkő tesztnél
+  /api/stop és Ctrl+C csak a CLI wrapper (közvetlen gyermek) PID-jét ölte
+  meg. Ha _run_milestone() éppen futott (subprocess.run(test_model_sanity.py)),
+  a teszt subprocess árvaként tovább futott, lefoglalva a GPU-t.
+  Javítás: start_new_session=True (új process group) + os.killpg() az egész
+  fát egyszerre leöli. Windows-on automatikus fallback terminate()-re.
+
+[P1-4] train_gui.py – Zombie process Ctrl+C-re
+  A KeyboardInterrupt handler terminate()-t hívott wait() nélkül. Unix-on
+  a kernel nem tudja felszabadítani a process table entry-t amíg a szülő
+  el nem olvassa a visszatérési értéket → zombie process.
+  Javítás: terminate() + wait(timeout=6) + SIGKILL fallback minden shutdown
+  útvonalon (stop API + KeyboardInterrupt).
+
+── P2 – KÖZEPES ─────────────────────────────────────────────────────────────────
+
+[P2-1] training/collector.py – HUD tracker nem resetelődött → "HUD-vakság" bug
+  Ez az AF agressziós spirál közvetlen oka. Az OpponentPool rotált modelleket
+  (pl. fish → nit), de a HUD tracker az előző ellenfél stale VPIP/AF/PFR
+  statisztikáit őrizte. A learner "passive"-nak olvasta az agresszív ellenfelet
+  → alul-reagált → nagyobb veszteség → reward signal erőszakos counter-agresszióra
+  tanított → spirál.
+  Régi kód: if self._trackers[i] is None: ... (csak az első kézben jött létre új)
+  Javítás: minden _reset_env()-ban új OpponentHUDTracker példány.
+
+[P2-2] training/collector.py – No-op self._prev_equity[i] = self._prev_equity[i]
+  Megtévesztő, funkció nélküli sor. A _prev_equity[i] csak a street-váltás
+  ágban frissül helyesen.
+  Javítás: sor törölve, komment pontosítva.
+
+[P2-3] training/collector.py – Magic number fold action
+  last_action_int == 0 implicit fold feltétel. Ha PokerActionMapper változna,
+  silent bug lenne.
+  Javítás: _FOLD_ACTION = 0 modul-szintű konstans, arra hivatkozás.
+
+── P3 – ALACSONY ────────────────────────────────────────────────────────────────
+
+[P3-1] training/runner.py – Félrevezető startup log üzenet
+  A "Envs: X | Buffer: Y" stale modul-szintű konstansokat mutatott, nem a
+  tényleges cfg értékeket.
+  Javítás: cfg.num_envs, cfg.buffer_collect_size, PPOTrainer.PPO_EPOCHS.
+
+── VERZIÓTÖRTÉNET FRISSÍTÉS ─────────────────────────────────────────────────────
+
+  v4.2.1: GUI & process management bugfix sprint.
+    - 10 bug (2×P0, 4×P1, 3×P2, 1×P3) javítva
+    - Checkpoint formátum VÁLTOZATLAN (v4.2 kompatibilis)
+    - Modell architektúra VÁLTOZATLAN
+    - Új: logs/training_err.log (stderr capture), /api/status last_error mező
+
+================================================================================
+EOF v4.2.1 GUI BUGFIX SPRINT NOTES
+================================================================================
+
