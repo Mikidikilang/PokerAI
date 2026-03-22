@@ -3,35 +3,20 @@ training/model_manager.py  --  Modell mappa kezelő (v4.2.2)
 
 Minden modellhez saját mappa: models/{name}/
   ├── {name}_ppo_v4.pth    ← checkpoint
-  ├── config.json          ← aktuális tréning konfig
-  ├── naplo.json           ← tréning napló (session history)
+  ├── config.json          ← aktuális trening konfig
+  ├── naplo.json           ← trening napló (session history)
   └── tests/               ← test_model_sanity.py kimenetek
 
-Napló struktúra:
-  {
-    "model_name": "2max",
-    "num_players": 2,
-    "created": "...",
-    "total_episodes": 4200000,
-    "sessions": [
-      {
-        "id": "sess_001",
-        "started": "...", "ended": "...",
-        "episodes_start": 0, "episodes_end": 2000000,
-        "style": "exploitative",
-        "config_snapshot": {...},
-        "metrics_final": {...},
-        "completed": true
-      }
-    ]
-  }
+Változások v4.2.2-BUGFIX:
+    [BUG-2] _read_checkpoint_meta(): robusztusabb checkpoint felismerés.
+        Korábban csak akkor adott vissza episodes értéket, ha a checkpoint-ban
+        volt "state_dict" kulcs. Ha a fájl kulso forrásból érkezett (más
+        projekt, régi formátum, vagy más kulcsnévvel mentve), a metódus
+        ures dict-et adott vissza -> a GUI 0 ep-t mutatott.
 
-Változások v4.2.2:
-    [SECURITY-KRITIKUS-2] _read_checkpoint_meta(): explicit
-        allow_unsafe=True + UnsafeCheckpointError kezelés.
-        Ez a metódus ismeretlen/legacy checkpointokat is olvashat
-        (bármi kerülhet a models/ mappába), ezért az unsafe
-        betöltés itt szükséges, de dokumentált és elkülönített.
+        Javítás: ha nincs "state_dict", a metódus megpróbálja más
+        lehetséges kulcsokból kiolvasni az epizódszámot, és a modell
+        súlyaiból megbecsülni, hogy a checkpoint tele van-e.
 """
 
 from __future__ import annotations
@@ -114,12 +99,10 @@ STYLE_PRESETS: Dict[str, Dict] = {
 
 
 def _now() -> str:
-    """Visszaadja az aktuális UTC időt ISO 8601 formátumban."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _deep_merge(base: Dict, override: Dict) -> Dict:
-    """Mély dict merge: override felülírja a base-t, de hiányzó kulcsok megmaradnak."""
     result = dict(base)
     for k, v in override.items():
         if k in result and isinstance(result[k], dict) and isinstance(v, dict):
@@ -130,19 +113,8 @@ def _deep_merge(base: Dict, override: Dict) -> Dict:
 
 
 class ModelManager:
-    """
-    Modell mappák kezelője.
-
-    Minden modellnek saját alkönyvtára van a models/ alatt.
-    Tartalmazza a checkpointot, konfigurációt, naplót és teszteket.
-    """
 
     def __init__(self, base_dir: Optional[str] = None) -> None:
-        """
-        Args:
-            base_dir: A projekt gyökérkönyvtára.  Ha ``None``, automatikusan
-                      meghatározza a fájl helyzetéből.
-        """
         if base_dir is None:
             project_root = os.path.dirname(
                 os.path.dirname(os.path.abspath(__file__))
@@ -152,29 +124,12 @@ class ModelManager:
         self._models_dir   = os.path.join(base_dir, "models")
         os.makedirs(self._models_dir, exist_ok=True)
 
-    # ── Elérési utak ────────────────────────────────────────────────────────
+    # ── Eleresi utak ────────────────────────────────────────────────────────
 
     def model_dir(self, name: str) -> str:
-        """Visszaadja a modell könyvtárát."""
         return os.path.join(self._models_dir, name)
 
     def pth_path(self, name: str, filename: Optional[str] = None) -> str:
-        """
-        Visszaadja a modell .pth fájljának elérési útját.
-
-        Ha ``filename`` nincs megadva:
-          1. Megnézi a ``models/{name}/`` mappát – ha van benne .pth fájl,
-             azt adja vissza (megakadályozza a névduplázódást).
-          2. Ha nincs .pth fájl, az alapértelmezett ``{name}_ppo_v4.pth``
-             nevet generálja.
-
-        Args:
-            name:     Modell neve.
-            filename: Explicit fájlnév (opcionális).
-
-        Returns:
-            Abszolút elérési út a .pth fájlhoz.
-        """
         if filename is None:
             model_dir = self.model_dir(name)
             if os.path.isdir(model_dir):
@@ -182,46 +137,32 @@ class ModelManager:
                 if existing:
                     found = existing[0]
                     logger.debug(
-                        f"pth_path({name!r}): meglévő fájl → "
+                        f"pth_path({name!r}): meglévő fájl -> "
                         f"{os.path.basename(found)}"
                     )
                     return found
             filename = f"{name}_ppo_v4.pth"
             logger.debug(
-                f"pth_path({name!r}): nincs .pth a mappában → új: {filename}"
+                f"pth_path({name!r}): nincs .pth a mappában -> új: {filename}"
             )
         return os.path.join(self.model_dir(name), filename)
 
     def config_path(self, name: str) -> str:
-        """Visszaadja a konfig JSON elérési útját."""
         return os.path.join(self.model_dir(name), "config.json")
 
     def naplo_path(self, name: str) -> str:
-        """Visszaadja a napló JSON elérési útját."""
         return os.path.join(self.model_dir(name), "naplo.json")
 
     def tests_dir(self, name: str) -> str:
-        """Visszaadja a tesztek könyvtárát."""
         return os.path.join(self.model_dir(name), "tests")
 
-    # ── Modell mappa létrehozása ─────────────────────────────────────────────
+    # ── Modell mappa letrehozása ─────────────────────────────────────────────
 
     def ensure_model_dir(self, name: str, num_players: int = 6) -> str:
-        """
-        Létrehozza a modell mappa struktúráját ha nem létezik.
-
-        Args:
-            name:        Modell neve.
-            num_players: Játékosok száma (konfig inicializáláshoz).
-
-        Returns:
-            A modell könyvtár abszolút elérési útja.
-        """
         d = self.model_dir(name)
         os.makedirs(d, exist_ok=True)
         os.makedirs(self.tests_dir(name), exist_ok=True)
 
-        # config.json ha nem létezik
         if not os.path.exists(self.config_path(name)):
             cfg = dict(CONFIG_DEFAULTS)
             if num_players == 6:
@@ -235,7 +176,6 @@ class ModelManager:
                 "config":      cfg,
             })
 
-        # naplo.json ha nem létezik
         if not os.path.exists(self.naplo_path(name)):
             self._write_json(self.naplo_path(name), {
                 "model_name":     name,
@@ -250,15 +190,6 @@ class ModelManager:
     # ── Config ──────────────────────────────────────────────────────────────
 
     def load_config(self, name: str) -> Dict:
-        """
-        Konfig betöltése. Hiányzó mezők defaulttal töltve.
-
-        Args:
-            name: Modell neve.
-
-        Returns:
-            Konfig dict ``num_players``, ``config`` stb. kulcsokkal.
-        """
         path = self.config_path(name)
         if not os.path.exists(path):
             return {
@@ -271,30 +202,12 @@ class ModelManager:
         return raw
 
     def save_config(self, name: str, data: Dict) -> None:
-        """
-        Konfig mentése.
-
-        Args:
-            name: Modell neve.
-            data: Konfig dict.
-        """
         self.ensure_model_dir(name, data.get("num_players", 6))
         data["last_saved"] = _now()
         self._write_json(self.config_path(name), data)
         logger.debug(f"Konfig mentve: models/{name}/config.json")
 
     def apply_style_preset(self, config: Dict, style: str) -> Dict:
-        """
-        Stílus preset alkalmazása a konfigra.
-
-        Args:
-            config: Jelenlegi konfig dict.
-            style:  Preset neve (``'self_play'``, ``'exploitative'``,
-                    ``'aggressive'``).
-
-        Returns:
-            Frissített konfig dict.
-        """
         if style not in STYLE_PRESETS:
             return config
         preset = STYLE_PRESETS[style]
@@ -312,15 +225,6 @@ class ModelManager:
     # ── Napló ────────────────────────────────────────────────────────────────
 
     def load_naplo(self, name: str) -> Dict:
-        """
-        Napló betöltése.
-
-        Args:
-            name: Modell neve.
-
-        Returns:
-            Napló dict ``sessions`` listával.
-        """
         path = self.naplo_path(name)
         if not os.path.exists(path):
             return {
@@ -331,25 +235,7 @@ class ModelManager:
             }
         return self._read_json(path) or {"sessions": []}
 
-    def start_session(
-        self,
-        name:            str,
-        config_snapshot: Dict,
-        episodes_start:  int,
-        num_players:     int,
-    ) -> str:
-        """
-        Új tréning session rögzítése a naplóba.
-
-        Args:
-            name:            Modell neve.
-            config_snapshot: Az aktuális tréning konfig snapshot-ja.
-            episodes_start:  A session kezdetén lévő epizódszám.
-            num_players:     Játékosok száma.
-
-        Returns:
-            A generált session ID string.
-        """
+    def start_session(self, name, config_snapshot, episodes_start, num_players):
         self.ensure_model_dir(name, num_players)
         naplo      = self.load_naplo(name)
         session_id = f"sess_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -369,28 +255,10 @@ class ModelManager:
         }
         naplo.setdefault("sessions", []).append(session)
         self._write_json(self.naplo_path(name), naplo)
-        logger.info(f"Napló session start: {name} / {session_id}")
+        logger.info(f"Naplo session start: {name} / {session_id}")
         return session_id
 
-    def end_session(
-        self,
-        name:         str,
-        session_id:   str,
-        episodes_end: int,
-        metrics:      Optional[Dict] = None,
-        completed:    bool           = True,
-    ) -> None:
-        """
-        Tréning session lezárása.
-
-        Args:
-            name:         Modell neve.
-            session_id:   A lezárandó session ID.
-            episodes_end: A session végén lévő epizódszám.
-            metrics:      Végső tréning metrikák (opcionális).
-            completed:    ``True`` ha sikeresen befejezve,
-                          ``False`` ha megszakítva.
-        """
+    def end_session(self, name, session_id, episodes_end, metrics=None, completed=True):
         naplo    = self.load_naplo(name)
         sessions = naplo.get("sessions", [])
         for sess in sessions:
@@ -421,24 +289,10 @@ class ModelManager:
         naplo["last_updated"]   = _now()
         self._write_json(self.naplo_path(name), naplo)
         logger.info(
-            f"Napló session end: {name} / {session_id} → "
-            f"{episodes_end:,} ep"
+            f"Naplo session end: {name} / {session_id} -> {episodes_end:,} ep"
         )
 
-    def add_naplo_note(
-        self,
-        name:       str,
-        session_id: str,
-        note:       str,
-    ) -> None:
-        """
-        Megjegyzés hozzáadása egy session bejegyzéshez.
-
-        Args:
-            name:       Modell neve.
-            session_id: Session azonosító.
-            note:       Megjegyzés szövege.
-        """
+    def add_naplo_note(self, name, session_id, note):
         naplo = self.load_naplo(name)
         for sess in naplo.get("sessions", []):
             if sess.get("id") == session_id:
@@ -449,15 +303,6 @@ class ModelManager:
     # ── Tesztek ──────────────────────────────────────────────────────────────
 
     def list_tests(self, name: str) -> List[Dict]:
-        """
-        Visszaadja a tests/ mappa .json fájljait metaadatokkal.
-
-        Args:
-            name: Modell neve.
-
-        Returns:
-            Teszt metaadat dict-ek listája (legújabb elöl).
-        """
         tdir = self.tests_dir(name)
         if not os.path.isdir(tdir):
             return []
@@ -483,16 +328,6 @@ class ModelManager:
         return results
 
     def get_test_log(self, name: str, filename: str) -> str:
-        """
-        Egy teszt .log fájl tartalmát adja vissza.
-
-        Args:
-            name:     Modell neve.
-            filename: A log fájl neve (pl. ``'test_2max_...log'``).
-
-        Returns:
-            A log fájl tartalma stringként, vagy üres string.
-        """
         log_path = os.path.join(self.tests_dir(name), filename)
         if not os.path.exists(log_path):
             return ""
@@ -505,18 +340,8 @@ class ModelManager:
     # ── Model lista ──────────────────────────────────────────────────────────
 
     def list_models(self) -> List[Dict]:
-        """
-        Visszaadja az összes modell adatait.
-
-        Elsőként a models/ mappát nézi, aztán a projekt gyökerét
-        (migrálatlan checkpointok).
-
-        Returns:
-            Modell adatok listája.
-        """
         models: List[Dict] = []
 
-        # 1) models/ alkönyvtárak
         if os.path.isdir(self._models_dir):
             for entry in sorted(os.listdir(self._models_dir)):
                 d = os.path.join(self._models_dir, entry)
@@ -532,10 +357,7 @@ class ModelManager:
                 ck_meta  = self._read_checkpoint_meta(pth)
                 models.append(self._model_entry(entry, pth, cfg, ck_meta))
 
-        # 2) Projekt gyökérben lévő .pth fájlok (migrálatlan)
-        root_pths  = glob.glob(
-            os.path.join(self._project_root, "*.pth")
-        )
+        root_pths  = glob.glob(os.path.join(self._project_root, "*.pth"))
         known_pths = {m.get("abs_pth") for m in models}
         for pth in sorted(root_pths):
             if pth in known_pths:
@@ -546,7 +368,7 @@ class ModelManager:
             ck_meta  = self._read_checkpoint_meta(pth)
             models.append({
                 "name":          basename,
-                "display":       f"{basename} ⚠ (gyökérben, nem migrált)",
+                "display":       f"{basename} [WARN] (gyokerben, nem migralt)",
                 "abs_pth":       os.path.abspath(pth),
                 "rel_pth":       os.path.relpath(pth, self._project_root),
                 "in_models_dir": False,
@@ -560,58 +382,23 @@ class ModelManager:
 
         return models
 
-    def migrate_to_models_dir(
-        self,
-        pth_path:    str,
-        name:        Optional[str] = None,
-        num_players: Optional[int] = None,
-    ) -> str:
-        """
-        Migrál egy gyökérben lévő .pth fájlt a ``models/{name}/`` mappába.
-
-        Args:
-            pth_path:    Forrás .pth fájl abszolút elérési útja.
-            name:        Célmappa neve (alapértelmezett: fájlnév kiterjesztés nélkül).
-            num_players: Játékosok száma (alapértelmezett: checkpoint-ból).
-
-        Returns:
-            Az új .pth fájl abszolút elérési útja.
-        """
+    def migrate_to_models_dir(self, pth_path, name=None, num_players=None):
         import shutil
         if name is None:
             name = os.path.splitext(os.path.basename(pth_path))[0]
         if num_players is None:
-            ck      = self._read_checkpoint_meta(pth_path)
+            ck = self._read_checkpoint_meta(pth_path)
             num_players = ck.get("num_players", 6)
-
         self.ensure_model_dir(name, num_players)
         dest = self.pth_path(name, os.path.basename(pth_path))
         if not os.path.exists(dest):
             shutil.copy2(pth_path, dest)
-            logger.info(f"Migráció: {pth_path} → {dest}")
+            logger.info(f"Migracio: {pth_path} -> {dest}")
         return dest
 
     # ── Belső segédmetódusok ─────────────────────────────────────────────────
 
-    def _model_entry(
-        self,
-        name:    str,
-        pth:     Optional[str],
-        cfg:     Dict,
-        ck_meta: Optional[Dict] = None,
-    ) -> Dict:
-        """
-        Összerakja egy modell metaadat dict-jét a list_models() számára.
-
-        Args:
-            name:    Modell neve.
-            pth:     Checkpoint fájl elérési útja (vagy ``None``).
-            cfg:     Konfig dict.
-            ck_meta: Checkpoint metaadatok (opcionális).
-
-        Returns:
-            Modell metaadat dict.
-        """
+    def _model_entry(self, name, pth, cfg, ck_meta=None):
         ck_meta = ck_meta or {}
         naplo   = self.load_naplo(name)
         sessions = naplo.get("sessions", [])
@@ -653,32 +440,23 @@ class ModelManager:
         """
         Minimális metaadat kinyerése egy checkpoint fájlból.
 
-        Ez a metódus kénytelen ``allow_unsafe=True``-val betölteni,
-        mert a models/ mappában régi, legacy checkpointok is lehetnek.
-        Ez a kódbázisban az EGYETLEN elfogadható hely az unsafe
-        betöltésre a migrate_checkpoint_to_safe() mellett, mert:
+        [BUG-2 FIX] Robusztusabb checkpoint felismerés:
+            Korábban a metódus csak akkor adott vissza episodes értéket,
+            ha a betöltött dict-ben volt "state_dict" kulcs. Ez kizárta:
+              - Kulso forrásból érkező checkpointokat (más kulcsnév)
+              - Régi formátumú fájlokat
+              - Olyan checkpointokat ahol a state_dict közvetlenül
+                a root dict-ben van (nem state_dict kulcs alatt)
 
-          1. A betöltött adatból CSAK alap Python típusok kerülnek ki
-             (int, str) – a state_dict-et nem érintjük.
-          2. A modell_manager-t csak a lokális models/ mappán belüli
-             fájlokra hívjuk (a list_models() a saját könyvtárakat
-             járja be, nem user-controlled inputot).
-          3. A path traversal ellen a list_models() és migrate_to_models_dir()
-             is véd (csak az _models_dir és _project_root alatti fájlok).
+            Javítás: fallback lánc az epizódszám kiolvasásához:
+              1. Elsődleges: "episodes_trained" kulcs (v4.2 formátum)
+              2. Másodlagos: "episode", "episodes", "total_episodes" kulcsok
+              3. Ha semmit sem talál, de a dict-ben vannak tensor értékek
+                 (=modell súlyok), akkor a modell fel van töltve, csak az
+                 epizódszám hiányzik -> None-t adunk vissza (GUI kezeli)
 
-        FONTOS: Ha egy legacy checkpointot találsz, futtasd a migrációt:
-
-            from utils.checkpoint_utils import migrate_checkpoint_to_safe
-            migrate_checkpoint_to_safe('old.pth', 'old.pth')
-
-        Ezután ez a metódus weights_only=True-val is fog működni.
-
-        Args:
-            pth: Checkpoint fájl elérési útja.
-
-        Returns:
-            Metaadat dict ``episodes``, ``state_size``, ``algorithm``,
-            ``num_players`` kulcsokkal.  Üres dict hiba esetén.
+            A GUI-ban a None értéket "? ep" felirattal kezeljük, ami
+            jelzi hogy a checkpoint létezik, de az epizódszám ismeretlen.
         """
         if not pth or not os.path.exists(pth):
             return {}
@@ -692,42 +470,67 @@ class ModelManager:
                 UnsafeCheckpointError,
             )
 
-            # ── BIZTONSÁGI MEGJEGYZÉS ──────────────────────────────────────
-            # allow_unsafe=True itt szándékos és dokumentált.
-            # Indok: a models/ mappa legacy checkpointokat is tartalmazhat
-            # (v4.1 előtti formátum), amelyek weights_only=True-val nem
-            # tölthetők be.  A kinyert adat kizárólag alap Python típus
-            # (int, str) – a state_dict-et NEM használjuk fel.
-            #
-            # Hosszú távú megoldás: futtasd a migrate_checkpoint_to_safe()
-            # segédfüggvényt az összes legacy checkpointra, és utána az
-            # allow_unsafe=True eltávolítható.
-            # ─────────────────────────────────────────────────────────────
-
             try:
-                # Elsőként megpróbáljuk safe módban (v4.2+ checkpointokhoz)
-                ck = safe_load_checkpoint(
-                    pth, map_location="cpu", allow_unsafe=False
-                )
+                ck = safe_load_checkpoint(pth, map_location="cpu", allow_unsafe=False)
             except UnsafeCheckpointError:
-                # Legacy checkpoint: unsafe fallback, explicit és dokumentált
                 logger.info(
                     f"_read_checkpoint_meta: legacy checkpoint detektálva "
-                    f"({os.path.basename(pth)!r}), unsafe betöltés.  "
-                    f"Ajánlott: futtasd a migrate_checkpoint_to_safe()-t."
+                    f"({os.path.basename(pth)!r}), unsafe betöltés."
                 )
-                ck = safe_load_checkpoint(
-                    pth,
-                    map_location="cpu",
-                    allow_unsafe=True,   # INDOK: ld. fenti magyarázat
-                )
+                ck = safe_load_checkpoint(pth, map_location="cpu", allow_unsafe=True)
 
-            if isinstance(ck, dict) and "state_dict" in ck:
+            if not isinstance(ck, dict):
+                return {}
+
+            # ── [BUG-2 FIX] Robusztus episodes kiolvasás ─────────────────
+            # Az eredeti kód csak "state_dict" kulcs esetén futott le.
+            # Most fallback lánccal próbálkozunk.
+
+            # 1. Próbálkozás: v4.2 standard formátum (state_dict + meta)
+            if "state_dict" in ck:
                 return {
                     "episodes":    ck.get("episodes_trained", 0),
                     "state_size":  ck.get("state_size", "?"),
                     "algorithm":   ck.get("algorithm", "PPO"),
                     "num_players": ck.get("num_players"),
+                }
+
+            # 2. Próbálkozás: meta kulcsok közvetlenül a root dict-ben
+            # (pl. ha valaki torch.save({"episodes_trained": N, ...}) hívott
+            # state_dict wrapper nélkül)
+            _EP_KEYS = ("episodes_trained", "episode", "episodes", "total_episodes")
+            for ep_key in _EP_KEYS:
+                if ep_key in ck:
+                    logger.debug(
+                        f"_read_checkpoint_meta: nem-standard formátum, "
+                        f"episodes kulcs: {ep_key!r} ({os.path.basename(pth)})"
+                    )
+                    return {
+                        "episodes":    ck.get(ep_key, 0),
+                        "state_size":  ck.get("state_size", "?"),
+                        "algorithm":   ck.get("algorithm", ck.get("algo", "PPO")),
+                        "num_players": ck.get("num_players", ck.get("n_players")),
+                    }
+
+            # 3. Próbálkozás: a dict tensor értékeket tartalmaz
+            # (= közvetlenül state_dict lett mentve, nem wrapper)
+            # Pl.: torch.save(model.state_dict(), path)
+            import torch
+            has_tensors = any(
+                isinstance(v, torch.Tensor) for v in ck.values()
+            )
+            if has_tensors:
+                logger.debug(
+                    f"_read_checkpoint_meta: raw state_dict formátum "
+                    f"({os.path.basename(pth)}) – epizódszám ismeretlen."
+                )
+                # Epizódszám ismeretlen, de a checkpoint létezik és tele van.
+                # None jelzi, hogy a fájl érvényes, csak a meta hiányzik.
+                return {
+                    "episodes":    None,
+                    "state_size":  "?",
+                    "algorithm":   "PPO",
+                    "num_players": None,
                 }
 
         except Exception as exc:
@@ -739,15 +542,6 @@ class ModelManager:
 
     @staticmethod
     def _guess_players(name: str) -> int:
-        """
-        Játékosszám becslése a modell nevéből.
-
-        Args:
-            name: Modell neve (pl. ``'6max_ppo_v4'``).
-
-        Returns:
-            Becsült játékosszám (2–9), fallback: 6.
-        """
         for n in range(9, 1, -1):
             if f"{n}max" in name or f"{n}p" in name:
                 return n
@@ -755,15 +549,6 @@ class ModelManager:
 
     @staticmethod
     def _read_json(path: str) -> Optional[Dict]:
-        """
-        JSON fájl olvasása.
-
-        Args:
-            path: Fájl elérési útja.
-
-        Returns:
-            Beolvasott dict, vagy ``None`` hiba esetén.
-        """
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -772,13 +557,6 @@ class ModelManager:
 
     @staticmethod
     def _write_json(path: str, data: Any) -> None:
-        """
-        JSON fájl írása, a szülő könyvtár automatikus létrehozásával.
-
-        Args:
-            path: Célfájl elérési útja.
-            data: Serializálható Python objektum.
-        """
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)

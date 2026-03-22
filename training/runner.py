@@ -1,5 +1,5 @@
 """
-training/runner.py  --  Tréning session és menü rendszer (v4.2.2-OPT)
+training/runner.py  --  Trening session és menü rendszer (v4.2.2-OPT)
 
 Változások v4.2.2 (eredeti):
     [ARCH-FIX] global MILESTONE_DIR_ROOT mutáció eltávolítva.
@@ -10,16 +10,16 @@ Változások v4.2.2-OPT (ez a verzió):
                 equity_cache_size), hogy a collector a konfigurált értékeket
                 használja a hardcode-olt 200/50/20_000 helyett.
 
-    [OPT-CLEANUP] collector.close() hívás tréning végén – ThreadPoolExecutor
+    [OPT-CLEANUP] collector.close() hívás trening végén – ThreadPoolExecutor
                   leállítása, erőforrás szivárgás elkerülése.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OPTIMALIZÁCIÓK (v4.2.1-ből megőrizve):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  OPT-5: NUM_ENVS 256→512 – jobb GPU batch kihasználtság
-  OPT-6: BUFFER_COLLECT_SIZE 1024→2048 – hatékonyabb PPO update
-  OPT-7: torch.compile(mode="reduce-overhead") ha elérhető
+  OPT-5: NUM_ENVS 256->512 – jobb GPU batch kihasználtság
+  OPT-6: BUFFER_COLLECT_SIZE 1024->2048 – hatékonyabb PPO update
+  OPT-7: torch.compile(mode="reduce-overhead") ha elerheto
 
 MÉRFÖLDKŐ RENDSZER:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -82,7 +82,7 @@ MILESTONE_DIR_ROOT  = _DEFAULT_CFG.milestone_dir_root  # ← READ-ONLY, ne mutá
 
 def _get_model_info(filename: str) -> str:
     if not os.path.exists(filename):
-        return "[ Üres / Új modell ]"
+        return "[ Ures / Új modell ]"
     try:
         ck = safe_load_checkpoint(filename, map_location="cpu")
         if isinstance(ck, dict) and "episodes_trained" in ck:
@@ -102,18 +102,18 @@ def _get_model_info(filename: str) -> str:
 
 
 def menu_system():
-    """Interaktív CLI menürendszer a tréning indításához."""
+    """Interaktív CLI menürendszer a trening indításához."""
     print("\n" + "=" * 70)
     print("  POKER AI v4  --  PPO + Self-Play (OPTIMIZED)")
     print("=" * 70)
-    print("\n  Játékosszám:")
-    print("    2 = Heads-Up  |  6 = 6-max  |  9 = Full ring  |  A = összes")
+    print("\n  Jatekosszam:")
+    print("    2 = Heads-Up  |  6 = 6-max  |  9 = Full ring  |  A = osszes")
     print(
         f"\n  Env-ek: {NUM_ENVS} | "
         f"Buffer: {BUFFER_COLLECT_SIZE} | PPO epochs: 8"
     )
     print(
-        f"  Mérföldkő: minden {MILESTONE_INTERVAL:,} ep → "
+        f"  Merfoldko: minden {MILESTONE_INTERVAL:,} ep -> "
         f"mentés + auto-teszt"
     )
     print("=" * 70)
@@ -125,24 +125,24 @@ def menu_system():
         if not (2 <= num_players <= 9):
             raise ValueError
     except ValueError:
-        print("  Hibás bemenet → 6 max.")
+        print("  Hibas bemenet -> 6 max.")
         num_players = 6
     default_name = f"{num_players}max_ppo_v4.pth"
     info = _get_model_info(default_name)
-    print(f"\n  Fájl: {default_name}  {info}")
+    print(f"\n  Fajl: {default_name}  {info}")
     custom = input("  Más név? (ENTER = alapértelmezett): ").strip()
     filename = custom if custom else default_name
     if not filename.endswith(".pth"):
         filename += ".pth"
-    print(f"  → {filename}")
+    print(f"  -> {filename}")
     print("=" * 70 + "\n")
     return num_players, filename
 
 
 def _try_compile(model: AdvancedPokerAI, device: torch.device) -> AdvancedPokerAI:
-    """OPT-7: torch.compile ha elérhető (PyTorch 2.0+)."""
+    """OPT-7: torch.compile ha elerheto (PyTorch 2.0+)."""
     if not hasattr(torch, "compile"):
-        logger.info("torch.compile nem elérhető (PyTorch <2.0)")
+        logger.info("torch.compile nem elerheto (PyTorch <2.0)")
         return model
     try:
         compiled = torch.compile(model, mode="reduce-overhead")
@@ -153,7 +153,7 @@ def _try_compile(model: AdvancedPokerAI, device: torch.device) -> AdvancedPokerA
         dummy = torch.randn(1, dummy_state_size, device=device)
         with torch.inference_mode():
             compiled._encode(dummy)
-        logger.info("torch.compile warmup kész")
+        logger.info("torch.compile warmup kesz")
         return compiled
     except Exception as exc:
         logger.warning(
@@ -198,11 +198,11 @@ def _save_checkpoint(
         )
         logger.debug(f"Checkpoint mentve: {filename!r}")
     except Exception as exc:
-        logger.error(f"Checkpoint mentési hiba: {exc}", exc_info=True)
+        logger.error(f"Checkpoint mentesi hiba: {exc}", exc_info=True)
 
 
 def _milestone_str(milestone_episodes: int) -> str:
-    """Mérföldkő string: sub-million → '{N}k', million+ → '{N}M'."""
+    """Merfoldko string: sub-million -> '{N}k', million+ -> '{N}M'."""
     if milestone_episodes < 1_000_000:
         return f"{milestone_episodes // 1_000}k"
     return f"{milestone_episodes // 1_000_000}M"
@@ -223,7 +223,7 @@ def _run_milestone(
     rlcard_obs_size:    int            = 54,
     milestone_hands:    Optional[int]  = None,
 ) -> None:
-    """Mérföldkő: snapshot mentés + automatikus sanity teszt."""
+    """Merfoldko: snapshot mentés + automatikus sanity teszt."""
     ms_str    = _milestone_str(milestone_episodes)
     base_name = os.path.splitext(os.path.basename(filename))[0]
     _hands    = milestone_hands if milestone_hands is not None else MILESTONE_HANDS
@@ -235,7 +235,7 @@ def _run_milestone(
         os.makedirs(milestone_dir, exist_ok=True)
     except OSError as exc:
         logger.error(
-            f"Mérföldkő mappa nem hozható létre "
+            f"Merfoldko mappa nem hozhato letre "
             f"({milestone_dir!r}): {exc}"
         )
         return
@@ -249,8 +249,7 @@ def _run_milestone(
         num_players=num_players, rlcard_obs_size=rlcard_obs_size,
     )
     logger.info(
-        f"🏆 Mérföldkő: {milestone_episodes:,} ep → "
-        f"{milestone_model_path!r}"
+        f"[MILESTONE] {milestone_episodes:,} ep -> {milestone_model_path!r}"
     )
 
     project_root = os.path.dirname(
@@ -275,7 +274,7 @@ def _run_milestone(
     ]
 
     logger.info(
-        f"Teszt indítása (tréning szünetel, max 10 perc):\n"
+        f"Teszt inditasa (trening szunetel, max 10 perc):\n"
         f"  {' '.join(cmd)}"
     )
     _TAIL = 800
@@ -289,29 +288,29 @@ def _run_milestone(
         )
         if result.returncode == 0:
             logger.info(
-                f"✅ {ms_str} teszt kész → eredmények: {milestone_dir!r}"
+                f"[OK] {ms_str} teszt kesz -> eredmények: {milestone_dir!r}"
             )
         else:
-            stdout_tail = result.stdout[-_TAIL:] if result.stdout else "(üres)"
-            stderr_tail = result.stderr[-_TAIL:] if result.stderr else "(üres)"
+            stdout_tail = result.stdout[-_TAIL:] if result.stdout else "(ures)"
+            stderr_tail = result.stderr[-_TAIL:] if result.stderr else "(ures)"
             logger.error(
-                f"❌ {ms_str} teszt hibával zárult "
-                f"(returncode={result.returncode}) – tréning folytatódik\n"
+                f"[FAIL] {ms_str} teszt hibával zarult "
+                f"(returncode={result.returncode}) – trening folytatodik\n"
                 f"  stdout (vége): {stdout_tail}\n"
                 f"  stderr (vége): {stderr_tail}"
             )
     except subprocess.TimeoutExpired:
         logger.error(
-            f"❌ {ms_str} teszt timeout (>10 perc) – tréning folytatódik"
+            f"[FAIL] {ms_str} teszt timeout (>10 perc) – trening folytatodik"
         )
     except Exception as exc:
         logger.error(
-            f"❌ {ms_str} teszt ismeretlen hiba: {exc} – tréning folytatódik"
+            f"[FAIL] {ms_str} teszt ismeretlen hiba: {exc} – trening folytatodik"
         )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fő tréning session
+# Fő trening session
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_training_session(
@@ -320,7 +319,7 @@ def run_training_session(
     episodes_to_run: int,
     cfg:             Optional[TrainingConfig] = None,
 ) -> None:
-    """Egyetlen tréning session futtatása."""
+    """Egyetlen trening session futtatása."""
     if cfg is None:
         cfg = TrainingConfig()
 
@@ -386,7 +385,7 @@ def run_training_session(
     total_time_spent = 0.0
 
     if os.path.exists(filename):
-        logger.info(f"Checkpoint betöltése: {filename!r}")
+        logger.info(f"Checkpoint betoltese: {filename!r}")
         try:
             ck = safe_load_checkpoint(filename, map_location=device)
             if isinstance(ck, dict) and "state_dict" in ck:
@@ -400,7 +399,7 @@ def run_training_session(
                 n_total  = len(model_dict)
                 if n_loaded < n_total:
                     logger.warning(
-                        f"Részleges betöltés: {n_loaded}/{n_total} layer"
+                        f"Reszleges betöltés: {n_loaded}/{n_total} layer"
                     )
                 model_dict.update(pretrained)
                 learner.load_state_dict(model_dict)
@@ -418,10 +417,10 @@ def run_training_session(
                     reward_norm.load_state_dict(ck["reward_norm"])
             else:
                 learner.load_state_dict(ck, strict=False)
-            logger.info(f"Folytatás: {start_episode:,}. epizódtól.")
+            logger.info(f"Folytatas: {start_episode:,}. epizodtol.")
         except Exception as exc:
             logger.error(
-                f"Checkpoint betöltési hiba: {exc}", exc_info=True
+                f"Checkpoint betoltesi hiba: {exc}", exc_info=True
             )
 
     # ── torch.compile ─────────────────────────────────────────────────────
@@ -452,16 +451,16 @@ def run_training_session(
     target_episodes = start_episode + episodes_to_run
     total_collected = start_episode
 
-    # ── Mérföldkő inicializálás ───────────────────────────────────────────
+    # ── Merfoldko inicializálás ───────────────────────────────────────────
     milestone_dir_root = cfg.milestone_dir_root
     last_milestone     = (
         (start_episode // cfg.milestone_interval) * cfg.milestone_interval
     )
 
     logger.info(
-        f"Mérföldkő rendszer: interval={cfg.milestone_interval:,} | "
-        f"következő: {last_milestone + cfg.milestone_interval:,} ep | "
-        f"mentési hely: {milestone_dir_root!r}"
+        f"Merfoldko rendszer: interval={cfg.milestone_interval:,} | "
+        f"kovetkezo: {last_milestone + cfg.milestone_interval:,} ep | "
+        f"mentesi hely: {milestone_dir_root!r}"
     )
 
     session_start = time.time()
@@ -469,7 +468,7 @@ def run_training_session(
 
     logger.info("=" * 70)
     logger.info(
-        f"Tréning indul | {num_players}p | PPO + Self-Play v4 OPTIMIZED"
+        f"Trening indul | {num_players}p | PPO + Self-Play v4 OPTIMIZED"
     )
     logger.info(
         f"Cél: {target_episodes:,} | State: {STATE_SIZE} | "
@@ -480,7 +479,7 @@ def run_training_session(
     )
     logger.info("=" * 70)
 
-    # ── Fő tréning loop ───────────────────────────────────────────────────
+    # ── Fő trening loop ───────────────────────────────────────────────────
     try:
         while total_collected < target_episodes:
             to_collect = min(
@@ -502,13 +501,13 @@ def run_training_session(
             try:
                 all_episodes = collector.collect(to_collect)
             except Exception as exc:
-                logger.error(f"Gyűjtési hiba: {exc}", exc_info=True)
+                logger.error(f"Gyujtesi hiba: {exc}", exc_info=True)
                 continue
 
             # PPO update
             learner.train()
             if not all_episodes:
-                logger.warning("Üres gyűjtési batch")
+                logger.warning("Ures gyujtesi batch")
                 continue
 
             for steps, bb_reward in all_episodes:
@@ -586,7 +585,7 @@ def run_training_session(
                     rlcard_obs_size=rlcard_obs_size,
                 )
 
-                # ── Mérföldkő ellenőrzés ──────────────────────────────
+                # ── Merfoldko ellenőrzés ──────────────────────────────
                 current_milestone = (
                     (total_collected // cfg.milestone_interval)
                     * cfg.milestone_interval
@@ -614,7 +613,7 @@ def run_training_session(
         # A finally blokk garantálja, hogy Ctrl+C vagy kivétel esetén is lefut.
         collector.close()
 
-    # ── Tréning vége ──────────────────────────────────────────────────────
+    # ── Trening vége ──────────────────────────────────────────────────────
     if writer:
         writer.close()
 
@@ -627,5 +626,5 @@ def run_training_session(
         rlcard_obs_size=rlcard_obs_size,
     )
     logger.info(
-        f"KÉSZ  →  {filename!r}  ({target_episodes:,} epizód)"
+        f"KÉSZ  ->  {filename!r}  ({target_episodes:,} epizód)"
     )

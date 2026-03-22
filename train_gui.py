@@ -10,16 +10,15 @@ Használat:
 
 Változások v4.2.2-K5:
     [SECURITY-KRITIKUS-5] _ensure_cli_script() eltávolítva.
-        Korábban a függvény egy 40+ soros Python szkriptet írt a lemezre
-        ha _train_session_cli.py hiányzott. Ez:
-          1. Kód-injekciós felület volt – ha a content string valaha
-             user-controlled adatot kapott volna, RCE lett volna belőle.
-          2. Versenyhelyzetet okozhatott – a fájl felülírható volt
-             párhuzamos kéréssel az /api/start előtt.
-          3. Elrejtette a valódi hibát (a fájl szándékos törlése).
-        Új viselkedés: _validate_cli_script() ellenőrzi a fájl
-        létezését, és informatív SystemExit / HTTP 503 hibát ad,
-        ha hiányzik.
+
+Változások v4.2.2-BUGFIX:
+    [BUG-1] _parse_latest_log(): a glob minta javítva.
+        Volt:   logs/session_*.log
+        Legyen: logs/train_ui_*.log
+        A _handle_start() mindig train_ui_{name}_{ts}.log névvel ment,
+        ezért a poller sosem találta meg a fájlokat → a lenti metrika sáv
+        (EP, ACTOR, CRIT, ENT, ETA) befagyott az utolsó értéken,
+        vagy sosem frissült.
 """
 
 import argparse
@@ -52,11 +51,8 @@ logger = logging.getLogger("TrainGUI")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 mgr      = ModelManager(BASE_DIR)
 
-# ── A CLI wrapper szkript elérési útja – modul-szintű konstans ──────────────
-# Ha ez a fájl hiányzik, a szerver explicit hibával áll le (nem regenerálja).
 _CLI_SCRIPT_PATH: str = os.path.join(BASE_DIR, "_train_session_cli.py")
 
-# ── Futó tréning állapot ─────────────────────────────────────────────────────
 _training_proc       = None
 _training_model      = None
 _training_session_id = None
@@ -64,44 +60,14 @@ _training_lock       = threading.Lock()
 _last_metrics        = {}
 _metrics_lock        = threading.Lock()
 
-# [TASK-6] Opcionalis HTTP Basic Auth.
-# Ha --password flag-gel van elindítva, minden kereshez szükseges az
-# Authorization: Basic <base64(admin:pass)> header.
-# A jelszo SHA-256 hash-kent tarolodik memoriban – nem plaintextkent.
-# Felhasználónév mindig "admin" (egyszemelyes lokalis eszköznel elegendo).
-_auth_hash: str = ""   # ures → nincs auth kovetelment
-_training_err_file   = None   # stderr fájl handle a subprocess-hez
-_training_err_path   = None   # stderr log fájl elérési útja
-_session_log_file    = None   # per-session részletes log handle
-_session_log_path    = None   # per-session log fájl elérési útja
+_auth_hash: str = ""
+_training_err_file   = None
+_training_err_path   = None
+_session_log_file    = None
+_session_log_path    = None
 
 
 def _validate_cli_script() -> None:
-    """
-    Ellenőrzi, hogy a ``_train_session_cli.py`` létezik-e a projekt gyökerében.
-
-    Ez a függvény váltja ki a korábbi ``_ensure_cli_script()``-et.
-    Ahelyett, hogy dinamikusan regenerálná a fájlt (ami kód-injekciós
-    felületet és versenyhelyzetet okozhat), most explicit hibával jelzi,
-    ha a fájl hiányzik.
-
-    A ``_train_session_cli.py`` a kódbázis szerves része – soha nem kell
-    automatikusan generálni.  Ha hiányzik, az operátor feladata visszaállítani
-    (pl. ``git checkout _train_session_cli.py``).
-
-    Returns:
-        None
-
-    Raises:
-        SystemExit: Ha a fájl nem létezik (kilépési kód: 1).
-                    A szerver indításakor hívjuk; ha itt megáll, az
-                    egyértelmű üzenet jelenik meg a konzolon.
-
-    Notes:
-        Az /api/start handler is hívja ezt, és HTTP 503-mal tér vissza
-        (nem SystemExit-tel), hogy a böngészős kliens informatív hibaüzenetet
-        kapjon ahelyett, hogy a szerver váratlanul megállna futás közben.
-    """
     if not os.path.isfile(_CLI_SCRIPT_PATH):
         msg = (
             f"\n{'=' * 70}\n"
@@ -122,53 +88,17 @@ def _validate_cli_script() -> None:
 
 
 def _cli_script_exists() -> bool:
-    """
-    Nem-dobó változat a ``_validate_cli_script()``-nek.
-
-    Használatos az /api/start handler-ben, ahol HTTP 503-at kell
-    visszaadni SystemExit helyett.
-
-    Returns:
-        True ha a CLI script létezik, False ha nem.
-    """
     return os.path.isfile(_CLI_SCRIPT_PATH)
 
 
 def _open_session_log(
-    model_name: str,
-    pth: str,
-    num_players: int,
-    episodes: int,
-    episodes_start: int,
-    session_id: str,
-    config: dict,
-    cmd: list,
-) -> tuple:
-    """
-    Létrehoz egy részletes per-session log fájlt a logs/ mappában.
-
-    Formátum: logs/train_ui_{model_name}_{timestamp}.log
-    Tartalmazza a session metaadatokat fejlécként, utána a subprocess
-    stdout+stderr outputját, végül a session záró adatokat.
-
-    Args:
-        model_name:     A modell neve.
-        pth:            A checkpoint .pth fájl elérési útja.
-        num_players:    Játékosok száma.
-        episodes:       Futtatandó epizódok száma.
-        episodes_start: A session kezdetén lévő epizódszám.
-        session_id:     A session azonosítója.
-        config:         A tréning konfiguráció dict-je.
-        cmd:            A subprocess parancs listája.
-
-    Returns:
-        ``(file_handle, log_path)`` tuple.  ``(None, None)`` hiba esetén.
-    """
+    model_name, pth, num_players, episodes, episodes_start, session_id, config, cmd
+):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = model_name.replace("/", "_").replace("\\", "_")
     log_path = os.path.join(BASE_DIR, "logs", f"train_ui_{safe_name}_{ts}.log")
     try:
-        fh = open(log_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+        fh = open(log_path, "w", encoding="utf-8", buffering=1)
         fh.write("=" * 70 + "\n")
         fh.write("  POKER AI v4  –  Train Session Log\n")
         fh.write("=" * 70 + "\n")
@@ -196,23 +126,7 @@ def _open_session_log(
         return None, None
 
 
-def _close_session_log(
-    fh,
-    log_path: str,
-    exit_code=None,
-    episodes_end: int = None,
-    completed: bool = False,
-) -> None:
-    """
-    Lezárja a session log fájlt összefoglaló sorral.
-
-    Args:
-        fh:           Nyitott file handle (vagy None ha nem nyílt meg).
-        log_path:     A log fájl elérési útja (csak logoláshoz).
-        exit_code:    A subprocess kilépési kódja (opcionális).
-        episodes_end: A session végén lévő epizódszám (opcionális).
-        completed:    True ha sikeresen befejezve.
-    """
+def _close_session_log(fh, log_path, exit_code=None, episodes_end=None, completed=False):
     if fh is None:
         return
     try:
@@ -233,12 +147,6 @@ def _close_session_log(
 
 
 def _read_training_error() -> str:
-    """
-    Visszaadja a tréning subprocess stderr log utolsó 20 sorát (ha van).
-
-    Returns:
-        Az utolsó 20 sor mint string, vagy üres string ha a log nem elérhető.
-    """
     try:
         if _training_err_path and os.path.exists(_training_err_path):
             with open(_training_err_path, "r", encoding="utf-8", errors="replace") as f:
@@ -253,15 +161,17 @@ def _parse_latest_log() -> dict:
     """
     Kiolvassa a legfrissebb log fájlból az aktuális tréning metrikákat.
 
-    Returns:
-        Dict a jelenlegi epizódszámmal, ETA-val, actor/critic loss-szal stb.
-        Üres dict ha nincs log vagy nem értelmezhető az adat.
+    [BUG-1 FIX] A glob minta javítva: session_*.log → train_ui_*.log.
+    A _handle_start() mindig train_ui_{name}_{ts}.log névvel ment a logs/
+    mappába, ezért a régi session_*.log minta sosem talált semmit.
     """
     log_dir = os.path.join(BASE_DIR, "logs")
     if not os.path.isdir(log_dir):
         return {}
     import glob as _g
-    logs = sorted(_g.glob(os.path.join(log_dir, "session_*.log")))
+
+    # [BUG-1 FIX] Helyes minta: train_ui_*.log (nem session_*.log)
+    logs = sorted(_g.glob(os.path.join(log_dir, "train_ui_*.log")))
     if not logs:
         return {}
     try:
@@ -270,8 +180,6 @@ def _parse_latest_log() -> dict:
         for line in reversed(lines[-80:]):
             if "Ep " in line and "Actor" in line:
                 m = {}
-                # A logging formátum: "TIMESTAMP [LEVEL] MESSAGE"
-                # A "] " token után következik a tényleges log üzenet.
                 raw_msg = line.split("] ", 1)[-1] if "] " in line else line
                 for part in raw_msg.split("|"):
                     part = part.strip()
@@ -316,10 +224,6 @@ def _parse_latest_log() -> dict:
 
 
 def _metrics_poller() -> None:
-    """
-    Háttér szál: folyamatosan olvassa a log fájlt és frissíti a metrikákat.
-    Daemon thread – a szerver leállásakor automatikusan megáll.
-    """
     while True:
         with _metrics_lock:
             _last_metrics.update(_parse_latest_log())
@@ -327,28 +231,13 @@ def _metrics_poller() -> None:
 
 
 class GUIHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP kéréskezelő a tréning manager GUI-hoz."""
 
-    def log_message(self, format: str, *args) -> None:  # type: ignore[override]
+    def log_message(self, format, *args):
         logger.debug("HTTP %s", args[0] if args else "")
 
-    # ── [TASK-6] HTTP Basic Auth ──────────────────────────────────────────────
-
     def _check_auth(self) -> bool:
-        """
-        Ellenorzi a HTTP Basic Auth credentialokat ha _auth_hash be van allitva.
-
-        Visszater:
-            True  – nincs auth kovetelment VAGY helyes credential
-            False – helytelen credential (a metodus mar elküldte a 401 valaszt)
-
-        Hasznalat a handler metodusok elejen:
-            if not self._check_auth():
-                return
-        """
         if not _auth_hash:
-            return True   # auth ki van kapcsolva
-
+            return True
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Basic "):
             try:
@@ -358,17 +247,14 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                 if given_hash == _auth_hash:
                     return True
             except Exception:
-                pass  # malformed header → 401
-
-        # Helytelen vagy hianyzó credential
+                pass
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="Poker AI Training Manager"')
         self.send_header("Content-Length", "0")
         self.end_headers()
         return False
 
-    def _send_json(self, data: dict, status: int = 200) -> None:
-        """JSON válasz küldése UTF-8 kódolással."""
+    def _send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -377,8 +263,7 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_html(self, filepath: str) -> None:
-        """HTML fájl küldése."""
+    def _send_html(self, filepath):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read().encode("utf-8")
@@ -390,8 +275,7 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
         except FileNotFoundError:
             self.send_error(404)
 
-    def _read_body(self) -> dict:
-        """Request body olvasása és JSON parse."""
+    def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
         if length > 0:
             try:
@@ -400,17 +284,15 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                 return {}
         return {}
 
-    def do_OPTIONS(self) -> None:  # type: ignore[override]
-        """CORS preflight kezelés."""
+    def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    def do_GET(self) -> None:  # type: ignore[override]
-        """GET kérések kezelése."""
-        if not self._check_auth():   # [TASK-6]
+    def do_GET(self):
+        if not self._check_auth():
             return
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
@@ -428,11 +310,6 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/presets":
             self._send_json(STYLE_PRESETS)
         elif path == "/api/status":
-            # P1-1 FIX + TASK-1: az összes _training_* globálist ÉS a
-            # _last_metrics-t egyszerre olvassuk, egyetlen atomikus snapshot-ban.
-            # A _metrics_lock-ot a _training_lock blokkon BELÜL szerezzük meg,
-            # hogy a running + metrics snapshot soha ne tartozzon két különböző
-            # időpillanathoz (pl. a tréning épp leállt a két lock között).
             with _training_lock:
                 if _training_proc is not None:
                     running = _training_proc.poll() is None
@@ -440,10 +317,9 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                     running = False
                 snap_model      = _training_model
                 snap_session_id = _training_session_id
-                with _metrics_lock:          # ← nested: atomikus snapshot
+                with _metrics_lock:
                     metrics = dict(_last_metrics)
             err_msg = "" if running else _read_training_error()
-            # [K5 FIX] CLI script állapot visszajelzése a frontend számára
             cli_ok = _cli_script_exists()
             self._send_json({
                 "running":     running,
@@ -456,9 +332,8 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def do_POST(self) -> None:  # type: ignore[override]
-        """POST kérések kezelése."""
-        if not self._check_auth():   # [TASK-6]
+    def do_POST(self):
+        if not self._check_auth():
             return
         global _training_proc, _training_model, _training_session_id
         path = urlparse(self.path).path
@@ -530,24 +405,11 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
             logger.error(f"API hiba ({path}): {e}\n{traceback.format_exc()}")
             self._send_json({"error": str(e)}, 500)
 
-    # ── POST handler segédfüggvények ─────────────────────────────────────────
-
-    def _handle_start(self, body: dict) -> None:
-        """
-        ``/api/start`` végpont: tréning indítása.
-
-        [K5 FIX] Ahelyett, hogy _ensure_cli_script()-et hívnánk (ami
-        dinamikusan generálta a CLI wrapper-t lemezre), most ellenőrizzük,
-        hogy a fájl létezik-e, és 503-as hibával térünk vissza ha nem.
-
-        Args:
-            body: A klienstől érkező JSON body dict.
-        """
+    def _handle_start(self, body):
         global _training_proc, _training_model, _training_session_id
         global _training_err_file, _training_err_path
         global _session_log_file, _session_log_path
 
-        # ── [K5 FIX] CLI script ellenőrzés – 503 ha hiányzik ─────────────
         if not _cli_script_exists():
             error_msg = (
                 f"_train_session_cli.py nem található itt: "
@@ -607,7 +469,6 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
 
         os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
 
-        # Per-session részletes log megnyitása
         if _session_log_file is not None:
             try:
                 _session_log_file.close()
@@ -618,7 +479,6 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
             episodes_start, session_id, config, cmd,
         )
 
-        # training_err.log visszafelé kompatibilitásból megtartva
         err_path = os.path.join(BASE_DIR, "logs", "training_err.log")
         if _training_err_file is not None:
             try:
@@ -658,20 +518,12 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
             "session_log":   _session_log_path,
         })
 
-    def _handle_stop(self) -> None:
-        """
-        ``/api/stop`` végpont: futó tréning leállítása.
-
-        Process group kill-t alkalmaz (start_new_session=True esetén),
-        hogy a milestone tesztek subprocess-ei is leálljanak.
-        """
+    def _handle_stop(self):
         global _training_proc, _training_model, _training_session_id
         global _session_log_file, _session_log_path
 
         with _training_lock:
             if _training_proc is not None and _training_proc.poll() is None:
-                # P1-3 FIX: Process group kill – a milestone teszt subprocess-t
-                # is leöli, nem csak a CLI wrapper-t.
                 try:
                     import os as _os
                     import signal as _sig
@@ -716,33 +568,18 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    """
-    Szerver indítása.
-
-    [K5 FIX] A startup validáció most ``_validate_cli_script()``-et hív,
-    amely egyértelmű hibaüzenettel (SystemExit) áll le ha a CLI wrapper
-    hiányzik – ahelyett, hogy regenerálná azt.
-    """
     parser = argparse.ArgumentParser(
         description="Poker AI v4 Training Manager v2"
     )
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument(
-        "--password", type=str, default="",
-        help=(
-            "Opcionalis HTTP Basic Auth jelszo. Ha meg van adva, minden "
-            "bongeszos keres megkoveteli az 'admin:<jelszo>' credentialt. "
-            "Ajanlott RunPod / publikus port hasznalatanal."
-        ),
-    )
+    parser.add_argument("--password", type=str, default="")
     args = parser.parse_args()
 
-    # [TASK-6] Auth hash beallitasa ha --password meg van adva
     global _auth_hash
     if args.password:
         _auth_hash = hashlib.sha256(args.password.encode()).hexdigest()
-        print(f"  Auth: HTTP Basic Auth BEKAPCSOLVA (felhasznalonev: admin)")
+        print(f"  Auth: HTTP Basic Auth BEKAPCSOLVA (felhasználónév: admin)")
     else:
         _auth_hash = ""
 
@@ -751,11 +588,8 @@ def main() -> None:
         print(f"⚠ Hiányzik: train_gui.html")
         return
 
-    # [K5 FIX] CLI script validáció indításkor – SystemExit ha hiányzik.
-    # Ez váltja ki a korábbi _ensure_cli_script() automatikus generálást.
     _validate_cli_script()
 
-    # Háttér metrika poller szál indítása
     t = threading.Thread(target=_metrics_poller, daemon=True)
     t.start()
 
@@ -783,7 +617,6 @@ def main() -> None:
         print("\n  Leállítva.")
         with _training_lock:
             if _training_proc and _training_proc.poll() is None:
-                # P1-4 FIX: terminate() + wait() párban – zombie process megelőzése.
                 try:
                     import os as _os
                     import signal as _sig
