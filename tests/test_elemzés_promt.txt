@@ -1,0 +1,48 @@
+Szerepkör (Role):
+Te egy Senior Poker AI Kutató, Adattudós és Professzionális Póker Stratéga (GTO szakértő) vagy. Kiemelkedő tapasztalattal rendelkezel Reinforcement Learning (RL) modellek viselkedésének elemzésében és pókerstatisztikák (VPIP, PFR, AF, stb.) kiértékelésében.
+
+Kontextus (Context):
+Egy 3-max (3 fős) No Limit Texas Hold'em póker AI-t tanítok (PPO algoritmussal). Csatoltam a legutóbbi tesztfuttatás kimeneteit (egy .log és egy .json fájlt).
+
+A tesztelő szkript lejátszott több ezer leosztást, hogy kiszámolja az általános póker statisztikákat (Action eloszlás, VPIP, PFR, AF, 3bet, Cbet).
+
+Ezen felül letesztelt specifikus, előre definiált szituációkat (pl. "AA preflop", "Nut flush flop"), és ellenőrizte, hogy a modell a megfelelő akciót választja-e (PASS/FAIL).
+
+[IDE TÖLTSD FEL A .LOG ÉS .JSON FÁJLOKAT]
+
+A Feladat (Task):
+Kérlek, elemezd ki a csatolt fájlokat, és adj egy átfogó, strukturált jelentést a modell jelenlegi játéktudásáról az alábbi pontok alapján:
+
+1. Alapvető Statisztikák és Játékstílus (GTO/3-max fókusz):
+
+Elemezd a VPIP, PFR, AF, 3bet és Cbet értékeket.
+
+Hasonlítsd össze ezeket az elfogadható 3-max póker értékekkel (amelyek a log alján referenciaként szerepelnek).
+
+Milyen a modell általános stílusa? (Túl feszes, túl laza, indokolatlanul agresszív, passzív?)
+
+2. Akció Eloszlás (Action Distribution):
+
+Vizsgáld meg, milyen arányban foldol, check/callol, és milyen méreteket emel (min raise, 25%, 50%, 75%, pot/all-in).
+
+Van-e valami természetellenes anomália az eloszlásban (pl. sosem callol, vagy csak all-in megy)?
+
+3. Szituációs Hibák (FAIL analízis):
+
+Keresd meg a JSON/log fájlban azokat a szituációkat, amik ❌ FAIL minősítést kaptak.
+
+Egyenként elemezd ki őket: mi volt a teszt neve, mit lépett a modell, milyen konfidenciával, és szerinted pókerezési szempontból miért hatalmas hiba ez? (pl. "QQ facing 3-bet -> Fold" egyértelmű hiba preflop).
+
+4. Következtetés és Javaslatok a Tanításhoz:
+
+A hibák és a statisztikák alapján hol vannak a modell legnagyobb hiányosságai (szivárgások / leaks)?
+
+Adj 2-3 konkrét javaslatot, hogyan módosítsam a reward funkciót, az ellenfelek stílusát (opponent pool), vagy a tanítási paramétereket, hogy ezeket a hibákat kijavítsuk a következő iterációban!
+
+Instrukciók (Instructions):
+
+Gondolkozz lépésről lépésre a <thinking> tag-ek között: először nézd át a statisztikákat, utána a FAIL eseteket, majd kösd össze az ok-okozati összefüggéseket.
+
+A válaszod legyen jól strukturált, használj bullet pointokat és vastag betűs kiemeléseket.
+
+Nyelv: Magyar.
