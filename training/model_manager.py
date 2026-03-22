@@ -140,8 +140,34 @@ class ModelManager:
         return os.path.join(self._models_dir, name)
 
     def pth_path(self, name: str, filename: str = None) -> str:
+        """
+        Visszaadja a modell .pth fájljának elérési útját.
+
+        Ha filename nincs megadva:
+          1. Megnézi a models/{name}/ mappát – ha van benne .pth fájl,
+             azt adja vissza (migrált vagy régi névkonvenciójú modelleknél
+             ez megakadályozza a névduplázódást, pl. name_ppo_v4_ppo_v4.pth).
+          2. Ha nincs .pth fájl, az alapértelmezett {name}_ppo_v4.pth nevet
+             generálja (új modell esetén).
+
+        BUGFIX: korábban mindig {name}_ppo_v4.pth-t adott vissza, ami
+        migrált modelleknél eltért a tényleges fájlnévtől → az
+        os.path.exists() False lett → episodes_trained=0 → 0-ról indult.
+        """
         if filename is None:
+            model_dir = self.model_dir(name)
+            if os.path.isdir(model_dir):
+                existing = sorted(glob.glob(os.path.join(model_dir, "*.pth")))
+                if existing:
+                    found = existing[0]
+                    logger.debug(
+                        f"pth_path({name!r}): meglévő fájl → {os.path.basename(found)}"
+                    )
+                    return found
             filename = f"{name}_ppo_v4.pth"
+            logger.debug(
+                f"pth_path({name!r}): nincs .pth a mappában → új: {filename}"
+            )
         return os.path.join(self.model_dir(name), filename)
 
     def config_path(self, name: str) -> str:

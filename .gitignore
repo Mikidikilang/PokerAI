@@ -4,6 +4,7 @@ logs/
 runs/
 screenshots/
 ModellNaplo/
+models/
 
 # SQLite ellenfél adatbázis
 players.db

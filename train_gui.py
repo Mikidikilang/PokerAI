@@ -20,6 +20,7 @@ import threading
 import time
 import traceback
 import webbrowser
+from datetime import datetime
 from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,74 @@ _last_metrics        = {}
 _metrics_lock        = threading.Lock()
 _training_err_file   = None   # stderr fájl handle a subprocess-hez
 _training_err_path   = None   # stderr log fájl elérési útja
+_session_log_file    = None   # per-session részletes log handle
+_session_log_path    = None   # per-session log fájl elérési útja
+
+
+def _open_session_log(model_name: str, pth: str, num_players: int,
+                      episodes: int, episodes_start: int,
+                      session_id: str, config: dict, cmd: list) -> tuple:
+    """
+    Létrehoz egy részletes per-session log fájlt a logs/ mappában.
+
+    Formátum: logs/train_ui_{model_name}_{timestamp}.log
+    Tartalmazza a session metaadatokat fejlécként, utána a subprocess
+    stdout+stderr outputját, végül a session záró adatokat.
+
+    Visszatér: (file_handle, log_path)
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = model_name.replace("/", "_").replace("\\", "_")
+    log_path = os.path.join(BASE_DIR, "logs", f"train_ui_{safe_name}_{ts}.log")
+    try:
+        fh = open(log_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+        fh.write("=" * 70 + "\n")
+        fh.write("  POKER AI v4  –  Train Session Log\n")
+        fh.write("=" * 70 + "\n")
+        fh.write(f"  Dátum/idő      : {datetime.now().isoformat()}\n")
+        fh.write(f"  Modell neve    : {model_name}\n")
+        fh.write(f"  PthPath        : {pth}\n")
+        fh.write(f"  PthLétezik     : {os.path.exists(pth)}\n")
+        fh.write(f"  Játékosok      : {num_players}\n")
+        fh.write(f"  Futtatandó ep. : {episodes:,}\n")
+        fh.write(f"  Kezdő ep.      : {episodes_start:,}\n")
+        fh.write(f"  Cél ep.        : {episodes_start + episodes:,}\n")
+        fh.write(f"  Session ID     : {session_id}\n")
+        fh.write(f"  Config         :\n")
+        for line in json.dumps(config, indent=4, ensure_ascii=False,
+                               default=str).splitlines():
+            fh.write(f"    {line}\n")
+        fh.write(f"  Subprocess cmd :\n    {' '.join(cmd)}\n")
+        fh.write("=" * 70 + "\n")
+        fh.write("  SUBPROCESS KIMENET (stdout + stderr):\n")
+        fh.write("=" * 70 + "\n\n")
+        fh.flush()
+        return fh, log_path
+    except Exception as e:
+        logger.warning(f"Session log fájl nem hozható létre ({log_path}): {e}")
+        return None, None
+
+
+def _close_session_log(fh, log_path: str, exit_code=None,
+                       episodes_end: int = None, completed: bool = False):
+    """Lezárja a session log fájlt összefoglaló sorral."""
+    if fh is None:
+        return
+    try:
+        fh.write("\n" + "=" * 70 + "\n")
+        fh.write("  SESSION VÉGE\n")
+        fh.write(f"  Időpont     : {datetime.now().isoformat()}\n")
+        if exit_code is not None:
+            fh.write(f"  Kilépési kód: {exit_code}\n")
+        if episodes_end is not None:
+            fh.write(f"  Ep. vége    : {episodes_end:,}\n")
+        fh.write(f"  Completed   : {completed}\n")
+        fh.write("=" * 70 + "\n")
+        fh.flush()
+        fh.close()
+        logger.info(f"Session log lezárva: {log_path}")
+    except Exception as e:
+        logger.debug(f"Session log lezárási hiba: {e}")
 
 
 def _read_training_error() -> str:
@@ -325,6 +394,7 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
 
             elif path == "/api/start":
                 global _training_err_file, _training_err_path
+                global _session_log_file, _session_log_path
                 model_name  = body.get("model_name", "")
                 num_players = int(body.get("num_players", 6))
                 episodes    = int(body.get("episodes", 100_000))
@@ -339,14 +409,25 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                 pth = mgr.pth_path(model_name)
 
                 episodes_start = 0
-                if os.path.exists(pth):
+                pth_exists = os.path.exists(pth)
+                if pth_exists:
                     try:
                         from utils.checkpoint_utils import safe_load_checkpoint
                         ck = safe_load_checkpoint(pth, map_location="cpu")
                         if isinstance(ck, dict):
                             episodes_start = ck.get("episodes_trained", 0)
-                    except Exception:
-                        pass
+                    except Exception as ck_exc:
+                        logger.warning(f"Checkpoint olvasási hiba ({pth}): {ck_exc}")
+                else:
+                    logger.info(
+                        f"Checkpoint nem található ({pth}) → új modell, 0-ról indul"
+                    )
+
+                logger.info(
+                    f"/api/start | modell={model_name!r} | pth={pth} | "
+                    f"pth_létezik={pth_exists} | episodes_start={episodes_start:,} | "
+                    f"futtatandó={episodes:,} | cél={episodes_start + episodes:,}"
+                )
 
                 session_id = mgr.start_session(model_name, config, episodes_start, num_players)
 
@@ -355,12 +436,20 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                        "--players", str(num_players), "--episodes", str(episodes),
                        "--config-json", json.dumps(config), "--session-id", session_id]
 
-                # [FIX P1-2] stderr fájlba irányítva, nem DEVNULL.
-                # Crash esetén a hibaszöveg a /api/status "last_error" mezőjén
-                # keresztül kiolvasható a GUI-ban is.
                 os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
+
+                # Per-session részletes log (stdout + stderr a subprocesstől)
+                if _session_log_file is not None:
+                    try: _session_log_file.close()
+                    except Exception: pass
+                _session_log_file, _session_log_path = _open_session_log(
+                    model_name, pth, num_players, episodes,
+                    episodes_start, session_id, config, cmd
+                )
+
+                # training_err.log megtartjuk visszafelé kompatibilitásból
+                # (a session log fájl tartalmazza az stderr-t is)
                 err_path = os.path.join(BASE_DIR, "logs", "training_err.log")
-                # Előző handle lezárása ha maradt nyitva
                 if _training_err_file is not None:
                     try: _training_err_file.close()
                     except Exception: pass
@@ -368,32 +457,39 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                 _training_err_path = err_path
 
                 with _training_lock:
-                    # [FIX P1-3] start_new_session=True: új process group-ba kerül
-                    # a subprocess, így stop-kor az egész fa (beleértve a milestone
-                    # teszt subprocesszt is) egy os.killpg() hívással leölhető –
-                    # nem marad orphan/zombie a GPU-n.
                     _training_proc = subprocess.Popen(
                         cmd, cwd=BASE_DIR,
-                        stdout=subprocess.DEVNULL,
-                        stderr=_training_err_file,
-                        start_new_session=True,   # ← új process group
+                        stdout=_session_log_file if _session_log_file else subprocess.DEVNULL,
+                        stderr=_session_log_file if _session_log_file else _training_err_file,
+                        start_new_session=True,
                     )
                     _training_model      = model_name
                     _training_session_id = session_id
+
+                logger.info(
+                    f"Subprocess elindítva | PID={_training_proc.pid} | "
+                    f"session_id={session_id} | log={_session_log_path}"
+                )
 
                 cfg_data = mgr.load_config(model_name)
                 cfg_data["num_players"] = num_players
                 cfg_data["config"]      = config
                 mgr.save_config(model_name, cfg_data)
 
-                self._send_json({"ok": True, "pid": _training_proc.pid, "session_id": session_id})
+                self._send_json({
+                    "ok": True,
+                    "pid": _training_proc.pid,
+                    "session_id": session_id,
+                    "pth_path": pth,
+                    "episodes_start": episodes_start,
+                    "session_log": _session_log_path,
+                })
 
             elif path == "/api/stop":
                 with _training_lock:
                     if _training_proc is not None and _training_proc.poll() is None:
                         # [FIX P1-3] Process group kill: a milestone teszt
                         # subprocess-t is leöli, nem csak a CLI wrapper-t.
-                        # Unix-on os.killpg()-vel, Windows-on fallback terminate().
                         try:
                             import os as _os, signal as _sig
                             _os.killpg(_os.getpgid(_training_proc.pid), _sig.SIGTERM)
@@ -408,11 +504,12 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                             except (AttributeError, ProcessLookupError, OSError):
                                 _training_proc.kill()
                             _training_proc.wait()
+                        exit_code = _training_proc.returncode
+                        ep_end = 0
                         if _training_model and _training_session_id:
                             try:
                                 from utils.checkpoint_utils import safe_load_checkpoint
                                 pth = mgr.pth_path(_training_model)
-                                ep_end = 0
                                 if os.path.exists(pth):
                                     ck = safe_load_checkpoint(pth, map_location="cpu")
                                     if isinstance(ck, dict):
@@ -421,6 +518,10 @@ class GUIHandler(http.server.BaseHTTPRequestHandler):
                                                ep_end, {}, completed=False)
                             except Exception as e:
                                 logger.warning(f"Session lezárás hiba: {e}")
+                        _close_session_log(
+                            _session_log_file, _session_log_path,
+                            exit_code=exit_code, episodes_end=ep_end, completed=False
+                        )
                         _training_proc = _training_model = _training_session_id = None
                 self._send_json({"ok": True})
 
