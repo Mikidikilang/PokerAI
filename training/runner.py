@@ -1,17 +1,17 @@
 """
-training/runner.py  --  Tréning session és menü rendszer (v4.2.2)
+training/runner.py  --  Tréning session és menü rendszer (v4.2.2-OPT)
 
-Változások v4.2.2:
-    [ARCH-FIX] global MILESTONE_DIR_ROOT mutáció eltávolítva:
-        - _run_milestone() mostantól explicit `milestone_dir_root`
-          paramétert kap, nem a modul-szintű globálist olvassa.
-        - A `global MILESTONE_DIR_ROOT` sor eltávolítva
-          run_training_session()-ból.
-        - A modul-szintű MILESTONE_DIR_ROOT konstans megmarad
-          visszafelé kompatibilis default értékként – de már nem
-          mutálódik futásidőben.
-        - Ha két session párhuzamosan fut (különböző num_players),
-          a mérföldkő útvonalak mostantól izoláltak.
+Változások v4.2.2 (eredeti):
+    [ARCH-FIX] global MILESTONE_DIR_ROOT mutáció eltávolítva.
+
+Változások v4.2.2-OPT (ez a verzió):
+    [OPT-1/2/3] BatchedSyncCollector példányosításakor átadja a cfg-ből
+                az equity paramétereket (equity_n_sim, equity_min_sims,
+                equity_cache_size), hogy a collector a konfigurált értékeket
+                használja a hardcode-olt 200/50/20_000 helyett.
+
+    [OPT-CLEANUP] collector.close() hívás tréning végén – ThreadPoolExecutor
+                  leállítása, erőforrás szivárgás elkerülése.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OPTIMALIZÁCIÓK (v4.2.1-ből megőrizve):
@@ -66,10 +66,6 @@ except ImportError:
     _TB = False
 
 # ── Konfiguráció – modul-szintű defaults ─────────────────────────────────────
-# FONTOS: ezek CSAK visszafelé kompatibilis default értékek.
-# A tényleges értékek a cfg (TrainingConfig) objektumból jönnek.
-# A MILESTONE_DIR_ROOT mostantól NEM mutálódik futásidőben –
-# a _run_milestone() explicit paramétert kap helyette.
 _DEFAULT_CFG        = TrainingConfig()
 NUM_ENVS            = _DEFAULT_CFG.num_envs
 BUFFER_COLLECT_SIZE = _DEFAULT_CFG.buffer_collect_size
@@ -85,15 +81,6 @@ MILESTONE_DIR_ROOT  = _DEFAULT_CFG.milestone_dir_root  # ← READ-ONLY, ne mutá
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_model_info(filename: str) -> str:
-    """
-    Checkpoint metaadatok megjelenítése a menürendszerhez.
-
-    Args:
-        filename: .pth fájl elérési útja.
-
-    Returns:
-        Rövid leírás string (epizódszám, algoritmus, state méret).
-    """
     if not os.path.exists(filename):
         return "[ Üres / Új modell ]"
     try:
@@ -153,17 +140,7 @@ def menu_system():
 
 
 def _try_compile(model: AdvancedPokerAI, device: torch.device) -> AdvancedPokerAI:
-    """
-    OPT-7: torch.compile ha elérhető (PyTorch 2.0+).
-    Fallback: eredeti modell ha compile nem megy.
-
-    Args:
-        model:  A lefordítandó modell.
-        device: A torch device (GPU/CPU).
-
-    Returns:
-        Kompilált modell, vagy az eredeti ha a compile sikertelen.
-    """
+    """OPT-7: torch.compile ha elérhető (PyTorch 2.0+)."""
     if not hasattr(torch, "compile"):
         logger.info("torch.compile nem elérhető (PyTorch <2.0)")
         return model
@@ -197,21 +174,7 @@ def _save_checkpoint(
     num_players:     int   = 2,
     rlcard_obs_size: int   = 54,
 ) -> None:
-    """
-    Checkpoint mentése.  Kezeli a torch.compile _orig_mod prefixet.
-
-    Args:
-        filename:        Cél .pth fájl elérési útja.
-        model:           A mentendő modell.
-        trainer:         A PPO trainer (optimizer/scheduler állapot).
-        reward_norm:     RunningMeanStd állapot.
-        episodes:        Eddig feldolgozott epizódok száma.
-        time_spent:      Összes eltöltött tréning idő másodpercben.
-        state_size:      State vektor mérete.
-        action_size:     Absztrakt akciók száma.
-        num_players:     Játékosok száma (GRU step_dim-hez).
-        rlcard_obs_size: rlcard obs tömb mérete.
-    """
+    """Checkpoint mentése. Kezeli a torch.compile _orig_mod prefixet."""
     try:
         if hasattr(model, "_orig_mod"):
             sd = model._orig_mod.state_dict()
@@ -239,21 +202,7 @@ def _save_checkpoint(
 
 
 def _milestone_str(milestone_episodes: int) -> str:
-    """
-    Mérföldkő string generálása.
-
-    1_000_000 alatt: ``'{N}k'`` (pl. ``'500k'``, ``'1500k'``)
-    1_000_000 felett: ``'{N}M'`` (pl. ``'2M'``, ``'4M'``)
-
-    [COLAB MOD v1] Fix: sub-million intervallumoknál (pl. 500_000)
-    az eredeti ``// 1_000_000`` mindig ``'0M'``-et adott.
-
-    Args:
-        milestone_episodes: Mérföldkő epizódszám.
-
-    Returns:
-        Ember-olvasható mérföldkő string.
-    """
+    """Mérföldkő string: sub-million → '{N}k', million+ → '{N}M'."""
     if milestone_episodes < 1_000_000:
         return f"{milestone_episodes // 1_000}k"
     return f"{milestone_episodes // 1_000_000}M"
@@ -270,50 +219,15 @@ def _run_milestone(
     action_size:        int,
     num_players:        int,
     milestone_episodes: int,
-    milestone_dir_root: str,                  # [ARCH-FIX] explicit paraméter
+    milestone_dir_root: str,
     rlcard_obs_size:    int            = 54,
     milestone_hands:    Optional[int]  = None,
 ) -> None:
-    """
-    Mérföldkő elérése: snapshoot mentés + automatikus sanity teszt.
-
-    A tréning a teszt végéig szünetel (max 10 perc timeout).
-    Ha a teszt túllépi a timeoutot, a tréning továbblép.
-
-    [ARCH-FIX v4.2.2] A mérföldkő mentési útvonal mostantól az
-    explicit ``milestone_dir_root`` paraméterből jön, NEM a modul-szintű
-    ``MILESTONE_DIR_ROOT`` globálisból.  Ez eliminálja a race condition-t
-    ha két tréning session párhuzamosan fut különböző konfigurációkkal.
-
-    Mappa struktúra:
-        {milestone_dir_root}/
-        └── {base_name}_{ms_str}/
-            ├── {base_name}_{ms_str}.pth
-            ├── test_...log
-            └── test_...json
-
-    Args:
-        filename:           Az aktuális checkpoint .pth fájl útja
-                            (base name kinyeréséhez).
-        model:              A mentendő modell.
-        trainer:            PPO trainer állapot.
-        reward_norm:        RunningMeanStd állapot.
-        episodes:           Aktuális epizódszám.
-        time_spent:         Eltelt tréning idő másodpercben.
-        state_size:         State vektor mérete.
-        action_size:        Absztrakt akciók száma.
-        num_players:        Játékosok száma.
-        milestone_episodes: A mérföldkő epizódszám (pl. 2_000_000).
-        milestone_dir_root: Mérföldkő mentések gyökérmappája.
-                            [ARCH-FIX] Explicit paraméter – nem globális!
-        rlcard_obs_size:    rlcard obs tömb mérete (default: 54).
-        milestone_hands:    Teszt kézszám (None → MILESTONE_HANDS default).
-    """
+    """Mérföldkő: snapshot mentés + automatikus sanity teszt."""
     ms_str    = _milestone_str(milestone_episodes)
     base_name = os.path.splitext(os.path.basename(filename))[0]
     _hands    = milestone_hands if milestone_hands is not None else MILESTONE_HANDS
 
-    # Mappa létrehozása
     milestone_dir = os.path.join(
         milestone_dir_root, f"{base_name}_{ms_str}"
     )
@@ -326,7 +240,6 @@ def _run_milestone(
         )
         return
 
-    # Modell snapshot mentése
     milestone_model_path = os.path.join(
         milestone_dir, f"{base_name}_{ms_str}.pth"
     )
@@ -340,7 +253,6 @@ def _run_milestone(
         f"{milestone_model_path!r}"
     )
 
-    # test_model_sanity.py elérési útja (projekt gyökérben)
     project_root = os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))
     )
@@ -350,8 +262,7 @@ def _run_milestone(
 
     if not os.path.exists(test_script):
         logger.warning(
-            f"Teszt script nem található: {test_script!r} – "
-            f"teszt kihagyva"
+            f"Teszt script nem található: {test_script!r} – teszt kihagyva"
         )
         return
 
@@ -395,8 +306,7 @@ def _run_milestone(
         )
     except Exception as exc:
         logger.error(
-            f"❌ {ms_str} teszt ismeretlen hiba: {exc} – "
-            f"tréning folytatódik"
+            f"❌ {ms_str} teszt ismeretlen hiba: {exc} – tréning folytatódik"
         )
 
 
@@ -410,15 +320,7 @@ def run_training_session(
     episodes_to_run: int,
     cfg:             Optional[TrainingConfig] = None,
 ) -> None:
-    """
-    Egyetlen tréning session futtatása.
-
-    Args:
-        num_players:     Játékosok száma (2–9).
-        filename:        Checkpoint .pth fájl elérési útja.
-        episodes_to_run: Futtatandó epizódok száma.
-        cfg:             TrainingConfig (None → alapértelmezett).
-    """
+    """Egyetlen tréning session futtatása."""
     if cfg is None:
         cfg = TrainingConfig()
 
@@ -510,8 +412,7 @@ def run_training_session(
                     except Exception as trainer_exc:
                         logger.warning(
                             f"Trainer state nem töltve "
-                            f"(architektúra változás, friss optimizerrel "
-                            f"folytat): {trainer_exc}"
+                            f"(architektúra változás): {trainer_exc}"
                         )
                 if "reward_norm" in ck:
                     reward_norm.load_state_dict(ck["reward_norm"])
@@ -528,27 +429,30 @@ def run_training_session(
     pool.snapshot(learner)
 
     # ── Collector ─────────────────────────────────────────────────────────
+    # [OPT-1/2/3] equity paraméterek cfg-ből – nem hardcode-olva a collectorban
     logger.info(
         f"BatchedSyncCollector inicializálása "
-        f"({cfg.num_envs} env)..."
+        f"({cfg.num_envs} env | equity: n_sim={cfg.equity_n_sim}, "
+        f"min_sims={cfg.equity_min_sims}, cache={cfg.equity_cache_size:,})..."
     )
     collector = BatchedSyncCollector(
-        num_envs=cfg.num_envs,
-        model=learner,
-        device=device,
-        num_players=num_players,
-        action_mapper=action_mapper,
-        model_kwargs=model_kwargs,
-        pool=pool,
-        rlcard_obs_size=rlcard_obs_size,
+        num_envs         = cfg.num_envs,
+        model            = learner,
+        device           = device,
+        num_players      = num_players,
+        action_mapper    = action_mapper,
+        model_kwargs     = model_kwargs,
+        pool             = pool,
+        rlcard_obs_size  = rlcard_obs_size,
+        equity_n_sim     = cfg.equity_n_sim,       # [OPT-1]
+        equity_min_sims  = cfg.equity_min_sims,    # [OPT-1]
+        equity_cache_size= cfg.equity_cache_size,  # [OPT-1]
     )
 
     target_episodes = start_episode + episodes_to_run
     total_collected = start_episode
 
     # ── Mérföldkő inicializálás ───────────────────────────────────────────
-    # [ARCH-FIX] milestone_dir_root a cfg-ből jön – nincs globális mutáció.
-    # A _run_milestone() explicit paramétert kap, ezért ez a sor elég:
     milestone_dir_root = cfg.milestone_dir_root
     last_milestone     = (
         (start_episode // cfg.milestone_interval) * cfg.milestone_interval
@@ -577,139 +481,138 @@ def run_training_session(
     logger.info("=" * 70)
 
     # ── Fő tréning loop ───────────────────────────────────────────────────
-    while total_collected < target_episodes:
-        to_collect = min(
-            cfg.buffer_collect_size,
-            target_episodes - total_collected,
-        )
+    try:
+        while total_collected < target_episodes:
+            to_collect = min(
+                cfg.buffer_collect_size,
+                target_episodes - total_collected,
+            )
 
-        # Snapshot az opponent pool-ba
-        prev_snap = total_collected // OpponentPool.SNAPSHOT_INTERVAL
-        next_snap = (
-            (total_collected + to_collect) // OpponentPool.SNAPSHOT_INTERVAL
-        )
-        if next_snap > prev_snap and total_collected > start_episode:
-            pool.snapshot(learner)
-            collector.update_pool()
+            # Snapshot az opponent pool-ba
+            prev_snap = total_collected // OpponentPool.SNAPSHOT_INTERVAL
+            next_snap = (
+                (total_collected + to_collect) // OpponentPool.SNAPSHOT_INTERVAL
+            )
+            if next_snap > prev_snap and total_collected > start_episode:
+                pool.snapshot(learner)
+                collector.update_pool()
 
-        # Gyűjtés
-        learner.eval()
-        try:
-            all_episodes = collector.collect(to_collect)
-        except Exception as exc:
-            logger.error(f"Gyűjtési hiba: {exc}", exc_info=True)
-            continue
+            # Gyűjtés
+            learner.eval()
+            try:
+                all_episodes = collector.collect(to_collect)
+            except Exception as exc:
+                logger.error(f"Gyűjtési hiba: {exc}", exc_info=True)
+                continue
 
-        # PPO update
-        learner.train()
-        if not all_episodes:
-            logger.warning("Üres gyűjtési batch")
-            continue
+            # PPO update
+            learner.train()
+            if not all_episodes:
+                logger.warning("Üres gyűjtési batch")
+                continue
 
-        for steps, bb_reward in all_episodes:
-            reward_norm.update(bb_reward)
-            norm_r  = reward_norm.normalize(bb_reward)
-            n_steps = len(steps)
-            for i, (s, la, a, lp, v) in enumerate(steps):
-                buffer.add(
-                    state=s.unsqueeze(0),
-                    legal_actions=la,
-                    action=a,
-                    log_prob=lp,
-                    value=v,
-                    reward=norm_r if i == n_steps - 1 else 0.0,
-                    episode_end=(i == n_steps - 1),
-                )
+            for steps, bb_reward in all_episodes:
+                reward_norm.update(bb_reward)
+                norm_r  = reward_norm.normalize(bb_reward)
+                n_steps = len(steps)
+                for i, (s, la, a, lp, v) in enumerate(steps):
+                    buffer.add(
+                        state=s.unsqueeze(0),
+                        legal_actions=la,
+                        action=a,
+                        log_prob=lp,
+                        value=v,
+                        reward=norm_r if i == n_steps - 1 else 0.0,
+                        episode_end=(i == n_steps - 1),
+                    )
 
-        collected_this_batch = len(all_episodes)
-        total_collected     += collected_this_batch
+            collected_this_batch = len(all_episodes)
+            total_collected     += collected_this_batch
 
-        # GAE bootstrap – last_value ha nem terminális buffer vég
-        # [RF-3b FIX] collector.get_bootstrap_value() az env.step() UTÁNI
-        # state-et (s_{T+1}) használja – nem a buffer.states[-1]-et (s_T).
-        last_value = 0.0
-        if buffer.episode_ends and not buffer.episode_ends[-1]:
-            last_value = collector.get_bootstrap_value(learner, device)
-        try:
-            metrics = trainer.update(buffer, last_value=last_value)
-        except Exception as exc:
-            logger.error(f"PPO update hiba: {exc}", exc_info=True)
-            buffer.reset()
-            metrics = {}
+            # GAE bootstrap
+            last_value = 0.0
+            if buffer.episode_ends and not buffer.episode_ends[-1]:
+                last_value = collector.get_bootstrap_value(learner, device)
+            try:
+                metrics = trainer.update(buffer, last_value=last_value)
+            except Exception as exc:
+                logger.error(f"PPO update hiba: {exc}", exc_info=True)
+                buffer.reset()
+                metrics = {}
 
-        # TensorBoard logging
-        if writer and metrics:
-            for k, mv in metrics.items():
+            # TensorBoard logging
+            if writer and metrics:
+                for k, mv in metrics.items():
+                    writer.add_scalar(f"Loss/{k}", mv, total_collected)
                 writer.add_scalar(
-                    f"Loss/{k}", mv, total_collected
+                    "Reward/mean_bb", reward_norm.mean, total_collected
                 )
-            writer.add_scalar(
-                "Reward/mean_bb", reward_norm.mean, total_collected
-            )
-            writer.add_scalar(
-                "Reward/std_bb",
-                reward_norm.var ** 0.5,
-                total_collected,
-            )
+                writer.add_scalar(
+                    "Reward/std_bb",
+                    reward_norm.var ** 0.5,
+                    total_collected,
+                )
 
-        # ── 1000 epizódonkénti log + checkpoint ──────────────────────────
-        prev_1k = (total_collected - collected_this_batch) // 1_000
-        curr_1k = total_collected // 1_000
+            # ── 1000 epizódonkénti log + checkpoint ──────────────────────
+            prev_1k = (total_collected - collected_this_batch) // 1_000
+            curr_1k = total_collected // 1_000
 
-        if curr_1k > prev_1k:
-            elapsed = time.time() - session_start
-            done_so_far = total_collected - start_episode
-            remaining   = target_episodes - total_collected
-            eps_sec     = done_so_far / max(elapsed, 1e-6)
-            eta_str = time.strftime(
-                "%H:%M:%S",
-                time.gmtime(remaining / max(eps_sec, 1e-6)),
-            )
-            ela_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            lr = trainer.optimizer.param_groups[0]["lr"]
+            if curr_1k > prev_1k:
+                elapsed = time.time() - session_start
+                done_so_far = total_collected - start_episode
+                remaining   = target_episodes - total_collected
+                eps_sec     = done_so_far / max(elapsed, 1e-6)
+                eta_str = time.strftime(
+                    "%H:%M:%S",
+                    time.gmtime(remaining / max(eps_sec, 1e-6)),
+                )
+                ela_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+                lr = trainer.optimizer.param_groups[0]["lr"]
 
-            logger.info(
-                f"Ep {total_collected:>8,}/{target_episodes:,} | "
-                f"Eltelt {ela_str} | ETA {eta_str} | LR {lr:.2e} | "
-                f"Actor {metrics.get('actor', float('nan')):+.4f} | "
-                f"Critic {metrics.get('critic', float('nan')):.4f} | "
-                f"Ent {metrics.get('entropy', float('nan')):.4f} | "
-                f"Pool {len(pool):2d}"
-            )
+                logger.info(
+                    f"Ep {total_collected:>8,}/{target_episodes:,} | "
+                    f"Eltelt {ela_str} | ETA {eta_str} | LR {lr:.2e} | "
+                    f"Actor {metrics.get('actor', float('nan')):+.4f} | "
+                    f"Critic {metrics.get('critic', float('nan')):.4f} | "
+                    f"Ent {metrics.get('entropy', float('nan')):.4f} | "
+                    f"Pool {len(pool):2d}"
+                )
 
-            # Rolling checkpoint
-            _save_checkpoint(
-                filename, learner, trainer, reward_norm,
-                total_collected, total_time_spent + elapsed,
-                STATE_SIZE, ACTION_SIZE,
-                num_players=num_players,
-                rlcard_obs_size=rlcard_obs_size,
-            )
-
-            # ── Mérföldkő ellenőrzés ──────────────────────────────────
-            current_milestone = (
-                (total_collected // cfg.milestone_interval)
-                * cfg.milestone_interval
-            )
-            if current_milestone > last_milestone and current_milestone > 0:
-                last_milestone = current_milestone
-                # [ARCH-FIX] milestone_dir_root explicit paraméterként,
-                # NEM a modul-szintű globálisból – nincs race condition.
-                _run_milestone(
-                    filename=filename,
-                    model=learner,
-                    trainer=trainer,
-                    reward_norm=reward_norm,
-                    episodes=total_collected,
-                    time_spent=total_time_spent + elapsed,
-                    state_size=STATE_SIZE,
-                    action_size=ACTION_SIZE,
+                _save_checkpoint(
+                    filename, learner, trainer, reward_norm,
+                    total_collected, total_time_spent + elapsed,
+                    STATE_SIZE, ACTION_SIZE,
                     num_players=num_players,
-                    milestone_episodes=current_milestone,
-                    milestone_dir_root=milestone_dir_root,   # explicit!
                     rlcard_obs_size=rlcard_obs_size,
-                    milestone_hands=cfg.milestone_hands,
                 )
+
+                # ── Mérföldkő ellenőrzés ──────────────────────────────
+                current_milestone = (
+                    (total_collected // cfg.milestone_interval)
+                    * cfg.milestone_interval
+                )
+                if current_milestone > last_milestone and current_milestone > 0:
+                    last_milestone = current_milestone
+                    _run_milestone(
+                        filename=filename,
+                        model=learner,
+                        trainer=trainer,
+                        reward_norm=reward_norm,
+                        episodes=total_collected,
+                        time_spent=total_time_spent + elapsed,
+                        state_size=STATE_SIZE,
+                        action_size=ACTION_SIZE,
+                        num_players=num_players,
+                        milestone_episodes=current_milestone,
+                        milestone_dir_root=milestone_dir_root,
+                        rlcard_obs_size=rlcard_obs_size,
+                        milestone_hands=cfg.milestone_hands,
+                    )
+
+    finally:
+        # [OPT-CLEANUP] ThreadPoolExecutor leállítása – erőforrás szivárgás elkerülése.
+        # A finally blokk garantálja, hogy Ctrl+C vagy kivétel esetén is lefut.
+        collector.close()
 
     # ── Tréning vége ──────────────────────────────────────────────────────
     if writer:
