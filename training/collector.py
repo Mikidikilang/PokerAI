@@ -1,85 +1,73 @@
 """
-training/collector.py  --  BatchedSyncCollector (v4 OPTIMIZED)
+training/collector.py  --  BatchedSyncCollector (v4.2.2-BOOTSTRAP)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OPTIMALIZÁCIÓK az eredetihez képest:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Változások v4.2.2-BOOTSTRAP:
+    [RF-3b FIX] last_value bootstrap: helyes s_{T+1} state.
 
-  OPT-1: Opponent lépések BATCHELVE modell szerint
-         Eredeti: 256 egyedi forward pass → 256× GPU kernel launch
-         Új: modellenként 1 batch forward → ~2-5× gyorsabb
+    Az eredeti kód (runner.py ~260. sor) a buffer.states[-1]-et használta
+    a GAE bootstrap-hoz, ami az UTOLSÓ LEARNER LÉPÉS ELŐTTI állapot (s_T).
+    A GAE képlethez V(s_{T+1}) kell – az utolsó env.step() UTÁNI state.
 
-  OPT-2: BatchStateBuilder – pre-allokált numpy tömb, slicing
-         Eredeti: N × np.concatenate + torch.FloatTensor
-         Új: egyetlen np.zeros + slicing + torch.from_numpy
+    Javítás:
+        _step_learners_batched()-ban, sikeres env.step() után, ha az env
+        NEM fejezte be a kezet (is_over() == False), eltároljuk:
+          self._bootstrap_next_raw   = ns           (raw state dict)
+          self._bootstrap_next_legal = ns legal      (legal actions)
+          self._bootstrap_env_idx    = i             (melyik env)
 
-  OPT-3: torch.inference_mode() a no_grad helyett
-         Kevesebb overhead (autograd tracking kikapcsolva, nem csak gradiens)
+        A collect() visszatérése után a runner.py a
+        get_bootstrap_value(model, device) metódust hívja, amely
+        felépíti a teljes state tensort (BatchStateBuilder-rel) és
+        kiszámolja V(s_{T+1})-et.
 
-  OPT-4: Opponent loop javítás – egy iterációban több env lépés
-         Kevesebb Python loop overhead
+    Miért kell eltárolni STEP-kor és nem collect() visszatérésekor?
+        A _collect_done_envs() _reset_env()-t hív a lezárt kezekre,
+        ami felülírja self._states[i]-t az új kéz initial state-jével.
+        Ha ott olvasnánk, azt a post-reset state-et kapnánk, nem s_{T+1}-et.
 
-  KOMPATIBILITÁS: Checkpoint formátum VÁLTOZATLAN.
-                  A modell architektúra VÁLTOZATLAN.
-                  A tanulási dinamika AZONOS (azonos state tensor kimenet).
-
-  [RF-1 FIX] BB/Stack mismatch javítva: _reset_env() most az rlcard env
-             tényleges game konfigját olvassa vissza reset után, ahelyett
-             hogy véletlenszerű, soha nem alkalmazott bb/stack értékeket
-             használna a feature normalizáláshoz.
-
-  [RF-9 FIX] Valódi equity számítás rlcard raw_obs alapján.
-             _step_learners_batched() mostantól HandEquityEstimator-t hív
-             a state tensor equity dimenzióját (state[-1]) kitöltendő.
-             Preflop: lookup cache, postflop: adaptív MC (min 50, max 200 sim).
-             Ha a kártyák nem elérhetők (preflop rejtett lap), 0.5 fallback.
-
-  [RF-11 FIX] Street-átmenet equity delta intermediate reward.
-             Flop/turn/river átmenetkor equity_delta * STREET_REWARD_SCALE
-             reward shaping adódik hozzá. Ez gyorsabb konvergenciát ad a
-             drawing hand szituációkhoz – óvatosan kalibrált (0.05 scale),
-             hogy ne torzítsa el a terminális reward fontosságát.
+    Equity a bootstrap state-hez:
+        A bootstrap state-hez NEM számítunk új equity-t (felesleges overhead,
+        a value head self-normalizált a tréning során). A legutolsó eltárolt
+        self._last_equity[i] értéket használjuk – ez s_T equity-je, ami
+        s_{T+1}-hez közel van (egy lépés különbség).
 """
-import collections, logging
-import rlcard, torch, torch.nn.functional as F
+import collections
+import logging
+from typing import Dict, List, Optional, Tuple
+
+import rlcard
+import torch
+import torch.nn.functional as F
+
 from core.equity import HandEquityEstimator
 from core.action_mapper import PokerActionMapper
 from core.features import (
-    ActionHistoryEncoder, build_state_tensor, detect_street,
-    ACTION_HISTORY_LEN, BatchStateBuilder, compute_state_size,
+    ActionHistoryEncoder,
+    build_state_tensor,
+    detect_street,
+    ACTION_HISTORY_LEN,
+    BatchStateBuilder,
+    compute_state_size,
 )
 from core.opponent_tracker import OpponentHUDTracker
 
 logger = logging.getLogger("PokerAI")
 _MAX_STEPS_PER_HAND = 500
-_LEARNER_ID = 0
-# [FIX P2-3] Explicit fold akció index – PokerActionMapper.ACTION_NAMES alapján:
-# 0=Fold, 1=Call/Check, 2-6=Raise szintek. Magic number helyett konstans,
-# hogy architektúra változáskor ne legyen silent bug.
-_FOLD_ACTION = 0
-# BB_OPTIONS / STACK_MULTIPLIERS eltávolítva (RF-1 fix): az env saját konfigja
-# kerül kiolvasásra reset után – véletlenszerű, soha nem alkalmazott értékek helyett.
-
-# [RF-11] Street-átmenet intermediate reward shaping
-# Equity delta szorozva ezzel az értékkel adódik a reward-hoz flop/turn/river-en.
-# Alacsony érték szándékos: a terminális reward marad a fő tanulási jel.
+_LEARNER_ID         = 0
+_FOLD_ACTION        = 0
 _STREET_REWARD_SCALE = 0.05
 
-# [RF-9] Equity estimator singleton (thread-safe: read-only cache + random)
+# Equity estimator singleton (thread-safe: RLock + OrderedDict LRU)
 _EQUITY_ESTIMATOR = HandEquityEstimator(n_sim=200, cache_size=20_000)
 
 
-
 def _rlcard_cards_to_equity_fmt(cards: list) -> list:
-    """
-    [RF-9] rlcard kártya formátum ('SA', 'HK') → equity.py formátum ('As', 'Kh').
-
-    rlcard: Card.get_index() = suit_upper + rank_upper  (pl. 'SA', 'HK', 'DT')
-    equity: rank_lower + suit_lower                     (pl. 'As', 'Kh', 'Td')
-    """
-    _SUIT_MAP  = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
-    _RANK_MAP  = {'A':'a','2':'2','3':'3','4':'4','5':'5','6':'6',
-                  '7':'7','8':'8','9':'9','T':'t','J':'j','Q':'q','K':'k'}
+    """rlcard kártya formátum ('SA') → equity.py formátum ('As')."""
+    _SUIT_MAP = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
+    _RANK_MAP = {
+        'A': 'a', '2': '2', '3': '3', '4': '4', '5': '5', '6': '6',
+        '7': '7', '8': '8', '9': '9', 'T': 't', 'J': 'j', 'Q': 'q', 'K': 'k',
+    }
     result = []
     for card in cards:
         if not card or len(card) < 2:
@@ -92,24 +80,14 @@ def _rlcard_cards_to_equity_fmt(cards: list) -> list:
 
 
 def _compute_equity_for_env(state: dict, num_opponents: int) -> float:
-    """
-    [RF-9] Valódi equity becslés az aktuális rlcard state-hez.
-
-    Kártyák kinyerése raw_obs['hand'] és raw_obs['public_cards']-ból,
-    majd HandEquityEstimator.equity() hívás.
-
-    Visszatér: float [0.0, 1.0] – fallback 0.5 ha a lapok nem elérhetők.
-    """
-    raw = state.get('raw_obs', {})
+    """Valódi equity becslés az aktuális rlcard state-hez."""
+    raw          = state.get('raw_obs', {})
     hole_rlcard  = raw.get('hand', [])
     board_rlcard = raw.get('public_cards', [])
-
-    hole  = _rlcard_cards_to_equity_fmt(hole_rlcard)
-    board = _rlcard_cards_to_equity_fmt(board_rlcard)
-
+    hole         = _rlcard_cards_to_equity_fmt(hole_rlcard)
+    board        = _rlcard_cards_to_equity_fmt(board_rlcard)
     if len(hole) < 2:
-        return 0.5  # lapok nem elérhetők → neutral prior
-
+        return 0.5
     try:
         return _EQUITY_ESTIMATOR.equity(
             hole_cards=hole,
@@ -121,57 +99,82 @@ def _compute_equity_for_env(state: dict, num_opponents: int) -> float:
 
 
 class BatchedSyncCollector:
-    def __init__(self, num_envs, model, device, num_players, action_mapper,
-                 model_kwargs, pool, rlcard_obs_size: int = 54):
-        """
-        Paraméterek:
-            ...
-            rlcard_obs_size: [RF-4 FIX] rlcard obs tömb mérete. Default=54 a
-                standard no-limit-holdem env-hez. Ha az rlcard frissítése vagy
-                más config megváltoztatja az obs méretet, ezt kell frissíteni –
-                nem fog silent méretbeli eltérés keletkezni.
-                runner.py-ban: rlcard_obs_size = len(env.reset()[0]['obs'])
-        """
-        self.num_envs = num_envs
-        self.model = model
-        self.device = device
-        self.num_players = num_players
+    """
+    Szinkron, batch-elt tapasztalatgyűjtő.
+
+    Változások:
+        [RF-3b] Bootstrap támogatás: get_bootstrap_value() metódus
+                a helyes s_{T+1} → V(s_{T+1}) számításhoz.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        model,
+        device: torch.device,
+        num_players: int,
+        action_mapper: PokerActionMapper,
+        model_kwargs: dict,
+        pool,
+        rlcard_obs_size: int = 54,
+    ) -> None:
+        self.num_envs     = num_envs
+        self.model        = model
+        self.device       = device
+        self.num_players  = num_players
         self.action_mapper = action_mapper
-        self.pool = pool
-        self.action_size = PokerActionMapper.NUM_CUSTOM_ACTIONS
-        self._rlcard_obs_size = rlcard_obs_size  # [RF-4 FIX] stored for _reset_env fallback
+        self.pool         = pool
+        self.action_size  = PokerActionMapper.NUM_CUSTOM_ACTIONS
+        self._rlcard_obs_size = rlcard_obs_size
 
         logger.info(f"  {num_envs} rlcard env inicializálása...")
         self.envs = [
-            rlcard.make('no-limit-holdem', config={'game_num_players': num_players})
+            rlcard.make(
+                'no-limit-holdem',
+                config={'game_num_players': num_players},
+            )
             for _ in range(num_envs)
         ]
         logger.info("  Env-ek kész.")
 
-        self._history_encoder = ActionHistoryEncoder(num_players, self.action_size)
+        self._history_encoder = ActionHistoryEncoder(
+            num_players, self.action_size
+        )
 
         # Per-env állapotok
-        self._states = [None] * num_envs
-        self._players = [0] * num_envs
-        self._trackers = [None] * num_envs
-        self._steps = [[] for _ in range(num_envs)]
-        self._opp_models = [None] * num_envs
-        self._step_cnt = [0] * num_envs
-        self._active = [False] * num_envs
+        self._states          = [None] * num_envs
+        self._players         = [0]    * num_envs
+        self._trackers        = [None] * num_envs
+        self._steps           = [[] for _ in range(num_envs)]
+        self._opp_models      = [None] * num_envs
+        self._step_cnt        = [0]    * num_envs
+        self._active          = [False] * num_envs
         self._action_histories = [
-            collections.deque(maxlen=ACTION_HISTORY_LEN) for _ in range(num_envs)
+            collections.deque(maxlen=ACTION_HISTORY_LEN)
+            for _ in range(num_envs)
         ]
-        self._bb = [2.0] * num_envs
-        self._sb = [1.0] * num_envs
-        self._initial_stack = [100.0] * num_envs
-        self._street      = [0]   * num_envs
-        self._last_equity = [0.5] * num_envs
-        # [RF-11] street-átmenet equity delta reward shaping
-        self._prev_street  = [0]   * num_envs   # előző lépés utcája
-        self._prev_equity  = [0.5] * num_envs   # előző lépés equitije
+        self._bb             = [2.0]  * num_envs
+        self._sb             = [1.0]  * num_envs
+        self._initial_stack  = [100.0] * num_envs
+        self._street         = [0]    * num_envs
+        self._last_equity    = [0.5]  * num_envs
+        self._prev_street    = [0]    * num_envs
+        self._prev_equity    = [0.5]  * num_envs
 
-        # ── OPT-2: BatchStateBuilder pre-allokált tömbökkel ───────────────
-        # [RF-4 FIX] obs_dim paraméterből jön, nem hardcode 54
+        # ── [RF-3b] Bootstrap state tárolás ──────────────────────────────
+        # Az utolsó nem-terminális learner lépés UTÁNI state és legal actions.
+        # Feltöltve _step_learners_batched()-ban, olvasva get_bootstrap_value()-ban.
+        # Közvetlenül env.step() után tárolódik, MIELŐTT _collect_done_envs()
+        # esetleg _reset_env()-t hívna (ami felülírná self._states[i]-t).
+        self._bootstrap_next_raw:   Optional[dict] = None
+        self._bootstrap_next_legal: List[int]       = [1]
+        self._bootstrap_next_equity: float          = 0.5
+        self._bootstrap_bb:          float          = 2.0
+        self._bootstrap_sb:          float          = 1.0
+        self._bootstrap_stack:       float          = 100.0
+        self._bootstrap_env_idx:     int            = 0
+
+        # BatchStateBuilder (pre-allokált)
         state_size = compute_state_size(rlcard_obs_size, num_players)
         self._batch_builder = BatchStateBuilder(
             state_size, num_players,
@@ -179,16 +182,18 @@ class BatchedSyncCollector:
             max_batch=num_envs,
         )
 
-        # ── Opponent model → id mapping a batch csoportosításhoz ──────────
-        self._opp_model_ids = [0] * num_envs  # id(model) → int index
-
         self._reset_all_envs()
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Public API – VÁLTOZATLAN
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Publikus API ─────────────────────────────────────────────────────────
 
-    def collect(self, n_episodes):
+    def collect(self, n_episodes: int) -> list:
+        """
+        Gyűjt n_episodes lezárt epizódot.
+
+        [RF-3b] A bootstrap state minden learner lépésnél frissül;
+        a collect() visszatérése után get_bootstrap_value() a runner
+        számára elérhetővé teszi V(s_{T+1})-et.
+        """
         completed = []
         while len(completed) < n_episodes:
             self._step_opponents_batched()
@@ -196,156 +201,180 @@ class BatchedSyncCollector:
             self._collect_done_envs(completed, n_episodes)
         return completed[:n_episodes]
 
-    def update_pool(self):
+    def get_bootstrap_value(self, model, device: torch.device) -> float:
+        """
+        Kiszámolja V(s_{T+1})-et az utolsó nem-terminális learner lépés
+        UTÁNI állapothoz.
+
+        [RF-3b FIX] Ez váltja ki a runner.py-ban lévő hibás bootstrapot,
+        ahol ``buffer.states[-1]`` (pre-action state, s_T) volt használva
+        V(s_{T+1}) helyett.
+
+        A visszaadott érték a ``compute_gae(last_value=...)`` paraméterének
+        adandó át.
+
+        Returns:
+            V(s_{T+1}) float, vagy 0.0 ha nincs érvényes bootstrap state
+            (pl. az összes gyűjtött epizód terminálisan zárult).
+        """
+        if self._bootstrap_next_raw is None:
+            return 0.0
+
+        try:
+            # Egyetlen state tensor felépítése az eltárolt next state-ből.
+            # Új OpponentHUDTracker (semleges prior): a bootstrap value
+            # estimate csak hozzávetőleges kell legyen, és nem kell a
+            # tréninghez pontosan illeszkedő HUD stat.
+            dummy_tracker = OpponentHUDTracker(self.num_players)
+
+            state_t = build_state_tensor(
+                state         = self._bootstrap_next_raw,
+                tracker       = dummy_tracker,
+                action_history= self._action_histories[self._bootstrap_env_idx],
+                history_encoder = self._history_encoder,
+                num_players   = self.num_players,
+                my_player_id  = _LEARNER_ID,
+                bb            = self._bootstrap_bb,
+                sb            = self._bootstrap_sb,
+                initial_stack = self._bootstrap_stack,
+                street        = detect_street(self._bootstrap_next_raw),
+                equity        = self._bootstrap_next_equity,
+            )
+
+            with torch.inference_mode():
+                _, v, _ = model.forward(
+                    state_t.to(device),
+                    self._bootstrap_next_legal,
+                )
+            return float(v.item())
+
+        except Exception as exc:
+            logger.debug(
+                f"Bootstrap value számítási hiba (fallback 0.0): {exc}"
+            )
+            return 0.0
+
+    def update_pool(self) -> None:
+        """Ellenfél modellek frissítése a pool-ból."""
         for i in range(self.num_envs):
             self._opp_models[i] = self.pool.get_opponent(self.model)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Env management
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Env management ───────────────────────────────────────────────────────
 
-    def _reset_all_envs(self):
+    def _reset_all_envs(self) -> None:
         for i in range(self.num_envs):
             self._reset_env(i)
 
-    def _reset_env(self, i):
-        # [RF-1 FIX] Nem generálunk véletlenszerű bb/stack értékeket amelyeket
-        # az rlcard env nem kap meg. Ehelyett: reset után beolvassuk az env
-        # tényleges game konfigurációját, hogy a feature pipeline konzisztens
-        # adatot lásson.
-        #
-        # Korábbi hiba: bb=5, stack=150 generálódott, de envs[i].reset()
-        # ignórálta őket → a stack_in_bb, SPR, pot_odds feature-ök
-        # szisztematikusan hibás értékeket adtak vissza.
+    def _reset_env(self, i: int) -> None:
+        """
+        Reset egy env-et, és olvassa vissza az rlcard game tényleges
+        bb/stack konfigurációját (RF-1 fix: nincs hamis randomizálás).
+        """
         try:
             s, p = self.envs[i].reset()
-            # ── Tényleges game konfig kiolvasása az rlcard game objektumból ──
-            game = self.envs[i].game
-            bb   = float(getattr(game, 'big_blind',   getattr(game, 'blind', 2.0)))
-            sb   = float(getattr(game, 'small_blind', bb / 2.0))
-            # initial_stack: reset utáni all_chips maximum értéke (mindenki egyforma)
-            raw  = s.get('raw_obs', {})
+            game  = self.envs[i].game
+            bb    = float(getattr(game, 'big_blind',
+                          getattr(game, 'blind', 2.0)))
+            sb    = float(getattr(game, 'small_blind', bb / 2.0))
+            raw   = s.get('raw_obs', {})
             chips = raw.get('all_chips', [])
             stack = float(max(chips)) if chips else float(
-                getattr(game, 'init_chips', getattr(game, 'chips', 100.0))
+                getattr(game, 'init_chips',
+                        getattr(game, 'chips', 100.0))
             )
-            # Sanity: ha az env nem ad értelmes értékeket, maradunk sane defaulton
             if bb < 0.5:   bb = 2.0
             if sb < 0.25:  sb = 1.0
             if stack < bb: stack = bb * 100
         except Exception as exc:
             logger.error(f"Env {i} reset hiba: {exc}", exc_info=True)
-            s     = {'obs': [0.0] * self._rlcard_obs_size, 'raw_obs': {}, 'legal_actions': [1]}
-            p     = 0
-            bb    = 2.0
-            sb    = 1.0
-            stack = 200.0
+            s     = {
+                'obs': [0.0] * self._rlcard_obs_size,
+                'raw_obs': {},
+                'legal_actions': [1],
+            }
+            p, bb, sb, stack = 0, 2.0, 1.0, 200.0
+
         self._bb[i]            = bb
         self._sb[i]            = sb
         self._initial_stack[i] = stack
-        self._states[i] = s
-        self._players[i] = p
-        self._steps[i] = []
-        self._step_cnt[i] = 0
-        self._active[i] = True
-        self._street[i] = detect_street(s)
-        self._opp_models[i] = self.pool.get_opponent(self.model)
-        # [FIX P2-1] HUD tracker MINDIG új példány kézváltáskor.
-        # Korábbi hiba: "if self._trackers[i] is None" → csak az első kéznél
-        # jött létre új tracker. Ezután az összes következő kézben a régi
-        # ellenfél(ek) stale statisztikái maradtak (pl. VPIP, AF, PFR),
-        # miközben az OpponentPool rotált – ez okozta a "HUD-vakság" bugot,
-        # ami az AF agressziós spirálhoz is hozzájárult (a learner félreolvasta
-        # az ellenfél típusát a régi HUD adatok alapján).
-        self._trackers[i] = OpponentHUDTracker(self.num_players)
+        self._states[i]        = s
+        self._players[i]       = p
+        self._steps[i]         = []
+        self._step_cnt[i]      = 0
+        self._active[i]        = True
+        self._street[i]        = detect_street(s)
+        self._opp_models[i]    = self.pool.get_opponent(self.model)
+        # P2-1 FIX: HUD tracker mindig új kézváltáskor
+        self._trackers[i]      = OpponentHUDTracker(self.num_players)
         self._action_histories[i].clear()
-        self._last_equity[i] = 0.5
-        self._prev_street[i]  = 0
-        self._prev_equity[i]  = 0.5
+        self._last_equity[i]   = 0.5
+        self._prev_street[i]   = 0
+        self._prev_equity[i]   = 0.5
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # OPT-1: BATCHED OPPONENT STEPPING
-    # ═══════════════════════════════════════════════════════════════════════
-    #
-    # Eredeti: minden env-ben egyenként forward pass → N GPU kernel launch
-    # Új: gyűjtsd össze az összes "opponent lépést igénylő" env-et,
-    #     csoportosítsd modell szerint, 1 batch forward pass per modell
-    #
-    # Az opponent loop-ban max _MAX_OPP_ROUNDS-szor iterálunk,
-    # mert egy env-ben több opponent lépés is kellhet egymás után.
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Opponent stepping (batch) ─────────────────────────────────────────────
 
-    _MAX_OPP_ROUNDS = 20  # max iteráció az opponent batch loop-ban
+    _MAX_OPP_ROUNDS = 20
 
-    def _step_opponents_batched(self):
-        """Opponent lépések batchelve – modell szerint csoportosítva."""
-
+    def _step_opponents_batched(self) -> None:
+        """Ellenfél lépések – modell szerint batch-elve."""
         for _round in range(self._MAX_OPP_ROUNDS):
-            # ── Gyűjtsd össze melyik env-ek várnak opponent lépésre ───────
-            opp_envs = []
-            for i in range(self.num_envs):
-                if (self._active[i]
+            opp_envs = [
+                i for i in range(self.num_envs)
+                if (
+                    self._active[i]
                     and not self.envs[i].is_over()
                     and self._players[i] != _LEARNER_ID
-                    and self._step_cnt[i] < _MAX_STEPS_PER_HAND):
-                    opp_envs.append(i)
-
+                    and self._step_cnt[i] < _MAX_STEPS_PER_HAND
+                )
+            ]
             if not opp_envs:
                 break
 
-            # ── Csoportosítás modell szerint ──────────────────────────────
-            model_groups = {}  # id(model) → list[env_idx]
+            model_groups: Dict[int, Tuple] = {}
             for i in opp_envs:
                 mid = id(self._opp_models[i])
                 if mid not in model_groups:
                     model_groups[mid] = (self._opp_models[i], [])
                 model_groups[mid][1].append(i)
 
-            # ── Batch forward pass modell-csoportonként ───────────────────
             for mid, (opp_model, env_list) in model_groups.items():
-                n = len(env_list)
+                n          = len(env_list)
                 player_ids = [self._players[i] for i in env_list]
 
-                # OPT-2: BatchStateBuilder
                 states_batch = self._batch_builder.build_batch(
-                    env_indices=env_list,
-                    states=self._states,
-                    trackers=self._trackers,
-                    action_histories=self._action_histories,
-                    player_ids=player_ids,
-                    bbs=self._bb,
-                    sbs=self._sb,
-                    initial_stacks=self._initial_stack,
-                    streets=self._street,
+                    env_indices     = env_list,
+                    states          = self._states,
+                    trackers        = self._trackers,
+                    action_histories= self._action_histories,
+                    player_ids      = player_ids,
+                    bbs             = self._bb,
+                    sbs             = self._sb,
+                    initial_stacks  = self._initial_stack,
+                    streets         = self._street,
                 ).to(self.device)
 
-                # Legal actions gyűjtése + mask építés
                 all_raw_legal = [
-                    self._states[i].get('legal_actions', [1]) for i in env_list
+                    self._states[i].get('legal_actions', [1])
+                    for i in env_list
                 ]
                 all_abs_legal = [
                     self.action_mapper.get_abstract_legal_actions(rl)
                     for rl in all_raw_legal
                 ]
 
-                # ── OPT-3: inference_mode (gyorsabb mint no_grad) ─────────
                 with torch.inference_mode():
-                    x = opp_model._encode(states_batch)
+                    x      = opp_model._encode(states_batch)
                     logits = opp_model.actor_head(x)
-
-                    # Mask alkalmazása batch-ben – logits device-án!
-                    mask = torch.full(
+                    mask   = torch.full(
                         (n, self.action_size), -1e9, device=logits.device
                     )
                     for idx, legal in enumerate(all_abs_legal):
                         for a in legal:
                             if 0 <= a < self.action_size:
                                 mask[idx, a] = 0.0
-
-                    probs = F.softmax(logits + mask, dim=-1)
+                    probs   = F.softmax(logits + mask, dim=-1)
                     actions = torch.distributions.Categorical(probs).sample()
 
-                # ── Env step-ek végrehajtása (CPU) ────────────────────────
                 actions_np = actions.cpu().numpy()
                 for idx, i in enumerate(env_list):
                     aa = int(actions_np[idx])
@@ -353,156 +382,175 @@ class BatchedSyncCollector:
                         aa, all_raw_legal[idx]
                     )
                     bn = self._calc_bet_norm(i, aa)
-
                     self._action_histories[i].append(
                         (self._players[i], aa, bn)
                     )
                     self._trackers[i].record_action(
                         self._players[i], aa, street=self._street[i]
                     )
-
                     try:
                         ns, np_ = self.envs[i].step(ea)
-                        self._states[i] = ns
+                        self._states[i]  = ns
                         self._players[i] = np_
                         self._step_cnt[i] += 1
-                        self._street[i] = detect_street(ns)
+                        self._street[i]  = detect_street(ns)
                     except Exception as exc:
-                        logger.error(f"Env {i} opp step hiba: {exc}",
-                                     exc_info=True)
+                        logger.error(
+                            f"Env {i} opp step hiba: {exc}", exc_info=True
+                        )
                         self._active[i] = False
 
                     if self._step_cnt[i] >= _MAX_STEPS_PER_HAND:
                         logger.warning(
-                            f"Env {i}: max lépésszám elérve "
-                            f"({_MAX_STEPS_PER_HAND} lépés/kéz), "
-                            f"opp loop deaktiválva – valószínű végtelen kéz"
+                            f"Env {i}: max lépésszám ({_MAX_STEPS_PER_HAND})"
                         )
                         self._active[i] = False
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Learner batch stepping – OPT-2 + OPT-3 alkalmazva
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Learner stepping (batch) ──────────────────────────────────────────────
 
-    def _step_learners_batched(self):
-        """Learner lépések batchelve – egyetlen GPU forward pass."""
+    def _step_learners_batched(self) -> None:
+        """
+        Learner lépések – egyetlen GPU forward pass.
 
+        [RF-3b] Bootstrap state frissítése: minden sikeres, nem-terminális
+        env.step() után eltároljuk a next state-et (ns) a bootstrap számára.
+        Ez az utolsó ilyen lépés értéke marad meg, mert a GAE csak az utolsó
+        buffer bejegyzés s_{T+1}-jét igényli.
+        """
         learner_envs = [
             i for i in range(self.num_envs)
-            if (self._active[i]
+            if (
+                self._active[i]
                 and self._players[i] == _LEARNER_ID
-                and not self.envs[i].is_over())
+                and not self.envs[i].is_over()
+            )
         ]
         if not learner_envs:
             return
 
-        n = len(learner_envs)
+        n          = len(learner_envs)
         player_ids = [_LEARNER_ID] * n
 
-        # OPT-2: BatchStateBuilder
         states_batch = self._batch_builder.build_batch(
-            env_indices=learner_envs,
-            states=self._states,
-            trackers=self._trackers,
-            action_histories=self._action_histories,
-            player_ids=player_ids,
-            bbs=self._bb,
-            sbs=self._sb,
-            initial_stacks=self._initial_stack,
-            streets=self._street,
+            env_indices     = learner_envs,
+            states          = self._states,
+            trackers        = self._trackers,
+            action_histories= self._action_histories,
+            player_ids      = player_ids,
+            bbs             = self._bb,
+            sbs             = self._sb,
+            initial_stacks  = self._initial_stack,
+            streets         = self._street,
         ).to(self.device)
 
-        # Legal actions
         all_raw_legal = [
-            self._states[i].get('legal_actions', [1]) for i in learner_envs
+            self._states[i].get('legal_actions', [1])
+            for i in learner_envs
         ]
         all_abs_legal = [
             self.action_mapper.get_abstract_legal_actions(rl)
             for rl in all_raw_legal
         ]
 
-        # OPT-3: inference_mode
         with torch.inference_mode():
-            x = self.model._encode(states_batch)
+            x            = self.model._encode(states_batch)
             logits_batch = self.model.actor_head(x)
             values_batch = self.model.critic_head(x)
 
-        # ── Per-env feldolgozás (CPU) ─────────────────────────────────────
         for idx, i in enumerate(learner_envs):
             logits = logits_batch[idx].unsqueeze(0)
-            value = values_batch[idx]
-            legal = all_abs_legal[idx]
+            value  = values_batch[idx]
+            legal  = all_abs_legal[idx]
 
             mask = torch.full_like(logits, -1e9)
             for a in legal:
                 if 0 <= a < self.action_size:
                     mask[:, a] = 0.0
 
-            probs = F.softmax(logits + mask, dim=-1)
-            dist = torch.distributions.Categorical(probs)
+            probs  = F.softmax(logits + mask, dim=-1)
+            dist   = torch.distributions.Categorical(probs)
             action = dist.sample()
-            lp = dist.log_prob(action)
+            lp     = dist.log_prob(action)
 
-            aa = int(action.item())
-            ea = self.action_mapper.get_env_action(
+            aa           = int(action.item())
+            ea           = self.action_mapper.get_env_action(
                 aa, self._states[i].get('legal_actions', [1])
             )
-
-            # State BEFORE action – a BatchStateBuilder kimenetéből
             state_before = states_batch[idx].cpu()
+            bn           = self._calc_bet_norm(i, aa)
 
-            bn = self._calc_bet_norm(i, aa)
             self._action_histories[i].append((_LEARNER_ID, aa, bn))
-            self._trackers[i].record_action(_LEARNER_ID, aa, street=self._street[i])
+            self._trackers[i].record_action(
+                _LEARNER_ID, aa, street=self._street[i]
+            )
             self._steps[i].append(
                 (state_before, legal, action.cpu(), lp.cpu(), value.cpu())
             )
 
-            # [RF-9 FIX] Valódi equity számítás rlcard raw_obs alapján
-            # (nem a state tensor utolsó dimenziójából, ami még 0.5 default volt)
-            equity_now = _compute_equity_for_env(
+            # RF-9: valódi equity
+            equity_now            = _compute_equity_for_env(
                 self._states[i], num_opponents=self.num_players - 1
             )
-            self._last_equity[i] = equity_now
-            # [FIX P2-2] A _prev_equity[i] frissítése a street-váltás ágban
-            # történik (lentebb, a step() utáni new_street != street feltételben).
-            # A korábbi "self._prev_equity[i] = self._prev_equity[i]" no-op sor
-            # félrevezető volt – törölve.
+            self._last_equity[i]  = equity_now
 
             try:
                 ns, np_ = self.envs[i].step(ea)
-                # [RF-11] Street váltás előtt mentjük az equity-t
                 new_street = detect_street(ns)
+
+                # ── [RF-3b] Bootstrap state frissítése ────────────────────
+                # KRITIKUS: ezt KÖZVETLENÜL az env.step() után tároljuk el,
+                # MIELŐTT _collect_done_envs() esetleg _reset_env()-t hívna.
+                # Ha az env nem fejezte be a kezét, ez az s_{T+1} state
+                # – pontosan ami a GAE last_value bootstrap-hoz kell.
+                if not self.envs[i].is_over() and self._step_cnt[i] + 1 < _MAX_STEPS_PER_HAND:
+                    self._bootstrap_next_raw    = ns
+                    self._bootstrap_next_legal  = ns.get('legal_actions', [1])
+                    self._bootstrap_next_equity = equity_now  # közeli közelítés
+                    self._bootstrap_bb          = self._bb[i]
+                    self._bootstrap_sb          = self._sb[i]
+                    self._bootstrap_stack       = self._initial_stack[i]
+                    self._bootstrap_env_idx     = i
+
+                # RF-11: street delta reward
                 if new_street != self._street[i]:
-                    # Street-átmenet: frissítjük a prev értékeket
-                    self._prev_street[i] = self._street[i]
-                    self._prev_equity[i] = equity_now
-                self._states[i] = ns
-                self._players[i] = np_
+                    self._prev_street[i]  = self._street[i]
+                    self._prev_equity[i]  = equity_now
+
+                self._states[i]   = ns
+                self._players[i]  = np_
                 self._step_cnt[i] += 1
-                self._street[i] = new_street
+                self._street[i]   = new_street
+
             except Exception as exc:
-                logger.error(f"Env {i} learner step hiba: {exc}", exc_info=True)
+                logger.error(
+                    f"Env {i} learner step hiba: {exc}", exc_info=True
+                )
                 self._active[i] = False
 
             if self._step_cnt[i] >= _MAX_STEPS_PER_HAND:
                 logger.warning(
-                    f"Env {i}: max lépésszám elérve "
-                    f"({_MAX_STEPS_PER_HAND} lépés/kéz), "
-                    f"learner loop deaktiválva – valószínű végtelen kéz"
+                    f"Env {i}: max lépésszám ({_MAX_STEPS_PER_HAND})"
                 )
                 self._active[i] = False
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Done env-ek begyűjtése – VÁLTOZATLAN logika
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Done env-ek begyűjtése ────────────────────────────────────────────────
 
-    def _collect_done_envs(self, completed, target):
+    def _collect_done_envs(
+        self,
+        completed: list,
+        target: int,
+    ) -> None:
+        """
+        Kész epizódok kinyerése, reward shaping és env reset.
+
+        [RF-3b] A bootstrap state eltárolása a _step_learners_batched()-ban
+        történt, tehát itt a _reset_env() hívás nem érinti azt.
+        """
         for i in range(self.num_envs):
             if not self._active[i] or self.envs[i].is_over():
                 if self._steps[i] and len(completed) < target:
                     try:
-                        payoffs = self.envs[i].get_payoffs()
+                        payoffs    = self.envs[i].get_payoffs()
                         raw_reward = (
                             float(payoffs[0])
                             if payoffs is not None and len(payoffs) > 0
@@ -512,47 +560,38 @@ class BatchedSyncCollector:
                         logger.debug(f"Env {i} payoffs hiba: {exc}")
                         raw_reward = 0.0
 
-                    # ── Reward shaping ───────────────────────────────────────────────────────
-                    #
-                    # 1) Draw fold penalty (eredeti): ha postflop fold erős equity-vel → -0.08
-                    # 2) [RF-11 FIX] Street-átmenet equity delta: flop/turn/river-en az
-                    #    equity növekedés kis pozitív, csökkenés kis negatív jutalmat ad.
-                    #    Scale: 0.05 – szándékosan alacsony, hogy a terminális reward
-                    #    domináljon. Célja: draw-ok és semibluff-ok gyorsabb tanulása.
-
+                    # Reward shaping
                     if self._steps[i]:
-                        last_state, last_legal, last_action, last_lp, last_val = self._steps[i][-1]
-                        last_action_int = int(last_action.item())
+                        last_action_int = int(
+                            self._steps[i][-1][2].item()
+                        )
                         last_street = self._street[i]
-                        last_eq    = self._last_equity[i]
+                        last_eq     = self._last_equity[i]
 
-                        # 1) Draw fold penalty
+                        # Draw fold penalty
                         DRAW_FOLD_PENALTY     = 0.08
-                        DRAW_EQUITY_THRESHOLD = 0.44  # ~8-9 outos draw szintje
-                        # [FIX P2-3] _FOLD_ACTION konstans, nem magic 0
-                        if (last_action_int == _FOLD_ACTION
-                                and last_street >= 1
-                                and last_eq >= DRAW_EQUITY_THRESHOLD):
+                        DRAW_EQUITY_THRESHOLD = 0.44
+                        if (
+                            last_action_int == _FOLD_ACTION
+                            and last_street >= 1
+                            and last_eq >= DRAW_EQUITY_THRESHOLD
+                        ):
                             raw_reward -= DRAW_FOLD_PENALTY
 
-                        # 2) [RF-11 FIX] Street-átmenet equity delta reward
-                        # Csak akkor adódik hozzá ha ténylegesen volt street-váltás
-                        # (prev_street != current street) és mindkét equity érvényes.
+                        # Street delta reward (RF-11)
                         if last_street > self._prev_street[i] and last_street >= 1:
                             equity_delta = last_eq - self._prev_equity[i]
-                            # Clamp: max ±0.3 equity változás vehető figyelembe
                             equity_delta = max(-0.3, min(0.3, equity_delta))
-                            raw_reward += equity_delta * _STREET_REWARD_SCALE
-                    
+                            raw_reward  += equity_delta * _STREET_REWARD_SCALE
+
                     bb_reward = raw_reward / max(self._bb[i], 1e-6)
                     completed.append((self._steps[i], bb_reward))
                 self._reset_env(i)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Helpers
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Segédek ──────────────────────────────────────────────────────────────
 
-    def _calc_bet_norm(self, env_idx, abstract_action):
+    def _calc_bet_norm(self, env_idx: int, abstract_action: int) -> float:
+        """Bet méret normalizálás az action history számára."""
         if abstract_action < 2:
             return 0.0
         fractions = [0.0, 0.25, 0.50, 0.75, 1.0]

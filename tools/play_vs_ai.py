@@ -28,7 +28,9 @@ Változások v4.2.2:
 """
 
 import argparse
+import base64
 import collections
+import hashlib
 import glob
 import http.server
 import json
@@ -885,7 +887,30 @@ session         = GameSession()
 available_models: List[Dict[str, Any]] = []
 
 
+# [TASK-6] Opcionalis HTTP Basic Auth – lasd train_gui.py megjegyzeseit.
+_auth_hash: str = ""   # ures → nincs auth kovetelment
+
+
 class GameHandler(http.server.BaseHTTPRequestHandler):
+    def _check_auth(self) -> bool:
+        """Ellenorzi a HTTP Basic Auth credentialokat (lasd train_gui.py)."""
+        if not _auth_hash:
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                decoded   = base64.b64decode(auth_header[6:]).decode("utf-8")
+                _, passwd = decoded.split(":", 1)
+                if hashlib.sha256(passwd.encode()).hexdigest() == _auth_hash:
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Poker AI vs AI"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     """HTTP kéréskezelő a játék API-hoz."""
 
     def log_message(self, format: str, *args: Any) -> None:  # type: ignore[override]
@@ -937,6 +962,8 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # type: ignore[override]
+        if not self._check_auth():   # [TASK-6]
+            return
         """GET kérések kezelése."""
         path = urlparse(self.path).path
 
@@ -960,6 +987,8 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:  # type: ignore[override]
+        if not self._check_auth():   # [TASK-6]
+            return
         """POST kérések kezelése."""
         path = urlparse(self.path).path
 
@@ -1127,7 +1156,18 @@ def main() -> None:
     )
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--password", type=str, default="",
+        help="Opcionalis HTTP Basic Auth jelszo (felhasznalonev: admin).",
+    )
     args = parser.parse_args()
+
+    global _auth_hash
+    if args.password:
+        _auth_hash = hashlib.sha256(args.password.encode()).hexdigest()
+        print(f"  Auth: HTTP Basic Auth BEKAPCSOLVA")
+    else:
+        _auth_hash = ""
 
     global available_models, _ALLOWED_DIRS
 

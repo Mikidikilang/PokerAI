@@ -136,7 +136,13 @@ class ActionHistoryEncoder:
 def build_state_tensor(state, tracker, action_history, history_encoder,
                        num_players, my_player_id, bb, sb, initial_stack,
                        street=None, equity=0.5):
-    obs_arr   =np.array(state['obs'],dtype=np.float32)
+    obs_arr   = np.array(state['obs'], dtype=np.float32)
+    # [TASK-3 FIX] obs[52] és obs[53] BB-normalizálás – azonos logika mint
+    # BatchStateBuilder.build_batch()-ben, hogy RTA és training konzisztens legyen.
+    bb_safe = max(float(bb), 1e-6)
+    if len(obs_arr) > 53:
+        obs_arr[52] = min(obs_arr[52] / bb_safe, 200.0)
+        obs_arr[53] = min(obs_arr[53] / bb_safe, 200.0)
     stats_arr =np.array(tracker.get_stats_vector(),dtype=np.float32)
     stack_arr =compute_stack_features(state,num_players,bb,sb,initial_stack)
     if street is None: street=detect_street(state)
@@ -244,6 +250,19 @@ class BatchStateBuilder:
             obs = state.get('obs', None)
             if obs is not None:
                 buf[idx, a:b] = obs
+                # [TASK-3 FIX] obs[52] és obs[53] BB-normalizálás.
+                # Az rlcard obs[52] = betett összeg (in_chips),
+                # obs[53] = max betett összeg – ezek nyers chip értékek.
+                # BB=1 esetén kis számok, BB=25 esetén 25x nagyobbak →
+                # instabil neural net bemenet különböző blind konfigurációknál.
+                # Megoldás: BB-egységre osztjuk (BB = 1.0 egység).
+                # Clamp: max 200 BB (szokásos deep stack határ).
+                bb_i = max(bbs[i], 1e-6)
+                obs52_idx = a + 52
+                obs53_idx = a + 53
+                if b > obs53_idx:   # biztonsági ellenőrzés: obs_dim >= 54
+                    buf[idx, obs52_idx] = min(buf[idx, obs52_idx] / bb_i, 200.0)
+                    buf[idx, obs53_idx] = min(buf[idx, obs53_idx] / bb_i, 200.0)
 
             # [2] stats (num_players × 7 dim)
             a, b = o['stats']

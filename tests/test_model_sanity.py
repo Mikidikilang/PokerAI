@@ -112,6 +112,51 @@ from utils.checkpoint_utils import safe_load_checkpoint
 RANKS = 'AKQJT98765432'
 SUITS = 'shdc'
 ALL_CARDS = [r + s for r in RANKS for s in SUITS]
+# ═══════════════════════════════════════════════════════════════════════════════
+# [TASK-16] PER-PLAYER-COUNT KONFIGURÁCIÓK
+# ─────────────────────────────────────────────────────────────────────────────
+# Minden asztalméretre (2..9) külön kalibrált stat-targetok és scenario
+# elvárások.  Az összes player-count-specifikus érték itt van definiálva,
+# nem szétszórva a függvénytörzsekben.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _table_category(np_: int) -> str:
+    """Visszaad egy olvasható kategória-nevet az asztalméretre."""
+    if np_ == 2:           return "HU"
+    elif np_ == 3:         return "3-max"
+    elif np_ in (4, 5):    return f"{np_}-max (short-handed)"
+    elif np_ == 6:         return "6-max"
+    else:                  return f"{np_}-max (full ring)"
+
+
+# ── VPIP / PFR / AF / 3-bet / C-bet célsávok ─────────────────────────────────
+# Forrás: PokerTracker / GTO-solver irodalom + élő mikro-stakes minták.
+# Formátum: (lo, hi) zárt intervallum.  Ha a modell ezen kívülre esik: ⚠
+#
+# | cat       | VPIP      | PFR       | AF        | 3-bet     | C-bet     |
+# |-----------|-----------|-----------|-----------|-----------|-----------|
+# | HU        | 55–90     | 35–75     | 1.5–5.0   | 25–55     | 50–85     |
+# | 3-max     | 42–68     | 30–55     | 1.5–4.5   | 12–28     | 55–82     |
+# | 4-5-max   | 28–48     | 20–40     | 1.5–4.0   | 8–20      | 55–80     |
+# | 6-max     | 22–38     | 16–30     | 1.5–3.5   | 6–15      | 55–78     |
+# | 7-9 ring  | 14–28     | 10–22     | 1.3–3.5   | 4–12      | 55–78     |
+
+TABLE_STAT_TARGETS = {
+    #           vpip       pfr        af         tbet       cbet
+    2:  dict(vpip=(55,90), pfr=(35,75), af=(1.5,5.0), tbet=(25,55), cbet=(50,85)),
+    3:  dict(vpip=(42,68), pfr=(30,55), af=(1.5,4.5), tbet=(12,28), cbet=(55,82)),
+    4:  dict(vpip=(28,48), pfr=(20,40), af=(1.5,4.0), tbet=( 8,20), cbet=(55,80)),
+    5:  dict(vpip=(28,48), pfr=(20,40), af=(1.5,4.0), tbet=( 8,20), cbet=(55,80)),
+    6:  dict(vpip=(22,38), pfr=(16,30), af=(1.5,3.5), tbet=( 6,15), cbet=(55,78)),
+    7:  dict(vpip=(14,28), pfr=(10,22), af=(1.3,3.5), tbet=( 4,12), cbet=(55,78)),
+    8:  dict(vpip=(14,28), pfr=(10,22), af=(1.3,3.5), tbet=( 4,12), cbet=(55,78)),
+    9:  dict(vpip=(14,28), pfr=(10,22), af=(1.3,3.5), tbet=( 4,12), cbet=(55,78)),
+}
+
+def _stat_ok(val, lo, hi):
+    return lo <= val <= hi
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -257,96 +302,324 @@ def query_model(model, obs_builder, tracker, history_encoder, scenario,
 
 def make_scenarios(np_):
     """
-    14 szituációs teszt.
+    Szituációs tesztek – [TASK-16] per-player-count elvárásokkal.
 
-    SPRINT 1 – FIX-1 (72o facing raise):
-      ELŐTTE: expected_good={0,1}, expected_bad={5,6}, severity='WARNING'
-      UTÁNA:  expected_good={0},   expected_bad={2,3,4,5,6}, severity='CRITICAL'
-      Indok: HU-ban a 72o vs raise egyértelmű fold – a call negatív EV,
-             bármilyen raise pedig értelmetlen. A korábbi teszt hamis PASS-t
-             adhatott, ha a modell call-t választott.
+    Struktúra:
+      A) UNIVERZÁLIS (minden asztalméretnél azonos elvárások) – 10 eset
+         Főleg postflop és alapvető preflop döntések, ahol a játékosszám
+         nem változtatja meg a helyes választ.
+
+      B) PREFLOP – player-count-adjusted (4 eset)
+         T8o facing 4-bet, 8BB 22 push/fold, BB preflop steal,
+         QQ facing 3-bet:  más elvárás HU / 6-max / full ring esetén.
+
+      C) PLAYER-COUNT-SPECIFIKUS (3-4 eset per kategória)
+         HU:       BTN open széles range, 3-bet AJo, BB steal defense
+         Short:    squeeze ATs, CO cold call fold, UTG range
+         6-max:    BTN open T9s, UTG fold K2o, BB vs BTN defend
+         Full ring: UTG fold 87s, EP fold vs UTG raise, UTG open QQ
+
+    Severity:
+      CRITICAL → failed esetén grade penalty +1
+      WARNING  → csak log-olva, nem büntetett
     """
     bb=2.0; sb=1.0; stk=100.0; S=[]
+
     def sc(**kw):
-        kw.setdefault('bb',bb); kw.setdefault('sb',sb); kw.setdefault('stack',stk)
-        kw.setdefault('legal_actions',[0,1,2,3,4,5,6])
-        kw.setdefault('all_chips',[kw.get('my_chips',2.0)]*np_)
+        kw.setdefault('bb', bb)
+        kw.setdefault('sb', sb)
+        kw.setdefault('stack', stk)
+        kw.setdefault('legal_actions', [0,1,2,3,4,5,6])
+        kw.setdefault('all_chips', [kw.get('my_chips', 2.0)] * np_)
         S.append(kw)
 
-    sc(name='AA preflop – raise',hole_cards=['As','Ah'],board_cards=[],street=0,
-       my_chips=2.0,pot=3.0,call_amount=0.0,expected_good={2,3,4,5,6},
-       expected_bad={0},severity='CRITICAL',category='preflop')
+    # ── A) UNIVERZÁLIS SZITUÁCIÓK ────────────────────────────────────────────
+    # Ezek minden asztalméretnél ugyanolyan döntést igényelnek.
 
-    sc(name='KK vs open',hole_cards=['Ks','Kh'],board_cards=[],street=0,
-       my_chips=2.0,all_chips=[6.0,2.0]+[0.0]*(np_-2),pot=9.0,call_amount=4.0,
-       expected_good={1,2,3,4,5,6},expected_bad={0},severity='CRITICAL',category='preflop')
+    sc(name='AA preflop – raise',
+       hole_cards=['As','Ah'], board_cards=[], street=0,
+       my_chips=2.0, pot=3.0, call_amount=0.0,
+       expected_good={2,3,4,5,6}, expected_bad={0},
+       severity='CRITICAL', category='preflop',
+       description='AA préflop: raise mindig helyes (VPIP + PFR).')
 
-    sc(name='AKs preflop',hole_cards=['As','Ks'],board_cards=[],street=0,
-       my_chips=1.0,all_chips=[1.0,2.0]+[0.0]*(np_-2),pot=3.0,call_amount=1.0,
-       expected_good={1,2,3,4,5,6},expected_bad={0},severity='CRITICAL',category='preflop')
+    sc(name='KK vs open – call/raise',
+       hole_cards=['Ks','Kh'], board_cards=[], street=0,
+       my_chips=2.0, all_chips=[6.0,2.0]+[0.0]*(np_-2),
+       pot=9.0, call_amount=4.0,
+       expected_good={1,2,3,4,5,6}, expected_bad={0},
+       severity='CRITICAL', category='preflop',
+       description='KK vs open: soha nem fold, call vagy re-raise.')
 
-    # ── FIX-1: 72o facing raise ──────────────────────────────────────────────
-    # RÉGI: expected_good={0,1}, expected_bad={5,6}, severity='WARNING'
-    #   → Hamis PASS, ha a modell Call-t választ (Call HU-ban -EV 72o-val)
-    # ÚJ:  expected_good={0}, expected_bad={2,3,4,5,6}, severity='CRITICAL'
-    #   → Csak a Fold helyes. Call ad WARN-t; bármely raise CRITICAL FAIL.
-    sc(name='72o facing raise',hole_cards=['7s','2h'],board_cards=[],street=0,
-       my_chips=2.0,all_chips=[6.0,2.0]+[0.0]*(np_-2),pot=9.0,call_amount=4.0,
-       expected_good={0},expected_bad={2,3,4,5,6},severity='CRITICAL',
-       category='preflop',
-       description='72o HU: egyértelmű fold. Call is -EV (pot odds ~30%, equity ~32%), '
-                   'bármely raise amatőr hiba.')
-    # ─────────────────────────────────────────────────────────────────────────
+    sc(name='AKs preflop – call/raise',
+       hole_cards=['As','Ks'], board_cards=[], street=0,
+       my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+       pot=3.0, call_amount=1.0,
+       expected_good={1,2,3,4,5,6}, expected_bad={0},
+       severity='CRITICAL', category='preflop',
+       description='AKs: top 3% kéz, call vagy raise – fold nem opció.')
 
-    sc(name='QQ facing 3-bet',hole_cards=['Qs','Qh'],board_cards=[],street=0,
-       my_chips=6.0,all_chips=[18.0,6.0]+[0.0]*(np_-2),pot=25.0,call_amount=12.0,
-       expected_good={1,4,5,6},expected_bad={0},severity='CRITICAL',category='3bet')
+    sc(name='72o facing raise – fold',
+       hole_cards=['7s','2h'], board_cards=[], street=0,
+       my_chips=2.0, all_chips=[6.0,2.0]+[0.0]*(np_-2),
+       pot=9.0, call_amount=4.0,
+       expected_good={0}, expected_bad={2,3,4,5,6},
+       severity='CRITICAL', category='preflop',
+       description='72o vs raise: fold MINDEN asztalméretnél (pot odds ~30%, equity ≤38%).')
 
-    sc(name='T8o facing 4-bet',hole_cards=['Th','8d'],board_cards=[],street=0,
-       my_chips=18.0,all_chips=[45.0,18.0]+[0.0]*(np_-2),pot=64.0,call_amount=27.0,
-       expected_good={0},expected_bad={5,6},severity='WARNING',category='3bet')
+    sc(name='Nut flush flop – bet',
+       hole_cards=['As','Ks'], board_cards=['Qs','7s','3s'],
+       street=1, my_chips=10.0,
+       all_chips=[10.0,10.0]+[0.0]*(np_-2),
+       pot=20.0, call_amount=0.0, stack=90.0,
+       expected_good={2,3,4,5,6}, expected_bad={0},
+       severity='CRITICAL', category='postflop',
+       description='Nut flush: bet/raise, ne slow play multiway sem.')
 
-    sc(name='Nut flush flop',hole_cards=['As','Ks'],board_cards=['Qs','7s','3s'],
-       street=1,my_chips=10.0,all_chips=[10.0,10.0]+[0.0]*(np_-2),
-       pot=20.0,call_amount=0.0,stack=90.0,
-       expected_good={2,3,4,5,6},expected_bad={0},severity='CRITICAL',category='postflop')
+    sc(name='Top set dry flop – bet',
+       hole_cards=['Ah','Ad'], board_cards=['Ac','7d','2s'],
+       street=1, my_chips=8.0,
+       all_chips=[8.0,8.0]+[0.0]*(np_-2),
+       pot=16.0, call_amount=0.0, stack=92.0,
+       expected_good={1,2,3,4,5,6}, expected_bad={0},
+       severity='CRITICAL', category='postflop',
+       description='Top set: bet/raise vagy check (slow play); fold soha.')
 
-    sc(name='Top set dry flop',hole_cards=['Ah','Ad'],board_cards=['Ac','7d','2s'],
-       street=1,my_chips=8.0,all_chips=[8.0,8.0]+[0.0]*(np_-2),
-       pot=16.0,call_amount=0.0,stack=92.0,
-       expected_good={1,2,3,4,5,6},expected_bad={0},severity='CRITICAL',category='postflop')
+    sc(name='Combo draw (15 out) flop – semi-bluff',
+       hole_cards=['Jh','Th'], board_cards=['9h','8d','2h'],
+       street=1, my_chips=6.0,
+       all_chips=[12.0,6.0]+[0.0]*(np_-2),
+       pot=18.0, call_amount=6.0, stack=94.0,
+       expected_good={1,4,5,6}, expected_bad={0},
+       severity='CRITICAL', category='semi_bluff',
+       description='15 out combo draw: call vagy raise; fold -EV (33% equity).')
 
-    sc(name='Combo draw (15 out) flop',hole_cards=['Jh','Th'],
-       board_cards=['9h','8d','2h'],street=1,my_chips=6.0,
-       all_chips=[12.0,6.0]+[0.0]*(np_-2),pot=18.0,call_amount=6.0,stack=94.0,
-       expected_good={1,4,5,6},expected_bad={0},severity='CRITICAL',category='semi_bluff')
+    sc(name='TPTK monotone board – passive',
+       hole_cards=['As','Kc'], board_cards=['Jh','9h','8h'],
+       street=1, my_chips=10.0,
+       all_chips=[30.0,10.0]+[0.0]*(np_-2),
+       pot=40.0, call_amount=20.0, stack=90.0,
+       expected_good={0,1}, expected_bad={5,6},
+       severity='WARNING', category='board_texture',
+       description='TPTK 3-flush boardon óriási bet ellen: fold/call OK, raise HIBA.')
 
-    sc(name='TPTK monotone board',hole_cards=['As','Kc'],
-       board_cards=['Jh','9h','8h'],street=1,my_chips=10.0,
-       all_chips=[30.0,10.0]+[0.0]*(np_-2),pot=40.0,call_amount=20.0,stack=90.0,
-       expected_good={0,1},expected_bad={5,6},severity='WARNING',category='board_texture')
+    sc(name='20:1 pot odds – call',
+       hole_cards=['5h','4d'], board_cards=['As','Ks','Qd','7c'],
+       street=2, my_chips=20.0,
+       all_chips=[22.0,20.0]+[0.0]*(np_-2),
+       pot=40.0, call_amount=2.0, stack=80.0,
+       expected_good={1,2,3,4,5,6}, expected_bad={0},
+       severity='WARNING', category='pot_odds',
+       description='20:1 pot odds: matematikailag call (szinte bármilyen kézzel).')
 
-    sc(name='10BB A8o BTN shove',hole_cards=['Ah','8d'],board_cards=[],street=0,
-       my_chips=1.0,all_chips=[1.0,2.0]+[0.0]*(np_-2),pot=3.0,call_amount=1.0,
-       stack=20.0,button_pos=0,my_player_id=0,
-       expected_good={5,6},expected_bad={0},severity='WARNING',category='short_stack')
+    sc(name='Air facing river pot bet – fold',
+       hole_cards=['9h','8h'], board_cards=['As','Kd','3c','5s','Jd'],
+       street=3, my_chips=30.0,
+       all_chips=[60.0,30.0]+[0.0]*(np_-2),
+       pot=60.0, call_amount=30.0, stack=70.0,
+       expected_good={0}, expected_bad={5,6},
+       severity='WARNING', category='pot_odds',
+       description='Air a riveren pot-bet ellen: fold (9 high, ~8% equity).')
 
-    sc(name='8BB 22 push/fold',hole_cards=['2s','2h'],board_cards=[],street=0,
-       my_chips=1.0,all_chips=[1.0,2.0]+[0.0]*(np_-2),pot=3.0,call_amount=1.0,
-       stack=16.0,button_pos=0,my_player_id=0,
-       expected_good={0,5,6},expected_bad={2,3},severity='WARNING',category='short_stack')
+    # ── B) PREFLOP – player-count-adjusted ──────────────────────────────────
+    # Ezek elvárásai np_-től függően változnak.
 
-    sc(name='20:1 pot odds',hole_cards=['5h','4d'],
-       board_cards=['As','Ks','Qd','7c'],street=2,my_chips=20.0,
-       all_chips=[22.0,20.0]+[0.0]*(np_-2),pot=40.0,call_amount=2.0,stack=80.0,
-       expected_good={1,2,3,4,5,6},expected_bad={0},severity='WARNING',category='pot_odds')
+    # T8o facing 4-bet:
+    #   HU:      pot odds ~40% vs ~38% equity → marginal, call/fold ok
+    #   3-5 max: fold inkább (range-disadvantage)
+    #   6+ max:  fold CRITICAL (cold 4-bet range megköveteli)
+    if np_ == 2:
+        t8o_good = {0, 1};  t8o_bad = {5, 6};  t8o_sev = 'WARNING'
+        t8o_desc = 'HU: T8o vs 4-bet – pot odds marginális call; raise HIBA.'
+    elif np_ <= 5:
+        t8o_good = {0};     t8o_bad = {4,5,6};  t8o_sev = 'WARNING'
+        t8o_desc = f'{np_}p: T8o vs 4-bet – fold preferált (range disadvantage).'
+    else:
+        t8o_good = {0};     t8o_bad = {3,4,5,6}; t8o_sev = 'CRITICAL'
+        t8o_desc = f'{np_}p: T8o vs 4-bet – fold KÖTELEZŐ (cold 4-bet range).'
+    sc(name='T8o facing 4-bet',
+       hole_cards=['Th','8d'], board_cards=[], street=0,
+       my_chips=18.0, all_chips=[45.0,18.0]+[0.0]*(np_-2),
+       pot=64.0, call_amount=27.0,
+       expected_good=t8o_good, expected_bad=t8o_bad,
+       severity=t8o_sev, category='3bet', description=t8o_desc)
 
-    sc(name='Air facing river pot bet',hole_cards=['9h','8h'],
-       board_cards=['As','Kd','3c','5s','Jd'],street=3,my_chips=30.0,
-       all_chips=[60.0,30.0]+[0.0]*(np_-2),pot=60.0,call_amount=30.0,stack=70.0,
-       expected_good={0},expected_bad={5,6},severity='WARNING',category='pot_odds')
+    # QQ facing 3-bet:
+    #   HU/short: call vagy 4-bet
+    #   Full ring vs EP 3-bet: QQ marginal, fold/call/raise mind ok
+    if np_ <= 5:
+        qq_good = {1,4,5,6}; qq_bad = {0}; qq_sev = 'CRITICAL'
+    else:
+        qq_good = {0,1,4,5,6}; qq_bad = {2,3}; qq_sev = 'WARNING'
+    sc(name='QQ facing 3-bet',
+       hole_cards=['Qs','Qh'], board_cards=[], street=0,
+       my_chips=6.0, all_chips=[18.0,6.0]+[0.0]*(np_-2),
+       pot=25.0, call_amount=12.0,
+       expected_good=qq_good, expected_bad=qq_bad,
+       severity=qq_sev, category='3bet',
+       description=f'{np_}p QQ vs 3-bet: {"call/4-bet (fold HIBA)" if np_<=5 else "fold/call/4-bet (min-raise HIBA)"}')
+
+    # 10BB A8o push/fold:
+    #   Universal: push inkább, de severity és description különbözik
+    if np_ == 2:
+        a8o_good = {5,6};  a8o_bad = {0};  a8o_sev = 'WARNING'
+        a8o_desc = 'HU 10BB A8o BTN: push (top 30% HU push range).'
+    elif np_ <= 5:
+        a8o_good = {5,6};  a8o_bad = {0};  a8o_sev = 'WARNING'
+        a8o_desc = f'{np_}p 10BB A8o BTN: push (BTN/CO pozícióban jó shove).'
+    else:
+        a8o_good = {0,5,6}; a8o_bad = {2,3}; a8o_sev = 'WARNING'
+        a8o_desc = f'{np_}p 10BB A8o BTN: push/fold; min-raise HIBA (bloating).'
+    sc(name='10BB A8o BTN push/fold',
+       hole_cards=['Ah','8d'], board_cards=[], street=0,
+       my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+       pot=3.0, call_amount=1.0, stack=20.0,
+       button_pos=0, my_player_id=0,
+       expected_good=a8o_good, expected_bad=a8o_bad,
+       severity=a8o_sev, category='short_stack', description=a8o_desc)
+
+    # 8BB 22 push/fold:
+    #   HU/BTN short: push
+    #   Full ring UTG: 22 is tighter, fold/push both ok
+    if np_ <= 5:
+        p22_good = {5,6};    p22_bad = {2,3}; p22_sev = 'WARNING'
+    else:
+        p22_good = {0,5,6};  p22_bad = {2,3}; p22_sev = 'WARNING'
+    sc(name='8BB 22 BTN push/fold',
+       hole_cards=['2s','2h'], board_cards=[], street=0,
+       my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+       pot=3.0, call_amount=1.0, stack=16.0,
+       button_pos=0, my_player_id=0,
+       expected_good=p22_good, expected_bad=p22_bad,
+       severity=p22_sev, category='short_stack',
+       description=f'{np_}p 8BB 22 BTN: {"push (2:1 chip EV)" if np_<=5 else "fold/push ok (full ring tight)"}.')
+
+    # ── C) PLAYER-COUNT-SPECIFIKUS SZITUÁCIÓK ───────────────────────────────
+
+    if np_ == 2:
+        # ── HU-SPECIFIKUS ──
+        # BTN open 83s: HU-ban a button 70%+ range-t nyit
+        sc(name='[HU] BTN open 83s',
+           hole_cards=['8h','3h'], board_cards=[], street=0,
+           my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+           pot=3.0, call_amount=1.0, stack=100.0,
+           button_pos=0, my_player_id=0,
+           expected_good={2,3,4,5,6}, expected_bad={0},
+           severity='WARNING', category='hu_specific',
+           description='HU BTN: 83s standard nyitás (HU push/fold top ~70%).')
+
+        # 3-bet AJo vs BTN open: HU-ban az AJo erős 3-bet kéz
+        sc(name='[HU] 3-bet AJo vs BTN',
+           hole_cards=['Ac','Jd'], board_cards=[], street=0,
+           my_chips=2.0, all_chips=[6.0,2.0]+[0.0]*(np_-2),
+           pot=9.0, call_amount=4.0,
+           expected_good={1,4,5,6}, expected_bad={0},
+           severity='WARNING', category='hu_specific',
+           description='HU BB: AJo vs BTN open – 3-bet vagy call; fold HIBA.')
+
+        # BB K2o vs min-open: HU BB defends very wide
+        sc(name='[HU] BB defend K2o vs min-open',
+           hole_cards=['Kd','2c'], board_cards=[], street=0,
+           my_chips=2.0, all_chips=[4.0,2.0]+[0.0]*(np_-2),
+           pot=6.0, call_amount=2.0,
+           expected_good={1,2,3}, expected_bad={0},
+           severity='WARNING', category='hu_specific',
+           description='HU BB: K2o vs 2BB min-open – defend (pot odds 33%, equity >35%).')
+
+    elif np_ <= 5:
+        # ── SHORT-HANDED (3-5max) SPECIFIKUS ──
+        # Squeeze ATs BB: BTN open + CO call → squeeze vagy fold, ne call
+        sc(name=f'[{np_}p] Squeeze ATs BB',
+           hole_cards=['Ah','Th'], board_cards=[], street=0,
+           my_chips=2.0, all_chips=[6.0,4.0,2.0]+[0.0]*(np_-3),
+           pot=12.0, call_amount=4.0,
+           expected_good={0,5,6}, expected_bad={2,3},
+           severity='WARNING', category='short_specific',
+           description=f'{np_}p BB ATs vs BTN open + call: squeeze (5-6x) vagy fold; cold call -EV.')
+
+        # CO cold call T9s vs BTN open: short-handed-ben fold preferált
+        sc(name=f'[{np_}p] CO fold T9s vs BTN',
+           hole_cards=['Td','9d'], board_cards=[], street=0,
+           my_chips=2.0, all_chips=[6.0,2.0]+[0.0]*(np_-2),
+           pot=9.0, call_amount=4.0,
+           expected_good={0,5,6}, expected_bad={},
+           severity='WARNING', category='short_specific',
+           description=f'{np_}p CO T9s vs BTN 3BB open: fold vagy squeeze (cold call marginal).')
+
+        # UTG open QQ: nyitni kell
+        sc(name=f'[{np_}p] UTG open QQ',
+           hole_cards=['Qs','Qh'], board_cards=[], street=0,
+           my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+           pot=3.0, call_amount=1.0, stack=100.0,
+           button_pos=np_-1, my_player_id=0,
+           expected_good={2,3,4,5,6}, expected_bad={0},
+           severity='CRITICAL', category='short_specific',
+           description=f'{np_}p UTG QQ: raise mindig (fold CRITICAL HIBA).')
+
+    elif np_ == 6:
+        # ── 6-MAX SPECIFIKUS ──
+        # BTN open T9s: 6-max BTN ~55% open range, T9s benne van
+        sc(name='[6max] BTN open T9s',
+           hole_cards=['Ts','9s'], board_cards=[], street=0,
+           my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+           pot=3.0, call_amount=1.0, stack=100.0,
+           button_pos=0, my_player_id=0,
+           expected_good={2,3,4,5,6}, expected_bad={0},
+           severity='WARNING', category='6max_specific',
+           description='6-max BTN T9s: standard nyitás (BTN ~55% open range).')
+
+        # UTG fold K2o: 6-max UTG range ~16%, K2o kívül esik
+        sc(name='[6max] UTG fold K2o',
+           hole_cards=['Kd','2c'], board_cards=[], street=0,
+           my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+           pot=3.0, call_amount=1.0, stack=100.0,
+           button_pos=np_-1, my_player_id=0,
+           expected_good={0}, expected_bad={3,4,5,6},
+           severity='CRITICAL', category='6max_specific',
+           description='6-max UTG K2o: fold (UTG range ~16%, K2o kívülre esik).')
+
+        # BB defend K7o vs BTN min-open: 6-max BB defends ~50%
+        sc(name='[6max] BB defend K7o vs BTN',
+           hole_cards=['Kh','7d'], board_cards=[], street=0,
+           my_chips=2.0, all_chips=[4.0,2.0]+[0.0]*(np_-2),
+           pot=6.0, call_amount=2.0,
+           expected_good={1,2,3}, expected_bad={},
+           severity='WARNING', category='6max_specific',
+           description='6-max BB K7o vs BTN 2BB open: call (BB defense ~50%; fold too tight).')
+
+    else:
+        # ── FULL RING (7-9 max) SPECIFIKUS ──
+        # UTG fold 87s: full ring UTG ~12%, 87s kívülre esik
+        sc(name=f'[{np_}p] UTG fold 87s',
+           hole_cards=['8h','7h'], board_cards=[], street=0,
+           my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+           pot=3.0, call_amount=1.0, stack=100.0,
+           button_pos=np_-1, my_player_id=0,
+           expected_good={0}, expected_bad={3,4,5,6},
+           severity='CRITICAL', category='ring_specific',
+           description=f'{np_}p UTG 87s: fold (UTG range ~12%; 87s junk kéznek számít).')
+
+        # EP fold KJo vs UTG open: full ring-ben EP vs UTG raise KJo fold
+        sc(name=f'[{np_}p] EP fold KJo vs UTG',
+           hole_cards=['Kd','Jc'], board_cards=[], street=0,
+           my_chips=2.0, all_chips=[6.0,2.0]+[0.0]*(np_-2),
+           pot=9.0, call_amount=4.0,
+           expected_good={0,5,6}, expected_bad={2,3},
+           severity='WARNING', category='ring_specific',
+           description=f'{np_}p EP KJo vs UTG open: fold vagy 4-bet; flat call -EV (dominated).')
+
+        # UTG open QQ: full ring-ben is nyitni kell
+        sc(name=f'[{np_}p] UTG open QQ',
+           hole_cards=['Qs','Qh'], board_cards=[], street=0,
+           my_chips=1.0, all_chips=[1.0,2.0]+[0.0]*(np_-2),
+           pot=3.0, call_amount=1.0, stack=100.0,
+           button_pos=np_-1, my_player_id=0,
+           expected_good={2,3,4,5,6}, expected_bad={0},
+           severity='CRITICAL', category='ring_specific',
+           description=f'{np_}p UTG QQ: raise (fold CRITICAL HIBA full ring-ben is).')
 
     return S
+
 
 def run_scenarios(model, ob, tr, he, np_, dev, ee, tl, verbose):
     scenarios = make_scenarios(np_); mp = PokerActionMapper()
@@ -1334,95 +1607,212 @@ def run_scenario_generator_test(model, ob, tr, he, np_, dev, ee, tl):
 
 
 def run_poker_stats(model, ob, tr, he, np_, dev, ee, n_hands, tl):
+    """
+    VPIP / PFR / AF / 3-bet% / C-bet% mérés és kiértékelés.
+
+    [TASK-16] Teljesen átdolgozva:
+      1. TABLE_STAT_TARGETS alapján per-player-count célsávok
+      2. Multiway szituációk (3+ játékosnál a 'coldcall' és 'multiway_post'
+         típusú kezek hozzáadva) – realisztikusabb stat-gyűjtés
+      3. Részletesebb kimeneti log (ideális sáv, eltérés, kategória)
+    """
     tl.log(f"\n{'─'*65}")
-    tl.log(f"  POKER STATISZTIKÁK ({n_hands} random kéz)")
+    cat = _table_category(np_)
+    tl.log(f"  POKER STATISZTIKÁK – {cat} ({n_hands} random kéz)")
     tl.log(f"{'─'*65}\n")
-    mp=PokerActionMapper(); bb=2.0; sb=1.0
-    ac=collections.Counter()
-    vo=0;va=0;po=0;pa_=0;pb=0;pc_=0;co=0;ca_=0;to=0;ta=0;fp=0;np2=0
+
+    mp = PokerActionMapper()
+    bb = 2.0; sb = 1.0
+    ac = collections.Counter()
+
+    # Stat számlálók
+    vo=0; va=0   # VPIP: opportunities / voluntary
+    po=0; pa=0   # PFR: open opportunities / raises
+    to=0; ta=0   # 3-bet: facing-open opportunities / 3-bets
+    pb=0; pc=0   # AF: postflop bets / calls
+    co=0; ca=0   # C-bet: cbet opportunities / cbets
+    np2=0; fp=0  # Premium fold counter
+
+    # Szituáció típusok – np_-től függő eloszlás
+    # HU: csak open/facing_raise/facing_3bet/postflop
+    # 3-5max: + coldcall (CO vs BTN open)
+    # 6+: + coldcall + multiway_post
+    if np_ == 2:
+        sit_pool = ['open']*4 + ['facing_raise']*3 + ['facing_3bet'] + ['postflop']*2
+    elif np_ <= 5:
+        sit_pool = ['open']*3 + ['facing_raise']*2 + ['facing_3bet'] + ['coldcall'] + ['postflop']*3
+    else:
+        sit_pool = ['open']*2 + ['facing_raise']*2 + ['facing_3bet'] + ['coldcall'] + ['multiway_post'] + ['postflop']*3
 
     for _ in range(n_hands):
-        deck=list(ALL_CARDS); random.shuffle(deck); hole=[deck[0],deck[1]]
-        sit=random.choice(['open','facing_raise','postflop','facing_3bet'])
-        if sit=='open':
-            sc={'hole_cards':hole,'board_cards':[],'street':0,'my_chips':1.0,
-                'all_chips':[1.0,2.0]+[0.0]*(np_-2),'pot':3.0,'call_amount':1.0,
-                'bb':bb,'sb':sb,'stack':100.0,'button_pos':0,'my_player_id':0,
-                'legal_actions':[0,1,2,3,4,5,6]}
-            _,best,_,_=query_model(model,ob,tr,he,sc,np_,dev,ee)
-            vo+=1;po+=1
-            if best>=1:va+=1
-            if best>=2:pa_+=1
-        elif sit=='facing_raise':
-            sc={'hole_cards':hole,'board_cards':[],'street':0,'my_chips':2.0,
-                'all_chips':[6.0,2.0]+[0.0]*(np_-2),'pot':8.0,'call_amount':4.0,
-                'bb':bb,'sb':sb,'stack':100.0,'button_pos':1,'my_player_id':0,
-                'legal_actions':[0,1,2,3,4,5,6]}
-            _,best,_,_=query_model(model,ob,tr,he,sc,np_,dev,ee)
-            vo+=1;to+=1
-            if best>=1:va+=1
-            if best>=2:ta+=1
-        elif sit=='facing_3bet':
-            sc={'hole_cards':hole,'board_cards':[],'street':0,'my_chips':6.0,
-                'all_chips':[18.0,6.0]+[0.0]*(np_-2),'pot':24.0,'call_amount':12.0,
-                'bb':bb,'sb':sb,'stack':100.0,'button_pos':0,'my_player_id':0,
-                'legal_actions':[0,1,2,3,4,5,6]}
-            _,best,_,_=query_model(model,ob,tr,he,sc,np_,dev,ee)
-            vo+=1
-            if best>=1:va+=1
-        else:
-            nb=random.choice([3,4,5]);board=deck[2:2+nb]
-            st=1 if nb==3 else(2 if nb==4 else 3)
-            mc=random.uniform(5,30);oc=random.uniform(5,30)
-            call=random.uniform(0,15) if random.random()>0.4 else 0.0
-            sc={'hole_cards':hole,'board_cards':board,'street':st,'my_chips':mc,
-                'all_chips':[oc,mc]+[0.0]*(np_-2),'pot':mc+oc,'call_amount':call,
-                'bb':bb,'sb':sb,'stack':100.0-mc,'legal_actions':[0,1,2,3,4,5,6]}
-            _,best,_,_=query_model(model,ob,tr,he,sc,np_,dev,ee)
-            if best>=2:pb+=1
-            elif best==1 and call>0:pc_+=1
-            if call<0.01:co+=1;ca_+=(1 if best>=2 else 0)
-        ac[best]+=1
-        r1,r2=hole[0][0],hole[1][0]
-        if(r1==r2 and r1 in'AKQJ')or('A'in(r1,r2)and set((r1,r2))&set('KQJ')):
-            np2+=1;fp+=(1 if best==0 else 0)
+        deck = list(ALL_CARDS); random.shuffle(deck)
+        hole = [deck[0], deck[1]]
+        sit  = random.choice(sit_pool)
 
-    total=sum(ac.values())
+        if sit == 'open':
+            # Hero on BTN/SB open
+            sc = {
+                'hole_cards': hole, 'board_cards': [], 'street': 0,
+                'my_chips': 1.0,
+                'all_chips': [1.0, 2.0] + [0.0]*(np_-2),
+                'pot': 3.0, 'call_amount': 1.0,
+                'bb': bb, 'sb': sb, 'stack': 100.0,
+                'button_pos': 0, 'my_player_id': 0,
+                'legal_actions': [0,1,2,3,4,5,6],
+            }
+            _, best, _, _ = query_model(model, ob, tr, he, sc, np_, dev, ee)
+            vo += 1; po += 1
+            if best >= 1: va += 1
+            if best >= 2: pa += 1
+
+        elif sit == 'facing_raise':
+            # Hero BB facing BTN open
+            sc = {
+                'hole_cards': hole, 'board_cards': [], 'street': 0,
+                'my_chips': 2.0,
+                'all_chips': [6.0, 2.0] + [0.0]*(np_-2),
+                'pot': 8.0, 'call_amount': 4.0,
+                'bb': bb, 'sb': sb, 'stack': 100.0,
+                'button_pos': 1, 'my_player_id': 0,
+                'legal_actions': [0,1,2,3,4,5,6],
+            }
+            _, best, _, _ = query_model(model, ob, tr, he, sc, np_, dev, ee)
+            vo += 1; to += 1
+            if best >= 1: va += 1
+            if best >= 2: ta += 1
+
+        elif sit == 'facing_3bet':
+            # Hero BTN facing 3-bet from BB
+            sc = {
+                'hole_cards': hole, 'board_cards': [], 'street': 0,
+                'my_chips': 6.0,
+                'all_chips': [18.0, 6.0] + [0.0]*(np_-2),
+                'pot': 24.0, 'call_amount': 12.0,
+                'bb': bb, 'sb': sb, 'stack': 100.0,
+                'button_pos': 0, 'my_player_id': 0,
+                'legal_actions': [0,1,2,3,4,5,6],
+            }
+            _, best, _, _ = query_model(model, ob, tr, he, sc, np_, dev, ee)
+            vo += 1
+            if best >= 1: va += 1
+
+        elif sit == 'coldcall':
+            # CO facing BTN open (cold call scenario – 3-5max és 6+max)
+            co_chips = random.choice([2.0, 4.0])  # limp or raise
+            sc = {
+                'hole_cards': hole, 'board_cards': [], 'street': 0,
+                'my_chips': co_chips,
+                'all_chips': [6.0, co_chips, 2.0] + [0.0]*(np_-3),
+                'pot': 6.0 + co_chips + 2.0, 'call_amount': 6.0 - co_chips,
+                'bb': bb, 'sb': sb, 'stack': 100.0,
+                'button_pos': 0, 'my_player_id': 2,
+                'legal_actions': [0,1,2,3,4,5,6],
+            }
+            _, best, _, _ = query_model(model, ob, tr, he, sc, np_, dev, ee)
+            vo += 1
+            if best >= 1: va += 1
+
+        elif sit == 'multiway_post':
+            # Multiway flop (BTN + CO + BB): realisztikus 6+ játékosnál
+            nb = random.choice([3])
+            board = deck[2:5]
+            mc  = random.uniform(4, 15)
+            oc1 = random.uniform(4, 15)
+            oc2 = random.uniform(0, mc)
+            call = random.uniform(0, 10) if random.random() > 0.4 else 0.0
+            sc = {
+                'hole_cards': hole, 'board_cards': board, 'street': 1,
+                'my_chips': mc,
+                'all_chips': [oc1, oc2, mc] + [0.0]*(np_-3),
+                'pot': oc1 + oc2 + mc, 'call_amount': call,
+                'bb': bb, 'sb': sb, 'stack': 100.0 - mc,
+                'legal_actions': [0,1,2,3,4,5,6],
+            }
+            _, best, _, _ = query_model(model, ob, tr, he, sc, np_, dev, ee)
+            if best >= 2: pb += 1
+            elif best == 1 and call > 0: pc += 1
+            if call < 0.01: co += 1; ca += (1 if best >= 2 else 0)
+
+        else:  # postflop
+            nb  = random.choice([3,4,5]); board = deck[2:2+nb]
+            st  = 1 if nb == 3 else (2 if nb == 4 else 3)
+            mc  = random.uniform(5, 30); oc = random.uniform(5, 30)
+            call = random.uniform(0, 15) if random.random() > 0.4 else 0.0
+            sc = {
+                'hole_cards': hole, 'board_cards': board, 'street': st,
+                'my_chips': mc,
+                'all_chips': [oc, mc] + [0.0]*(np_-2),
+                'pot': mc + oc, 'call_amount': call,
+                'bb': bb, 'sb': sb, 'stack': 100.0 - mc,
+                'legal_actions': [0,1,2,3,4,5,6],
+            }
+            _, best, _, _ = query_model(model, ob, tr, he, sc, np_, dev, ee)
+            if best >= 2: pb += 1
+            elif best == 1 and call > 0: pc += 1
+            if call < 0.01: co += 1; ca += (1 if best >= 2 else 0)
+
+        ac[best] += 1
+
+        # Prémium fold tracker
+        r1, r2 = hole[0][0], hole[1][0]
+        if ((r1 == r2 and r1 in 'AKQJ')
+                or ('A' in (r1, r2) and set((r1, r2)) & set('KQJ'))):
+            np2 += 1
+            if best == 0: fp += 1
+
+    total = sum(ac.values())
     tl.log(f"  Akció eloszlás ({total} kéz):")
     for a in range(7):
-        c=ac.get(a,0);p=c/max(total,1)*100
+        c = ac.get(a, 0); p = c / max(total, 1) * 100
         tl.log(f"    {mp.action_name(a):18s}: {c:5d} ({p:5.1f}%) {'█'*int(p/2)}")
-    vpip=va/max(vo,1)*100;pfr=pa_/max(po,1)*100
-    af=pb/max(pc_,1);tbet=ta/max(to,1)*100;cbet=ca_/max(co,1)*100
-    tl.log(f"\n  VPIP:{vpip:5.1f}% PFR:{pfr:5.1f}% AF:{af:5.2f} 3bet:{tbet:5.1f}% Cbet:{cbet:5.1f}%")
-    if np_==2:
-        vok=55<=vpip<=90;pok=35<=pfr<=75;aok=1.5<=af<=5.0;cok=50<=cbet<=85
-        tl.log(f"  HU ideális: VPIP 55-90 | PFR 35-75 | AF 1.5-5 | Cbet 50-85")
-    else:
-        vok=18<=vpip<=35;pok=15<=pfr<=30;aok=1.5<=af<=4.0;cok=55<=cbet<=80
-        tl.log(f"  {np_}-max: VPIP 18-35 | PFR 15-30 | AF 1.5-4 | Cbet 55-80")
-    tl.log(f"  VPIP{'✅'if vok else'⚠'} PFR{'✅'if pok else'⚠'} "
-           f"AF{'✅'if aok else'⚠'} Cbet{'✅'if cok else'⚠'}")
-    if np2>0:
-        fpp=fp/np2*100
-        tl.log(f"  Prémium fold: {fp}/{np2} ({fpp:.0f}%) "
-               f"{'✅'if fpp<=5 else'⚠'if fpp<=15 else'❌'}")
-    degen=[]
-    fpct=ac.get(0,0)/max(total,1)*100;aipct=ac.get(6,0)/max(total,1)*100
-    mx=max(ac.values())/max(total,1)*100 if ac else 0
-    if mx>80:degen.append(f"❌ Degenerált:{mp.action_name(max(ac,key=ac.get))} {mx:.0f}%")
-    if fpct>70:degen.append(f"❌ Passzív:{fpct:.0f}%")
-    if aipct>40:degen.append(f"❌ AllIn spam:{aipct:.0f}%")
-    for d in degen:tl.log(f"  {d}")
-    return{'vpip':vpip,'pfr':pfr,'af':af,'three_bet':tbet,'cbet':cbet,
-           'fold_pct':fpct,'allin_pct':aipct,
-           'premium_fold':fp/max(np2,1)*100,'degeneration':degen,
-           'vpip_ok':vok,'pfr_ok':pok,'af_ok':aok}
 
+    vpip = va / max(vo, 1) * 100
+    pfr  = pa / max(po, 1) * 100
+    af   = pb / max(pc, 1)
+    tbet = ta / max(to, 1) * 100
+    cbet = ca / max(co, 1) * 100
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 9. MODELL ÖSSZEHASONLÍTÁS (--compare)
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ── Per-player-count célsávok ──────────────────────────────────────────
+    tgt = TABLE_STAT_TARGETS[min(np_, 9)]
+    vlo, vhi = tgt['vpip'];  vok  = _stat_ok(vpip, vlo, vhi)
+    plo, phi = tgt['pfr'];   pok  = _stat_ok(pfr,  plo, phi)
+    alo, ahi = tgt['af'];    aok  = _stat_ok(af,   alo, ahi)
+    tlo, thi = tgt['tbet'];  tok  = _stat_ok(tbet, tlo, thi)
+    clo, chi = tgt['cbet'];  cok  = _stat_ok(cbet, clo, chi)
+
+    tl.log(f"\n  ── Statisztikák [{cat}] ──")
+    tl.log(f"  {'Mutató':<10} {'Érték':>7}   {'Ideális sáv':>13}   Státusz")
+    tl.log(f"  {'─'*50}")
+    tl.log(f"  {'VPIP':<10} {vpip:>6.1f}%   [{vlo:3d}–{vhi:3d}%]       {'✅' if vok else '⚠'}")
+    tl.log(f"  {'PFR':<10} {pfr:>6.1f}%   [{plo:3d}–{phi:3d}%]       {'✅' if pok else '⚠'}")
+    tl.log(f"  {'AF':<10} {af:>6.2f}    [{alo:.1f}–{ahi:.1f}]        {'✅' if aok else '⚠'}")
+    tl.log(f"  {'3-bet%':<10} {tbet:>6.1f}%   [{tlo:3d}–{thi:3d}%]       {'✅' if tok else '⚠'}")
+    tl.log(f"  {'C-bet%':<10} {cbet:>6.1f}%   [{clo:3d}–{chi:3d}%]       {'✅' if cok else '⚠'}")
+
+    if np2 > 0:
+        fpp = fp / np2 * 100
+        tl.log(f"\n  Prémium kéz fold: {fp}/{np2} ({fpp:.0f}%) "
+               f"{'✅' if fpp<=5 else '⚠' if fpp<=15 else '❌'}")
+
+    degen = []
+    fpct   = ac.get(0,0) / max(total,1) * 100
+    aipct  = ac.get(6,0) / max(total,1) * 100
+    mx     = max(ac.values()) / max(total,1) * 100 if ac else 0
+    if mx > 80:   degen.append(f"❌ Degenerált: {mp.action_name(max(ac,key=ac.get))} {mx:.0f}%")
+    if fpct > 70: degen.append(f"❌ Passzív: fold {fpct:.0f}%")
+    if aipct > 40: degen.append(f"❌ AllIn spam: {aipct:.0f}%")
+    for d in degen: tl.log(f"  {d}")
+
+    return {
+        'vpip': vpip, 'pfr': pfr, 'af': af,
+        'three_bet': tbet, 'cbet': cbet,
+        'fold_pct': fpct, 'allin_pct': aipct,
+        'premium_fold': fp / max(np2,1) * 100,
+        'degeneration': degen,
+        'vpip_ok': vok, 'pfr_ok': pok, 'af_ok': aok,
+        'tbet_ok': tok, 'cbet_ok': cok,
+    }
+
 
 def compare_models(model_paths, np_, device, n_hands, seed, do_winrate, wr_hands):
     print(f"\n{'='*75}")
@@ -1526,7 +1916,8 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
         tl.log = lambda text, console=False: tl._file.write(text+'\n')
 
     tl.log(f"\n{'='*65}")
-    tl.log(f"  🧪  POKER AI VIZSGÁZTATÓ v3.3 SPRINT3")
+    cat_label = _table_category(np_)
+    tl.log(f"  🧪  POKER AI VIZSGÁZTATÓ v4.0 [TASK-16: {cat_label}]")
     tl.log(f"{'='*65}")
     tl.log(f"  Modell: {model_path} ({episodes:,} ep)")
     tl.log(f"  {np_}p | {n_hands:,} kéz | seed={seed}")
@@ -1564,6 +1955,7 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
     #   +1 ha exploit score < 3/7                (HUD-vakság)
     #   +1 ha value kalibráció < 3 passed        (critic nem tanult EV-t)
     #   +1 per degeneration flag                 (VPIP/PFR/AF szélsőség)
+    #   +1 ha VPIP/PFR/3bet mindhárom rossz        ([TASK-16] per-player-count)
     #
     # Grade skála:
     #   0 penalty → 🟢 JÓ
@@ -1601,6 +1993,16 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
         penalty += 1
         penalty_log.append(f"degen:{degen[:20]}")
 
+    # [TASK-16] Per-player-count stat check: VPIP + PFR + 3-bet mind rossz → penalty
+    stat_failures = sum([
+        0 if stats.get('vpip_ok', True) else 1,
+        0 if stats.get('pfr_ok',  True) else 1,
+        0 if stats.get('tbet_ok', True) else 1,
+    ])
+    if stat_failures >= 3:
+        penalty += 1
+        penalty_log.append(f"stats[{_table_category(np_)}]: VPIP+PFR+3bet mind rossz")
+
     if   penalty == 0: g = '🟢 JÓ'
     elif penalty == 1: g = '🟡 ELFOGADHATÓ'
     elif penalty == 2: g = '🟠 PROBLÉMÁS'
@@ -1619,7 +2021,12 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
     tl.log(f"  ScenGen river:  {scgen['river_passed']}/{scgen['river_total']} "
            f"| stack={'✅' if scgen['stack_aware'] else '⚠'} "
            f"| texture={'✅' if scgen['texture_aware'] else '⚠'}")
-    tl.log(f"  VPIP:{stats['vpip']:.0f}% PFR:{stats['pfr']:.0f}% AF:{stats['af']:.2f}")
+    tl.log(f"  Stat [{_table_category(np_)}]:  "
+           f"VPIP:{stats['vpip']:.0f}%{'✅' if stats.get('vpip_ok') else '⚠'} "
+           f"PFR:{stats['pfr']:.0f}%{'✅' if stats.get('pfr_ok') else '⚠'} "
+           f"AF:{stats['af']:.2f}{'✅' if stats.get('af_ok') else '⚠'} "
+           f"3b:{stats['three_bet']:.0f}%{'✅' if stats.get('tbet_ok') else '⚠'} "
+           f"Cb:{stats['cbet']:.0f}%{'✅' if stats.get('cbet_ok') else '⚠'}")
     if wr:
         sp_ci  = wr.get('self_play_ci_low')
         rnd_ci = wr.get('vs_random_ci_low')

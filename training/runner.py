@@ -625,19 +625,11 @@ def run_training_session(
         total_collected     += collected_this_batch
 
         # GAE bootstrap – last_value ha nem terminális buffer vég
+        # [RF-3b FIX] collector.get_bootstrap_value() az env.step() UTÁNI
+        # state-et (s_{T+1}) használja – nem a buffer.states[-1]-et (s_T).
         last_value = 0.0
         if buffer.episode_ends and not buffer.episode_ends[-1]:
-            try:
-                last_state = buffer.states[-1].unsqueeze(0).to(device)
-                last_legal = buffer.legal_actions[-1]
-                with torch.inference_mode():
-                    _, lv, _ = learner.forward(last_state, last_legal)
-                last_value = float(lv.item())
-            except Exception as exc:
-                logger.debug(
-                    f"last_value bootstrap hiba (fallback 0.0): {exc}"
-                )
-
+            last_value = collector.get_bootstrap_value(learner, device)
         try:
             metrics = trainer.update(buffer, last_value=last_value)
         except Exception as exc:

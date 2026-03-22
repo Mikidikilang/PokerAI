@@ -789,11 +789,21 @@ class ScreenReader:
         """
         Debounce: csak akkor fogadja el az értéket, ha stabil.
         Animáció közben az OCR szemetet olvashat.
+
+        [TASK-2 FIX] Ha new_values üres (nincs detekció az adott frame-ben),
+        a history-t töröljük.  Az eredeti kód megtartotta a régi history-t,
+        ami kéz vége után is visszaadta az utolsó pot/stack értéket
+        (phantom detekció) -> hamis hand_over eseményt okozhatott.
         """
         if new_values:
             # Az első értéket vesszük (pot-nál általában egy van)
             value = new_values[0]
             history.append(value)
+        else:
+            # Nincs detekció -> az objektum eltunt a képernyon,
+            # töröljük a múltat, hogy ne maradjon "phantom" érték.
+            history.clear()
+            return None
 
         # Max N értéket tárolunk
         while len(history) > self._DEBOUNCE_FRAMES:

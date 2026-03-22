@@ -36,20 +36,143 @@ HU (2-player) equity referencia (MC n=200):
   Random hand ~50% | 72o ~35%
 
   Approximate top-X% thresholds (HU):
-    top  8% → eq > 0.70  (AA, KK, QQ, JJ, TT, AKs, AKo)
-    top 12% → eq > 0.67  (+ 99, AQs, AQo)
-    top 28% → eq > 0.58  (+ 88, 77, AJs, KQs, ...)
-    top 35% → eq > 0.55
-    top 45% → eq > 0.50  (mid-range, near average)
-    top 55% → eq > 0.47  (loose range)
+    top  8% → eq > EQ_PREMIUM  (AA, KK, QQ, JJ, TT, AKs, AKo)
+    top 12% → eq > EQ_STRONG  (+ 99, AQs, AQo)
+    top 28% → eq > EQ_DECENT  (+ 88, 77, AJs, KQs, ...)
+    top 35% → eq > EQ_MIDRANGE
+    top 45% → eq > EQ_AVERAGE  (mid-range, near average)
+    top 55% → eq > EQ_LOOSE  (loose range)
 """
 
 import torch
 import random
 
+# =============================================================================
+# [TASK-8] NEVESÍTETT KONSTANSOK – korábbi hardkódolt számok helyett
+# Minden threshold és súly itt van definiálva, így könnyen karbantartható
+# és dokumentált hogy mit jelent.
+# =============================================================================
+
+# ── Equity küszöbök (HU, MC n=200 becslések alapján) ─────────────────────────
+EQ_PREMIUM          = 0.70   # top ~8%:  AA, KK, QQ, JJ, TT, AKs, AKo
+EQ_STRONG           = 0.67   # top ~12%: + 99, AQs, AQo
+EQ_DECENT_HIGH      = 0.65   # NitBot: strong postflop threshold
+EQ_DECENT           = 0.58   # top ~28%: + 88, 77, AJs, KQs, ...
+EQ_MIDRANGE         = 0.55   # top ~35%: FishBot pair+ threshold
+EQ_AVERAGE          = 0.50   # ~50%: mid-range (NitBot check/call határvonal)
+EQ_LOOSE            = 0.47   # top ~55%: FishBot VPIP range, LAGBot threshold
+EQ_WEAK             = 0.45   # FishBot gyenge draw/mediocre hand
+EQ_AIR              = 0.40   # FishBot air threshold
+
+# ── Bet méret küszöbök (bet/pot arány, 1.0 = pot-size bet) ───────────────────
+BET_SMALL           = 0.33   # ≤ 1x pot: kis bet – call liberálisan
+BET_MEDIUM          = 0.60   # 1-2x pot: normál bet
+BET_LARGE           = 0.67   # ~2x pot: nagy bet – szigorú call threshold
+BET_ALLIN           = 0.80   # > 2-3x pot: all-in szintű bet
+
+# ── Logit erősségek (szoftmax súlyok; nagyobb = valószínűbb akció) ────────────
+LOGIT_DOMINANT      = 8.0    # szinte biztos akció
+LOGIT_STRONG        = 4.5    # erős preferencia
+LOGIT_MEDIUM        = 3.0    # közepes preferencia
+LOGIT_WEAK          = 1.5    # enyhe preferencia
+LOGIT_RARE          = 0.5    # ritka akció
+LOGIT_NEVER         = -15.0  # gyakorlatilag tiltott akció
+LOGIT_VETO          = -20.0  # abszolút tiltott (FishBot fold pair+-szal)
+
+# ── Bot archetype VPIP/PFR referencia értékek (dokumentációs célra) ──────────
+FISH_VPIP           = 0.55   # FishBot: VPIP ~55%
+FISH_PFR            = 0.08   # FishBot: PFR ~8%
+NIT_VPIP            = 0.12   # NitBot: VPIP ~12%
+NIT_PFR             = 0.10   # NitBot: PFR ~10%
+LAG_VPIP            = 0.52   # LAGBot: VPIP ~52%
+LAG_PFR             = 0.42   # LAGBot: PFR ~42%
+CALLSTATION_VPIP    = 0.70   # CallingStation: VPIP ~70%
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Callable actor_head wrapper – collector kompatibilitás
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def equity_thresholds_for(num_players: int) -> dict:
+    """
+    Per-player-count equity küszöbök a bot döntési logikához.
+
+    [TASK-16] Az eredeti konstansok (EQ_PREMIUM = 0.70 stb.) HU-ra
+    (2 játékos) voltak kalibrálva.  Több játékosnál ugyanaz a kéz
+    lényegesen alacsonyabb equity-t mutat a HandEquityEstimator-ban,
+    mert num_opponents=N-1 szerint van számolva:
+
+        AA vs 1 opp (HU) ≈ 85%   → EQ_PREMIUM HU = 0.70 (top ~8%)
+        AA vs 2 opp (3p) ≈ 73%   → EQ_PREMIUM 3p = 0.60
+        AA vs 5 opp (6p) ≈ 58%   → EQ_PREMIUM 6p = 0.47
+        AA vs 8 opp (9p) ≈ 47%   → EQ_PREMIUM 9p = 0.40
+
+    A küszöbök a RELATÍV range-percentileket tartják konstansen
+    (pl. EQ_PREMIUM mindig a top ~8% kezet jelöli), de az abszolút
+    equity érték arányosan csökken több ellenfélnél.
+
+    Visszatér: dict kulcsokkal:
+        premium, strong, decent_high, decent, midrange,
+        average, loose, weak, air
+    """
+    # Kalibrálva HandEquityEstimator(n_sim=500) MC szimulációkkal
+    # Forrás: preflop all-in equity táblák, post-flop átlagolt
+    if num_players == 2:                # HU – eredeti kalibrálás
+        return dict(
+            premium    = EQ_PREMIUM,       # 0.70 – AA~85%, top ~8%
+            strong     = EQ_STRONG,        # 0.67 – KK, top ~12%
+            decent_high= EQ_DECENT_HIGH,   # 0.65
+            decent     = EQ_DECENT,        # 0.58 – top ~28%
+            midrange   = EQ_MIDRANGE,      # 0.55 – top ~35%
+            average    = EQ_AVERAGE,       # 0.50 – ~50th percentile
+            loose      = EQ_LOOSE,         # 0.47 – top ~55%
+            weak       = EQ_WEAK,          # 0.45
+            air        = EQ_AIR,           # 0.40
+        )
+    elif num_players == 3:
+        return dict(
+            premium    = 0.60, strong     = 0.56, decent_high= 0.53,
+            decent     = 0.48, midrange   = 0.45, average    = 0.41,
+            loose      = 0.38, weak       = 0.36, air        = 0.32,
+        )
+    elif num_players == 4:
+        return dict(
+            premium    = 0.53, strong     = 0.50, decent_high= 0.47,
+            decent     = 0.42, midrange   = 0.39, average    = 0.36,
+            loose      = 0.33, weak       = 0.31, air        = 0.27,
+        )
+    elif num_players == 5:
+        return dict(
+            premium    = 0.49, strong     = 0.46, decent_high= 0.43,
+            decent     = 0.39, midrange   = 0.36, average    = 0.33,
+            loose      = 0.30, weak       = 0.28, air        = 0.24,
+        )
+    elif num_players == 6:
+        return dict(
+            premium    = 0.46, strong     = 0.43, decent_high= 0.40,
+            decent     = 0.36, midrange   = 0.33, average    = 0.30,
+            loose      = 0.28, weak       = 0.26, air        = 0.22,
+        )
+    elif num_players == 7:
+        return dict(
+            premium    = 0.43, strong     = 0.40, decent_high= 0.38,
+            decent     = 0.34, midrange   = 0.31, average    = 0.28,
+            loose      = 0.26, weak       = 0.24, air        = 0.20,
+        )
+    elif num_players == 8:
+        return dict(
+            premium    = 0.41, strong     = 0.38, decent_high= 0.36,
+            decent     = 0.32, midrange   = 0.29, average    = 0.26,
+            loose      = 0.24, weak       = 0.22, air        = 0.18,
+        )
+    else:  # 9 players (full ring)
+        return dict(
+            premium    = 0.39, strong     = 0.36, decent_high= 0.34,
+            decent     = 0.30, midrange   = 0.27, average    = 0.24,
+            loose      = 0.22, weak       = 0.20, air        = 0.17,
+        )
+
 
 class _BotHead:
     """
@@ -95,6 +218,11 @@ class RuleBasedBot:
         self._street_start = base + 8     # stack(8) után
         self._pot_start    = base + 8 + 4 # street(4) után
         self._equity_idx   = state_size - 1
+
+        # [TASK-16] Per-player-count equity küszöbök dinamikus betöltése.
+        # A modul-szintű EQ_* konstansok HU-ra vonatkoznak; itt az aktuális
+        # asztalméretre kalibrált értékek töltődnek be self._eq-ba.
+        self._eq = equity_thresholds_for(num_players)
 
         self.actor_head = _BotHead(self)
 
@@ -181,12 +309,12 @@ class FishBot(RuleBasedBot):
          → modell megtanulja: "kis bettel value-z, ne blöfföl nagyot"
 
     Preflop:
-      eq > 0.70 → raise (2 vagy 6, a fish mindig extrém méretet használ)
-      eq > 0.47 → call (top ~55%)
+      eq > EQ_PREMIUM → raise (2 vagy 6, a fish mindig extrém méretet használ)
+      eq > EQ_LOOSE → call (top ~55%)
       rest     → fold
 
     Postflop:
-      Pair+ (eq > 0.55): SOHA nem fold, call vagy min-raise
+      Pair+ (eq > EQ_MIDRANGE): SOHA nem fold, call vagy min-raise
       Gyenge (eq 0.40-0.55): call, kivéve huge bet
       Air (eq < 0.40): SIZE-DEPENDENT: kis bet → call, nagy bet → fold
     """
@@ -196,66 +324,66 @@ class FishBot(RuleBasedBot):
         L = torch.zeros(self.action_size)
 
         if street == 0:  # ── PREFLOP ──────────────────────────────────────
-            if eq > 0.70:
+            if eq > self._eq['premium']:
                 # Top ~8%: raise, fish stílusban (extrém méretek)
                 L[2] = 3.0   # min-raise (fish-jellegű)
                 L[6] = 2.0   # pot/all-in (fish sokszor all-in-nel nyit)
-                L[0] = -15.0 # soha nem fold premium kezekkel
+                L[0] = LOGIT_NEVER  # soha nem fold premium kezekkel
                 L[1] = -2.0  # ritkán flat
-            elif eq > 0.47:
+            elif eq > self._eq['loose']:
                 # VPIP range (top ~55%): call
-                L[1] = 4.5
+                L[1] = LOGIT_STRONG
                 L[0] = -1.0
                 L[2] = 0.3   # ritkán min-raise a range aljáról is
             else:
                 # Bottom ~45%: fold
-                L[0] = 4.0
+                L[0] = LOGIT_STRONG - 0.5
                 L[1] = -2.0
 
         else:  # ── POSTFLOP ──────────────────────────────────────────────
             if facing:
-                if eq > 0.55:
+                if eq > self._eq['midrange']:
                     # Pair+: SOSEM FOLD – ez a fish legsajátosabb jellemzője
                     L[1] = 4.5   # call (fő akció)
                     L[2] = 1.5   # min-raise, fish sokszor felraiser pair-rel is
                     L[6] = 0.5   # all-in push ritkán
-                    L[0] = -20.0 # ABSZOLÚT soha nem fold pair+-szal
-                elif eq > 0.40:
+                    L[0] = LOGIT_VETO  # ABSZOLÚT soha nem fold pair+-szal
+                elif eq > self._eq['air']:
                     # Gyenge pár / draw: call (size-tól némi függéssel)
-                    if bet_pct > 0.67:  # >2x pot: kicsit óvatosabb
-                        L[1] = 3.0
+                    if bet_pct > BET_LARGE:  # >2x pot: kicsit óvatosabb
+                        L[1] = LOGIT_MEDIUM
                         L[0] = 1.0
                     else:
-                        L[1] = 4.0
-                        L[0] = 0.2
+                        L[1] = LOGIT_STRONG - 0.5
+                        L[0] = LOGIT_RARE - 0.3
                 else:
                     # Air: SIZE-DEPENDENT (ez a sizing tanulás kulcsa!)
                     # Kis bet  (≤1x pot)  → még a fish is inkább call: ezért értékes a small bet
                     # Közepes bet         → 50/50
                     # Nagy bet (≥2x pot)  → fish is fold: itt nincs reward a blöffnek
-                    if bet_pct < 0.33:
-                        L[1] = 3.0   # kis bet → call (fish!)
+                    if bet_pct < BET_SMALL:
+                        L[1] = LOGIT_MEDIUM   # kis bet → call (fish!)
                         L[0] = 1.0
                     elif bet_pct < 0.65:
                         L[0] = 2.0   # közepes bet → 50/50
-                        L[1] = 2.0
+                        L[1] = LOGIT_WEAK + 0.5
                     else:
-                        L[0] = 3.5   # nagy bet → fold air
-                        L[1] = 1.0
+                        L[0] = LOGIT_MEDIUM + 0.5   # nagy bet → fold air
+                        L[1] = LOGIT_WEAK
             else:
                 # Checking to fish
-                if eq > 0.58:
+                if eq > self._eq['decent']:
                     # Has something: bet (fish mindig big-et bet)
                     L[6] = 3.0   # all-in bet (fish)
                     L[2] = 1.5   # min-bet
                     L[1] = 0.5   # néha check (slow play)
-                elif eq > 0.45:
+                elif eq > self._eq['weak']:
                     # Mediocre: mix bet/check
                     L[2] = 1.5   # small bet
                     L[1] = 2.0   # check
                 else:
                     # Weak: check (ne donk-bet air-rel)
-                    L[1] = 4.0
+                    L[1] = LOGIT_STRONG - 0.5
                     L[0] = -1.0  # ne fold when not facing bet
 
         return L
@@ -277,8 +405,8 @@ class NitBot(RuleBasedBot):
       3. Timing: Nit fold-ol gyenge kezekkel BÁRMILYEN agresszióra
          → a modell tanul: van ellenfél aki fold-ol (nem mindenki CallingStation)
 
-    Preflop:  eq > 0.70 → raise (proper sizing), rest → fold (nincs limp!)
-    Postflop: strong (eq > 0.65) → value bet, decent (eq > 0.50) → check/call,
+    Preflop:  eq > EQ_PREMIUM → raise (proper sizing), rest → fold (nincs limp!)
+    Postflop: strong (eq > 0.65) → value bet, decent (eq > EQ_AVERAGE) → check/call,
               weak → fold BÁRMILYEN bet-re
     """
 
@@ -287,43 +415,43 @@ class NitBot(RuleBasedBot):
         L = torch.zeros(self.action_size)
 
         if street == 0:  # ── PREFLOP ──────────────────────────────────────
-            if eq > 0.70:
+            if eq > self._eq['premium']:
                 # Top ~12% prémium: raise (nit proper méretet használ)
                 L[4] = 3.5   # raise 50%
                 L[5] = 2.0   # raise 75%
                 L[3] = 1.0   # raise 25% ritkán
-                L[0] = -15.0 # SOHA nem fold premiumot
-                L[1] = -5.0  # nincs limp (nit nem limpel)
+                L[0] = LOGIT_NEVER  # SOHA nem fold premiumot
+                L[1] = LOGIT_NEVER / 3  # nincs limp (nit nem limpel)
             else:
                 # MINDEN más: fold (nit a nit)
                 L[0] = 8.0
-                L[1] = -5.0  # nincs limp
-                L[2] = -5.0  # nincs speculative raise
+                L[1] = LOGIT_NEVER / 3  # nincs limp
+                L[2] = LOGIT_NEVER / 3  # nincs speculative raise
 
         else:  # ── POSTFLOP ──────────────────────────────────────────────
             if facing:
-                if eq > 0.65:
+                if eq > self._eq['decent_high']:
                     # Strong: raise for value (nit sosem slow-play a betek ellen)
                     L[4] = 3.5   # raise 50%
                     L[5] = 2.5   # raise 75%
                     L[3] = 1.0   # raise 25% (thin value)
                     L[1] = 0.8   # néha flat, pot control
-                    L[0] = -15.0 # soha nem fold strongot
-                elif eq > 0.50:
+                    L[0] = LOGIT_NEVER  # soha nem fold strongot
+                elif eq > self._eq['average']:
                     # Decent: bet mérettől függő call/fold
-                    if bet_pct > 0.67:      # >2x pot facing decent hand: fold
-                        L[0] = 3.0
-                        L[1] = 0.8
-                    elif bet_pct > 0.40:    # normal bet: call
-                        L[1] = 3.0
+                    if bet_pct > BET_LARGE:      # >2x pot facing decent hand: fold
+                        L[0] = LOGIT_MEDIUM
+                        L[1] = LOGIT_RARE + 0.3
+                    elif bet_pct > BET_SMALL:    # normal bet: call
+                        L[1] = LOGIT_MEDIUM
                         L[0] = 1.0
                     else:                   # kis bet: call
-                        L[1] = 4.0
-                        L[0] = 0.5
+                        L[1] = LOGIT_STRONG - 0.5
+                        L[0] = LOGIT_RARE
                 else:
                     # Weak: FOLD minden bet-re (nit soha nem chase-el)
                     L[0] = 7.0
-                    L[1] = -5.0
+                    L[1] = LOGIT_NEVER / 3
             else:
                 # Checked to nit
                 if eq > 0.68:
@@ -331,7 +459,7 @@ class NitBot(RuleBasedBot):
                     L[4] = 3.5   # raise 50% value
                     L[3] = 2.5   # raise 25% thin value
                     L[5] = 1.5   # raise 75% premium hands
-                elif eq > 0.55:
+                elif eq > self._eq['midrange']:
                     # Decent: thin value bet vagy check
                     L[3] = 2.5   # raise 25%
                     L[1] = 2.0   # check is OK
@@ -361,7 +489,7 @@ class CallingStation(RuleBasedBot):
       3. Value bet reward: modell TP+-szal bet → CS call → profit
          → erősíti a value bet szokást
 
-    Preflop:  eq > 0.78 → rare raise (AA, KK slow play), eq > 0.50 → call, rest fold
+    Preflop:  eq > 0.78 → rare raise (AA, KK slow play), eq > EQ_AVERAGE → call, rest fold
     Postflop: SOSEM raise (actions 2-6 = -15.0 logit).
               Call bármit ha eq > 0.30 VAGY bet ≤ 1.5x pot
               Fold csak ha bet > 2x pot ÉS eq < 0.30
@@ -372,18 +500,18 @@ class CallingStation(RuleBasedBot):
         L = torch.zeros(self.action_size)
 
         if street == 0:  # ── PREFLOP ──────────────────────────────────────
-            if eq > 0.78:
+            if eq > self._eq['premium']:
                 # Csak top prémiumok: slow play (AA, KK) – calling station jellemzője
                 L[1] = 3.5   # mostly call (slow play)
                 L[2] = 0.8   # ritkán min-raise
-                L[0] = -15.0
-            elif eq > 0.50:
+                L[0] = LOGIT_NEVER
+            elif eq > self._eq['average']:
                 # Top ~45%: call, call, call
                 L[1] = 5.0
                 L[0] = -1.0
             else:
                 # Bottom ~55%: fold
-                L[0] = 3.5
+                L[0] = LOGIT_MEDIUM + 0.5
                 L[1] = -1.5
 
         else:  # ── POSTFLOP ──────────────────────────────────────────────
@@ -395,27 +523,27 @@ class CallingStation(RuleBasedBot):
                 # SIZE-DEPENDENT CALLING (ez a sizing tanulás lényege):
                 huge_bet = bet_pct > 0.67      # >2x pot
                 big_bet  = bet_pct > 0.45      # >1.5x pot
-                small_bet = bet_pct < 0.33     # ≤1x pot
+                small_bet = bet_pct < BET_SMALL     # ≤1x pot
 
                 if eq > 0.30:
                     # Van valamije: CALL mindent (calling station!)
                     # A modell ezt tanulhatja: value-betnél mindig kap call-t
                     L[1] = 5.0
-                    L[0] = -5.0
+                    L[0] = LOGIT_NEVER / 3
                 elif huge_bet:
                     # Pure trash + óriási bet: fold (még a CS is fold)
                     # Ez tanítja: big blöffnél nincs reward, de small blöffnél sincs
-                    L[0] = 3.0
+                    L[0] = LOGIT_MEDIUM
                     L[1] = 1.5   # de még így is sokszor call (station)
                 elif big_bet:
                     # Trash + nagy bet: inkább fold
-                    L[0] = 2.5
-                    L[1] = 2.0
+                    L[0] = LOGIT_MEDIUM - 0.5
+                    L[1] = LOGIT_WEAK + 0.5
                 else:
                     # Trash + kis bet: call (még ez is call!)
                     # Ez a kulcs: kis bet-nél nincs "safe" blöff profit
-                    L[1] = 3.0
-                    L[0] = 1.5
+                    L[1] = LOGIT_MEDIUM
+                    L[0] = LOGIT_WEAK
             else:
                 # Checked to CS: check (calling station sosem donk-bet)
                 L[1] = 5.0
@@ -441,7 +569,7 @@ class LAGBot(RuleBasedBot):
       4. River blöff (részleges) büntetés: LAGBot call-ol medium equity-vel
          → random blöfföt bünteti, de nem annyira mint CallingStation
 
-    Preflop:  eq > 0.58 → raise (varied), eq > 0.47 → marginal mix, rest fold
+    Preflop:  eq > EQ_DECENT → raise (varied), eq > EQ_LOOSE → marginal mix, rest fold
     Postflop: c-bet ~80% ha nem facing bet, double barrel, varied sizing (3,4,5)
               fold weak kezekkel ha facing significant aggression
     """
@@ -451,24 +579,24 @@ class LAGBot(RuleBasedBot):
         L = torch.zeros(self.action_size)
 
         if street == 0:  # ── PREFLOP ──────────────────────────────────────
-            if eq > 0.75:
+            if eq > self._eq['premium']:
                 # Premium: 3-bet big (LAG jellemzője: értékesít)
                 L[5] = 3.5   # raise 75%
                 L[6] = 2.5   # pot/all-in 3-bet
                 L[4] = 1.5   # raise 50%
-                L[0] = -15.0
-            elif eq > 0.58:
+                L[0] = LOGIT_NEVER
+            elif eq > self._eq['decent']:
                 # Top ~28%: raise (PFR range, varied sizing)
                 L[3] = 3.0   # raise 25%
                 L[4] = 2.5   # raise 50%
                 L[5] = 1.5   # raise 75%
-            elif eq > 0.47:
+            elif eq > self._eq['loose']:
                 # Marginal: call/fold mix (LAG loose de nem teljesen random)
                 L[1] = 2.5   # call
                 L[0] = 1.5   # fold
             else:
                 # Fold
-                L[0] = 4.0
+                L[0] = LOGIT_STRONG - 0.5
                 L[1] = -1.0
 
         else:  # ── POSTFLOP ──────────────────────────────────────────────
@@ -480,7 +608,7 @@ class LAGBot(RuleBasedBot):
                     L[3] = 2.5   # raise 25%
                     L[5] = 1.5   # raise 75%
                     L[1] = 0.5   # ritkán check (deception)
-                elif eq > 0.40:
+                elif eq > self._eq['air']:
                     # Semi-blöff / thin value: bet (LAG c-bet range)
                     L[3] = 3.0   # raise 25% (c-bet sizing)
                     L[4] = 2.5   # raise 50%
@@ -499,26 +627,26 @@ class LAGBot(RuleBasedBot):
                     L[5] = 2.5   # raise 75%
                     L[3] = 1.5   # raise 25%
                     L[1] = 1.0   # flat is OK
-                    L[0] = -15.0
+                    L[0] = LOGIT_NEVER
                 elif eq > 0.48:
                     # Medium: call, ritkán blöff-raise
                     L[1] = 2.5   # call
                     L[3] = 1.5   # blöff-raise 25% (LAG float/raise)
-                    L[0] = 0.5
+                    L[0] = LOGIT_RARE
                 elif eq > 0.32:
                     # Weak: bet mérettől függő
                     if bet_pct > 0.50:  # big bet facing weak: fold mostly
-                        L[0] = 3.0
+                        L[0] = LOGIT_MEDIUM
                         L[1] = 1.0
                         L[3] = 0.5   # ritkán blöff-raise
                     else:              # kis bet: float vagy blöff
-                        L[1] = 2.0
-                        L[0] = 1.5
+                        L[1] = LOGIT_WEAK + 0.5
+                        L[0] = LOGIT_WEAK
                         L[3] = 1.0   # blöff-raise
                 else:
                     # Pure trash: give up (LAG tudja mikor kell fold-olni)
-                    L[0] = 4.5
-                    L[1] = 0.5
+                    L[0] = LOGIT_STRONG
+                    L[1] = LOGIT_RARE
 
         return L
 
