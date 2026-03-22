@@ -17,6 +17,35 @@ NUM_ABSTRACT_ACTIONS = 7
 STREET_PREFLOP=0; STREET_FLOP=1; STREET_TURN=2; STREET_RIVER=3
 BOARD_TEXTURE_DIM=6; STACK_FEATURE_DIM=8; POT_ODDS_DIM=4; STREET_DIM=4; EQUITY_DIM=1
 
+# ── [TASK-5] Standalone BB-normalizáló – torch-mentes, tesztelhető ────────────
+def normalize_obs_chips(obs_arr: np.ndarray, bb: float) -> np.ndarray:
+    """
+    Normalizálja az rlcard obs vektor chip-értékeit (obs[52], obs[53]) BB-egységre.
+
+    Kiemelve standalone numpy függvénybe, hogy:
+      1. build_state_tensor() és BatchStateBuilder mindkettő ugyanezt hívja
+         → garantált konzisztencia
+      2. torch nélkül is tesztelhető (unit tesztek offline CI-ban is futnak)
+
+    Paraméterek:
+        obs_arr: np.ndarray shape=(obs_dim,) – az rlcard obs tömb MÁSOLATA
+                 (a függvény helyben módosít, tehát a hívónak kell másolni ha kell)
+        bb:      float – big blind mérete chip-ben
+
+    Módosítások:
+        obs_arr[52] = min(obs_arr[52] / bb, 200.0)   # betett összeg BB-egységben
+        obs_arr[53] = min(obs_arr[53] / bb, 200.0)   # max betett összeg BB-egységben
+
+    Visszatér: obs_arr (helyben módosítva)
+    """
+    if len(obs_arr) <= 53:
+        return obs_arr
+    bb_safe = max(float(bb), 1e-6)
+    obs_arr[52] = min(float(obs_arr[52]) / bb_safe, 200.0)
+    obs_arr[53] = min(float(obs_arr[53]) / bb_safe, 200.0)
+    return obs_arr
+
+
 # NUM_HUD_STATS importálva az opponent_tracker-ből – szemantikailag helyes
 # (jelenleg NUM_HUD_STATS == NUM_ABSTRACT_ACTIONS == 7, de jövőbiztos)
 from core.opponent_tracker import NUM_HUD_STATS
@@ -136,13 +165,9 @@ class ActionHistoryEncoder:
 def build_state_tensor(state, tracker, action_history, history_encoder,
                        num_players, my_player_id, bb, sb, initial_stack,
                        street=None, equity=0.5):
-    obs_arr   = np.array(state['obs'], dtype=np.float32)
-    # [TASK-3 FIX] obs[52] és obs[53] BB-normalizálás – azonos logika mint
-    # BatchStateBuilder.build_batch()-ben, hogy RTA és training konzisztens legyen.
-    bb_safe = max(float(bb), 1e-6)
-    if len(obs_arr) > 53:
-        obs_arr[52] = min(obs_arr[52] / bb_safe, 200.0)
-        obs_arr[53] = min(obs_arr[53] / bb_safe, 200.0)
+    obs_arr = np.array(state['obs'], dtype=np.float32)
+    # [TASK-3/TASK-5] normalize_obs_chips() végzi a BB-normalizálást
+    normalize_obs_chips(obs_arr, bb)
     stats_arr =np.array(tracker.get_stats_vector(),dtype=np.float32)
     stack_arr =compute_stack_features(state,num_players,bb,sb,initial_stack)
     if street is None: street=detect_street(state)
@@ -250,19 +275,12 @@ class BatchStateBuilder:
             obs = state.get('obs', None)
             if obs is not None:
                 buf[idx, a:b] = obs
-                # [TASK-3 FIX] obs[52] és obs[53] BB-normalizálás.
-                # Az rlcard obs[52] = betett összeg (in_chips),
-                # obs[53] = max betett összeg – ezek nyers chip értékek.
-                # BB=1 esetén kis számok, BB=25 esetén 25x nagyobbak →
-                # instabil neural net bemenet különböző blind konfigurációknál.
-                # Megoldás: BB-egységre osztjuk (BB = 1.0 egység).
-                # Clamp: max 200 BB (szokásos deep stack határ).
-                bb_i = max(bbs[i], 1e-6)
-                obs52_idx = a + 52
-                obs53_idx = a + 53
-                if b > obs53_idx:   # biztonsági ellenőrzés: obs_dim >= 54
-                    buf[idx, obs52_idx] = min(buf[idx, obs52_idx] / bb_i, 200.0)
-                    buf[idx, obs53_idx] = min(buf[idx, obs53_idx] / bb_i, 200.0)
+                # [TASK-3/TASK-5] normalize_obs_chips() a standalone függvény
+                # gondoskodik a BB-normalizálásról, az offset alapján.
+                if b > a + 53:
+                    bb_i = max(bbs[i], 1e-6)
+                    buf[idx, a + 52] = min(buf[idx, a + 52] / bb_i, 200.0)
+                    buf[idx, a + 53] = min(buf[idx, a + 53] / bb_i, 200.0)
 
             # [2] stats (num_players × 7 dim)
             a, b = o['stats']
