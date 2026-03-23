@@ -1,0 +1,123 @@
+{
+  "timestamp": "20260323_230331",
+  "model": "/kaggle/working/PokerAI_Models/models/2max/tests/2max_ppo_v4_10M/2max_ppo_v4_10M.pth",
+  "num_players": 2,
+  "n_hands": 500,
+  "scenarios": [
+    {
+      "name": "AA preflop – raise",
+      "status": "✅ PASS",
+      "action": "Raise 50%",
+      "confidence": 0.7528862953186035
+    },
+    {
+      "name": "KK vs open – call/raise",
+      "status": "✅ PASS",
+      "action": "Raise (min)",
+      "confidence": 0.47173038125038147
+    },
+    {
+      "name": "AKs preflop – call/raise",
+      "status": "✅ PASS",
+      "action": "Raise (min)",
+      "confidence": 1.0
+    },
+    {
+      "name": "72o facing raise – fold",
+      "status": "❌ FAIL",
+      "action": "Raise pot/all-in",
+      "confidence": 0.8842747807502747
+    },
+    {
+      "name": "Nut flush flop – bet",
+      "status": "✅ PASS",
+      "action": "Raise pot/all-in",
+      "confidence": 0.6373355388641357
+    },
+    {
+      "name": "Top set dry flop – bet",
+      "status": "✅ PASS",
+      "action": "Raise 25%",
+      "confidence": 0.5081067681312561
+    },
+    {
+      "name": "Combo draw (15 out) flop – semi-bluff",
+      "status": "✅ PASS",
+      "action": "Raise pot/all-in",
+      "confidence": 1.0
+    },
+    {
+      "name": "TPTK monotone board – passive",
+      "status": "✅ PASS",
+      "action": "Call/Check",
+      "confidence": 0.826485276222229
+    },
+    {
+      "name": "20:1 pot odds – call",
+      "status": "✅ PASS",
+      "action": "Raise pot/all-in",
+      "confidence": 0.9448941946029663
+    },
+    {
+      "name": "Air facing river pot bet – fold",
+      "status": "⚠ WARN",
+      "action": "Raise pot/all-in",
+      "confidence": 0.8580374121665955
+    },
+    {
+      "name": "T8o facing 4-bet",
+      "status": "⚠ WARN",
+      "action": "Raise pot/all-in",
+      "confidence": 0.737267792224884
+    },
+    {
+      "name": "QQ facing 3-bet",
+      "status": "✅ PASS",
+      "action": "Raise 75%",
+      "confidence": 0.4892052114009857
+    },
+    {
+      "name": "10BB A8o BTN push/fold",
+      "status": "⚠ WARN",
+      "action": "Raise (min)",
+      "confidence": 0.9803747534751892
+    },
+    {
+      "name": "8BB 22 BTN push/fold",
+      "status": "✅ PASS",
+      "action": "Raise pot/all-in",
+      "confidence": 0.9986971020698547
+    },
+    {
+      "name": "[HU] BTN open 83s",
+      "status": "⚠ WARN",
+      "action": "Fold",
+      "confidence": 0.6461281180381775
+    },
+    {
+      "name": "[HU] 3-bet AJo vs BTN",
+      "status": "⚠ WARN",
+      "action": "Raise (min)",
+      "confidence": 0.9309154748916626
+    },
+    {
+      "name": "[HU] BB defend K2o vs min-open",
+      "status": "✅ PASS",
+      "action": "Raise (min)",
+      "confidence": 0.981162428855896
+    }
+  ],
+  "summary": {
+    "grade": "🔴 KOMOLY HIBÁK",
+    "passed": 11,
+    "warnings": 5,
+    "failed": 1,
+    "penalty": 4,
+    "penalty_reasons": [
+      "szituáció FAIL=1",
+      "pozíció-tudatos=0/5<2",
+      "degen:❌ AllIn spam: 71%",
+      "stats[HU]: VPIP+PFR+3bet mind rossz"
+    ]
+  }
+}
