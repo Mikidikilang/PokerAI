@@ -14,6 +14,151 @@
       "episodes_added": 0,
       "style": "?",
       "num_players": 2,
+<<<<<<< HEAD
+=======
+      "config_snapshot": {
+        "num_envs": 512,
+        "buffer_collect_size": 2048,
+        "max_steps_per_hand": 500,
+        "hidden_size": 512,
+        "gru_hidden": null,
+        "learning_rate": 0.0003,
+        "clip_eps": 0.2,
+        "ppo_epochs": 8,
+        "minibatch_size": 256,
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "entropy_final": 0.001,
+        "entropy_decay": 30000000,
+        "max_grad_norm": 0.5,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "lr_t_max": 500,
+        "lr_eta_min_ratio": 0.05,
+        "draw_fold_penalty": 0.08,
+        "draw_equity_threshold": 0.44,
+        "street_reward_scale": 0.05,
+        "milestone_interval": 2000000,
+        "equity_n_sim": 200,
+        "equity_cache_size": 20000,
+        "training_style": "exploitative",
+        "training_phase": 2,
+        "bot_pool": {
+          "fish": {
+            "enabled": true,
+            "weight": 0.8,
+            "display": "Fish",
+            "icon": "🐟"
+          },
+          "nit": {
+            "enabled": true,
+            "weight": 1.5,
+            "display": "Nit",
+            "icon": "🎯"
+          },
+          "calling_station": {
+            "enabled": true,
+            "weight": 0.2,
+            "display": "Calling Station",
+            "icon": "📞"
+          },
+          "lag": {
+            "enabled": true,
+            "weight": 1.5,
+            "display": "LAG",
+            "icon": "💣"
+          }
+        }
+      },
+      "metrics_final": {
+        "actor_loss": -0.0205,
+        "critic_loss": 0.4377,
+        "entropy": 0.7033
+      },
+      "completed": true
+    },
+    {
+      "id": "sess_20260321_202511",
+      "started": "2026-03-21T19:25:11Z",
+      "ended": "2026-03-21T19:26:04Z",
+      "duration_sec": 53,
+      "episodes_start": 20972484,
+      "episodes_end": 20972484,
+      "episodes_added": 0,
+      "style": "exploitative",
+      "num_players": 2,
+      "config_snapshot": {
+        "num_envs": 512,
+        "buffer_collect_size": 2048,
+        "max_steps_per_hand": 500,
+        "hidden_size": 512,
+        "gru_hidden": null,
+        "learning_rate": 0.0003,
+        "clip_eps": 0.2,
+        "ppo_epochs": 8,
+        "minibatch_size": 256,
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "entropy_final": 0.001,
+        "entropy_decay": 30000000,
+        "max_grad_norm": 0.5,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "lr_t_max": 500,
+        "lr_eta_min_ratio": 0.05,
+        "draw_fold_penalty": 0.08,
+        "draw_equity_threshold": 0.44,
+        "street_reward_scale": 0.05,
+        "milestone_interval": 2000000,
+        "equity_n_sim": 200,
+        "equity_cache_size": 20000,
+        "training_style": "exploitative",
+        "training_phase": 2,
+        "bot_pool": {
+          "fish": {
+            "enabled": true,
+            "weight": 0.8,
+            "display": "Fish",
+            "icon": "🐟"
+          },
+          "nit": {
+            "enabled": true,
+            "weight": 1.5,
+            "display": "Nit",
+            "icon": "🎯"
+          },
+          "calling_station": {
+            "enabled": true,
+            "weight": 0.2,
+            "display": "Calling Station",
+            "icon": "📞"
+          },
+          "lag": {
+            "enabled": true,
+            "weight": 1.5,
+            "display": "LAG",
+            "icon": "💣"
+          }
+        }
+      },
+      "metrics_final": {
+        "actor_loss": -0.0205,
+        "critic_loss": 0.4377,
+        "entropy": 0.7033
+      },
+      "completed": true
+    },
+    {
+      "id": "sess_20260323_144003",
+      "started": "2026-03-23T14:40:03Z",
+      "ended": null,
+      "duration_sec": null,
+      "episodes_start": 20972484,
+      "episodes_end": null,
+      "episodes_added": 0,
+      "style": "?",
+      "num_players": 2,
+>>>>>>> 23eeee6f539f42704fe59ae404a2eee18b80023d
       "config_snapshot": {},
       "metrics_final": {},
       "completed": false

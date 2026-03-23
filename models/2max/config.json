@@ -1,6 +1,6 @@
 {
   "num_players": 2,
-  "created": "2026-03-23T12:43:00Z",
+  "created": "2026-03-21T19:20:38Z",
   "config": {
     "num_envs": 256,
     "buffer_collect_size": 2048,
@@ -56,5 +56,5 @@
     },
     "milestone_hands": 500
   },
-  "last_saved": "2026-03-23T12:43:40Z"
+  "last_saved": "2026-03-23T14:40:03Z"
 }
