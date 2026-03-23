@@ -12,13 +12,13 @@
     "ppo_epochs": 8,
     "minibatch_size": 256,
     "value_coef": 0.5,
-    "entropy_coef": 0.02,
-    "entropy_final": 0.002,
-    "entropy_decay": 50000000,
+    "entropy_coef": 0.01,
+    "entropy_final": 0.001,
+    "entropy_decay": 30000000,
     "max_grad_norm": 0.5,
     "gamma": 0.99,
     "gae_lambda": 0.95,
-    "lr_t_max": 500,
+    "lr_t_max": 9765,
     "lr_eta_min_ratio": 0.05,
     "draw_fold_penalty": 0.08,
     "draw_equity_threshold": 0.44,
@@ -26,35 +26,35 @@
     "milestone_interval": 500000,
     "equity_n_sim": 200,
     "equity_cache_size": 20000,
-    "training_style": "self_play",
-    "training_phase": 1,
+    "training_style": "exploitative",
+    "training_phase": 2,
     "bot_pool": {
       "fish": {
-        "enabled": false,
-        "weight": 0.0,
+        "enabled": true,
+        "weight": 0.8,
         "display": "Fish",
         "icon": "🐟"
       },
       "nit": {
-        "enabled": false,
-        "weight": 0.0,
+        "enabled": true,
+        "weight": 1.5,
         "display": "Nit",
         "icon": "🎯"
       },
       "calling_station": {
-        "enabled": false,
-        "weight": 0.0,
+        "enabled": true,
+        "weight": 0.2,
         "display": "Calling Station",
         "icon": "📞"
       },
       "lag": {
-        "enabled": false,
-        "weight": 0.0,
+        "enabled": true,
+        "weight": 1.5,
         "display": "LAG",
         "icon": "💣"
       }
     },
-    "milestone_hands": 500
+    "milestone_hands": 5000
   },
-  "last_saved": "2026-03-23T23:28:07Z"
+  "last_saved": "2026-03-23T23:56:27Z"
 }

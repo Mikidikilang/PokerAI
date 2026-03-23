@@ -27,6 +27,20 @@
       "config_snapshot": {},
       "metrics_final": {},
       "completed": false
+    },
+    {
+      "id": "sess_20260323_235628",
+      "started": "2026-03-23T23:56:28Z",
+      "ended": null,
+      "duration_sec": null,
+      "episodes_start": 10891264,
+      "episodes_end": null,
+      "episodes_added": 0,
+      "style": "?",
+      "num_players": 2,
+      "config_snapshot": {},
+      "metrics_final": {},
+      "completed": false
     }
   ]
 }
