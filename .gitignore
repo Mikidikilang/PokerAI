@@ -1,10 +1,16 @@
 __pycache__/
+# Zárd ki a .pth fájlokat globálisan...
 *.pth
+# ... KIVÉVE, ha a models/2max/ mappában vannak
+!models/2max/*.pth
+
 logs/
 runs/
 screenshots/
 ModellNaplo/
-models/
+
+models/*
+!models/2max/
 
 # SQLite ellenfél adatbázis
 players.db
