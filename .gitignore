@@ -3,6 +3,7 @@ __pycache__/
 *.pth
 # ... KIVÉVE, ha a models/2max/ mappában vannak
 !models/2max/*.pth
+!models/2max/**/*.pth
 
 logs/
 runs/
