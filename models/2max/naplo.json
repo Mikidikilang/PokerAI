@@ -145,6 +145,20 @@
         "entropy": 0.7033
       },
       "completed": true
+    },
+    {
+      "id": "sess_20260323_144003",
+      "started": "2026-03-23T14:40:03Z",
+      "ended": null,
+      "duration_sec": null,
+      "episodes_start": 20972484,
+      "episodes_end": null,
+      "episodes_added": 0,
+      "style": "?",
+      "num_players": 2,
+      "config_snapshot": {},
+      "metrics_final": {},
+      "completed": false
     }
   ],
   "last_updated": "2026-03-21T19:26:04Z"
