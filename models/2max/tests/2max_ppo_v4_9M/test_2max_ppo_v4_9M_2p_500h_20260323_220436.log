@@ -1,0 +1,265 @@
+
+=================================================================
+  🧪  POKER AI VIZSGÁZTATÓ v4.0 [TASK-16: HU]
+=================================================================
+  Modell: /kaggle/working/PokerAI_Models/models/2max/tests/2max_ppo_v4_9M/2max_ppo_v4_9M.pth (9,000,960 ep)
+  2p | 500 kéz | seed=42
+
+─────────────────────────────────────────────────────────────────
+  SZITUÁCIÓS TESZTEK (17 eset)
+─────────────────────────────────────────────────────────────────
+
+  ✅ PASS  AA preflop – raise
+       Raise 50% (38%) | Top3: Raise 50% 38% | Raise 25% 25% | Raise (min) 23%
+       Eq:84% Val:2.546 [preflop]
+  ✅ PASS  KK vs open – call/raise
+       Raise 50% (98%) | Top3: Raise 50% 98% | Raise (min) 2% | Raise 25% 0%
+       Eq:82% Val:1.510 [preflop]
+  ✅ PASS  AKs preflop – call/raise
+       Raise 50% (55%) | Top3: Raise 50% 55% | Raise (min) 45% | Raise 25% 0%
+       Eq:60% Val:0.258 [preflop]
+  ⚠ WARN  72o facing raise – fold
+       Call/Check (62%) | Top3: Call/Check 62% | Raise 75% 36% | Raise 25% 1%
+       Eq:38% Val:-0.049 [preflop]
+  ✅ PASS  Nut flush flop – bet
+       Raise (min) (88%) | Top3: Raise (min) 88% | Call/Check 12% | Raise 50% 0%
+       Eq:96% Val:0.194 [postflop]
+  ✅ PASS  Top set dry flop – bet
+       Raise 75% (37%) | Top3: Raise 75% 37% | Raise (min) 27% | Raise 50% 21%
+       Eq:100% Val:2.784 [postflop]
+  ✅ PASS  Combo draw (15 out) flop – semi-bluff
+       Raise pot/all-in (99%) | Top3: Raise pot/all-in 99% | Raise 75% 1% | Call/Check 0%
+       Eq:69% Val:0.044 [semi_bluff]
+  ⚠ WARN  TPTK monotone board – passive
+       Raise 25% (87%) | Top3: Raise 25% 87% | Raise 50% 7% | Raise (min) 6%
+       Eq:33% Val:0.556 [board_texture]
+  ✅ PASS  20:1 pot odds – call
+       Call/Check (100%) | Top3: Call/Check 100% | Raise pot/all-in 0% | Raise 75% 0%
+       Eq:17% Val:0.064 [pot_odds]
+  ⚠ WARN  Air facing river pot bet – fold
+       Raise 25% (73%) | Top3: Raise 25% 73% | Call/Check 16% | Raise pot/all-in 9%
+       Eq:17% Val:-0.980 [pot_odds]
+  ⚠ WARN  T8o facing 4-bet
+       Raise 75% (84%) | Top3: Raise 75% 84% | Raise pot/all-in 13% | Call/Check 3%
+       Eq:51% Val:-0.411 [3bet]
+       ⚠ HU: T8o vs 4-bet – pot odds marginális call; raise HIBA.
+  ⚠ WARN  QQ facing 3-bet
+       Raise (min) (99%) | Top3: Raise (min) 99% | Call/Check 1% | Raise 50% 0%
+       Eq:82% Val:0.884 [3bet]
+  ⚠ WARN  10BB A8o BTN push/fold
+       Raise 25% (96%) | Top3: Raise 25% 96% | Raise 50% 4% | Raise (min) 0%
+       Eq:54% Val:0.226 [short_stack]
+  ✅ PASS  8BB 22 BTN push/fold
+       Raise 75% (82%) | Top3: Raise 75% 82% | Raise pot/all-in 12% | Raise 25% 3%
+       Eq:55% Val:-0.048 [short_stack]
+  ✅ PASS  [HU] BTN open 83s
+       Raise 75% (84%) | Top3: Raise 75% 84% | Raise pot/all-in 7% | Call/Check 3%
+       Eq:50% Val:-0.006 [hu_specific]
+  ⚠ WARN  [HU] 3-bet AJo vs BTN
+       Raise (min) (100%) | Top3: Raise (min) 100% | Raise 50% 0% | Call/Check 0%
+       Eq:52% Val:0.267 [hu_specific]
+  ✅ PASS  [HU] BB defend K2o vs min-open
+       Call/Check (100%) | Top3: Call/Check 100% | Raise 25% 0% | Raise (min) 0%
+       Eq:46% Val:0.111 [hu_specific]
+
+  Eredmény: 10 ✅  7 ⚠  0 ❌
+
+─────────────────────────────────────────────────────────────────
+  POZÍCIÓS TUDATOSSÁG TESZT (izolált, fix pénzügyi kontextus)
+─────────────────────────────────────────────────────────────────
+
+  Kontextus: hero 2BB betét, ellenfél 6BB open, pot=8BB, call=4BB
+  Változó:   csak button_pos (BTN=0 vs BB=1)
+
+  ⚠ K9o: BTN raise%=99 BB raise%=100 (Δ=-1%)
+  ⚠ A5o: BTN raise%=65 BB raise%=100 (Δ=-35%)
+  ⚠ QTo: BTN raise%=100 BB raise%=100 (Δ=-0%)
+  ⚠ J8s: BTN raise%=1 BB raise%=0 (Δ=+0%)
+  ✅ T7s: BTN raise%=99 BB raise%=95 (Δ=+3%)
+
+  Pozíció-tudatos: 1/5 (⚠ GYENGE)
+  Átlagos BTN–BB agresszió delta: -6.4%
+  ⚠ FIGYELEM: A modell BB-ből agresszívabb mint BTN-ből – pozíció-enkódolás valószínűleg nem hat a döntésre.
+
+─────────────────────────────────────────────────────────────────
+  HUD EXPLOITÁCIÓ TESZT (SPRINT2: 7 spot)
+─────────────────────────────────────────────────────────────────
+
+  [Nit ellen – blöff frekvencia, 3 spot]
+  ✅ Nit vs air K72r: Raise pot/all-in bet%=97% (neutral=98%)
+  ✅ Nit vs air A-high turn: Raise pot/all-in bet%=100% (neutral=100%)
+  ✅ Nit vs air low flop: Raise pot/all-in bet%=100% (neutral=100%)
+
+  [Maniac ellen – trap / nem fold]
+  ✅ Maniac AA trap: AA → Raise 75% (fold=FAIL)
+  ✅ Maniac KKK bet: Raise 75% bet%=100%
+
+  [Calling Station ellen – value bet méret]
+  ✅ CallingStation AAA value: Raise (min) bet%=100%
+
+  [Adaptáció delta – Nit vs Neutral, küszöb ≥10%]
+  ⚠ Adaptáció delta: nit_avg=99% vs neutral_avg=99% (Δ=-0%, küszöb=+10%)
+
+  Exploit összesítő: 6/7
+  ✅ HUD exploitáció rendben
+
+─────────────────────────────────────────────────────────────────
+  DRAW EQUITY AWARENESS TESZT
+─────────────────────────────────────────────────────────────────
+
+  ✅ Flush draw 9out: Call/Check eq=64% aggr=5%
+  ✅ OESD 8out: Raise pot/all-in eq=57% aggr=95%
+  ✅ Combo 15out AGGRO: Raise pot/all-in eq=76% aggr=72%
+  ⚠ Gutshot 4out: Raise pot/all-in eq=35% aggr=100%
+  ✅ TP+flush draw: Raise (min) eq=94% aggr=100%
+  ✅ Flush MISSED river: Call/Check eq=30% aggr=8%
+  ✅ OESD turn 8out: Raise pot/all-in eq=46% aggr=99%
+  ⚠ Board paired FD: Raise 75% eq=66% aggr=99%
+
+  Draw awareness: 6/8 OK | Erős draw fold: 0/5 (0%)
+  ✅ Draw kezelés OK
+  Equity↔Agresszió r=-0.18
+
+─────────────────────────────────────────────────────────────────
+  BET SIZING ANALÍZIS
+─────────────────────────────────────────────────────────────────
+
+  ── Preflop BTN open ──
+    72o   str=1: Call/Check         tier=1.5 eq=38%
+    T5o   str=2: Raise 75%          tier=5.1 eq=48%
+    K8o   str=3: Call/Check         tier=1.2 eq=55%
+    QJs   str=4: Raise (min)        tier=2.0 eq=55%
+    TT    str=5: Raise 50%          tier=4.0 eq=76%
+    AQo   str=6: Raise (min)        tier=2.0 eq=55%
+    KK    str=7: Raise 50%          tier=4.0 eq=82%
+    AA    str=8: Raise 50%          tier=3.4 eq=84%
+
+  Preflop sizing r=0.24 (⚠)
+
+  ── Postflop bet sizing (Kd 7d 2c) ──
+    Air 94o      str=1: Raise pot/all-in   tier=6.0 eq=31%
+    Mid pair     str=2: Raise pot/all-in   tier=5.9 eq=64%
+    Top pair     str=3: Raise 75%          tier=4.8 eq=86%
+    Overpair     str=4: Raise 75%          tier=4.1 eq=91%
+    Set          str=5: Call/Check         tier=1.5 eq=96%
+    Top set      str=6: Raise 75%          tier=4.4 eq=93%
+
+  Postflop sizing r=-0.83 (❌)
+  Átlag sizing r=-0.30
+
+─────────────────────────────────────────────────────────────────
+  KONZISZTENCIA / ENTROPY TESZT
+─────────────────────────────────────────────────────────────────
+
+  ⚠ AA preflop (KELL alacsony)
+     Raise 50% (38%) | Entropy=1.33 (magas ⚠)
+  ✅ 72o facing raise (elfogadható magas)
+     Call/Check (62%) | Entropy=0.76 (alacsony ✅)
+  ✅ Nut flush flop (KELL alacsony)
+     Raise (min) (88%) | Entropy=0.36 (alacsony ✅)
+  ✅ Marginális kéz (OK ha magas)
+     Raise 50% (99%) | Entropy=0.07 (alacsony ✅)
+  ⚠ Top set (KELL alacsony)
+     Raise 75% (37%) | Entropy=1.34 (magas ⚠)
+
+  Átlag entropy: 0.77 | Magabiztos: 3/5
+  ✅ Jó döntési magabiztosság
+
+─────────────────────────────────────────────────────────────────
+  VALUE HEAD KALIBRÁCIÓ TESZT (SPRINT2 – ÚJ)
+─────────────────────────────────────────────────────────────────
+
+  Értékelés: az EV iránya (előjel/relatív) helyes-e?
+  Skála: value>0 = pozitív EV, value<0 = negatív EV
+
+  ✅ AA preflop (EV > 0)
+     value=+2.5459  elvárás: [value > 0]  eq=84%
+  ✅ 72o vs raise (EV < 0)
+     value=-0.0490  elvárás: [value < 0]  eq=38%
+  ✅ Nut flush flop (EV > 0)
+     value=+0.1938  elvárás: [value > 0]  eq=96%
+  ✅ Top set dry flop (EV > 0)
+     value=+2.7844  elvárás: [value > 0]  eq=100%
+  ✅ Air river pot-bet (EV < 0.5)
+     value=-0.9801  elvárás: [value < 0.5]  eq=17%
+
+  Relatív sorrend: AA(+2.546) > 72o(-0.049) → ✅ helyes
+
+  Value kalibráció: 6/6
+  ✅ Value head EV iránya helyes minden esetben
+
+─────────────────────────────────────────────────────────────────
+  SCENARIO GENERATOR TESZT (SPRINT3 – ÚJ)
+─────────────────────────────────────────────────────────────────
+
+  [a] Stack depth sweep – Top pair KsJd, 4 stack mélység
+
+   10BB  →  Raise 75%          raise%=100%  allin%=0%  tier=3.98
+   20BB  →  Raise 75%          raise%=100%  allin%=0%  tier=3.98
+   50BB  →  Raise 75%          raise%=100%  allin%=0%  tier=3.98
+  100BB  →  Raise 75%          raise%=100%  allin%=0%  tier=3.98
+
+  Stack-tudatosság: 10BB allin%=0% vs 100BB allin%=0%  → ⚠ azonos döntés (stack-vak?)
+
+  [b] Board texture sweep – KcJd top pair, 4 textúra
+
+  dry         →  Raise 75%          bet%=100%  eq=90%
+  two_tone    →  Raise (min)        bet%=100%  eq=79%
+  monotone    →  Raise 50%          bet%=100%  eq=67%
+  paired      →  Raise 75%          bet%=100%  eq=96%
+
+  Texture-tudatosság: dry=100% vs monotone=100%  → ⚠ azonos bet% (texture-vak?)
+
+  [c] River-specifikus szituációk (4 spot)
+
+  ✅ River value bet (2-pair, check to)
+     → Raise 75% (51%)  val=+2.617  eq=95%
+  ⚠ River bluff-catch fold (Q-high, pot-bet)
+     → Raise pot/all-in (100%)  val=-0.245  eq=98%
+  ✅ Missed flush river (fold or overbet-bluff)
+     → Raise pot/all-in (57%)  val=-0.054  eq=30%
+  ✅ Nut river trips (max value)
+     → Raise 75% (37%)  val=+2.763  eq=99%
+
+  River szituációk: 3/4
+  ⚠ River döntések részben helyes (3/4)
+
+─────────────────────────────────────────────────────────────────
+  POKER STATISZTIKÁK – HU (500 random kéz)
+─────────────────────────────────────────────────────────────────
+
+  Akció eloszlás (500 kéz):
+    Fold              :    30 (  6.0%) ███
+    Call/Check        :    92 ( 18.4%) █████████
+    Raise (min)       :    42 (  8.4%) ████
+    Raise 25%         :    48 (  9.6%) ████
+    Raise 50%         :    62 ( 12.4%) ██████
+    Raise 75%         :    98 ( 19.6%) █████████
+    Raise pot/all-in  :   128 ( 25.6%) ████████████
+
+  ── Statisztikák [HU] ──
+  Mutató       Érték     Ideális sáv   Státusz
+  ──────────────────────────────────────────────────
+  VPIP         92.9%   [ 55– 90%]       ⚠
+  PFR          75.1%   [ 35– 75%]       ⚠
+  AF          15.50    [1.5–5.0]        ⚠
+  3-bet%       70.7%   [ 25– 55%]       ⚠
+  C-bet%       84.8%   [ 50– 85%]       ✅
+
+  Prémium kéz fold: 0/23 (0%) ✅
+
+=================================================================
+  ÖSSZEFOGLALÓ
+=================================================================
+  Szituációs:     10 ✅  7 ⚠  0 ❌
+  Pozíció:        1/5 (avg delta: -6.4%)
+  Exploit:        6/7
+  Draw awareness: 6/8 (fold%=0)
+  Sizing:         pf r=0.24 pp r=-0.83
+  Entropy:        0.77
+  Value calib:    6/6
+  ScenGen river:  3/4 | stack=⚠ | texture=⚠
+  Stat [HU]:  VPIP:93%⚠ PFR:75%⚠ AF:15.50⚠ 3b:71%⚠ Cb:85%✅
+
+  Penalty összeg: 2  [pozíció-tudatos=1/5<2, stats[HU]: VPIP+PFR+3bet mind rossz]
+  ÉRTÉKELÉS: 🟠 PROBLÉMÁS  (9,000,960 ep)
