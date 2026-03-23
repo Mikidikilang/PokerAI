@@ -2,51 +2,29 @@
 training/trainer.py  --  PPO Trainer
 
 VÁLTOZÁSOK:
-  [FIX-1] CosineAnnealingLR T_max=500 → T_max=14_648
-    Az eredeti T_max=500 ~1M epizódonként visszaugrott a max LR-re (3e-4).
-    30M epizód alatt ~29 teljes ciklust jelentett → catastrophic forgetting
-    ismétlődött minden ciklusnál.
-    Javítás: T_max = 30_000_000 // 2048 buffer_size = 14_648 update.
-    Az LR most egyirányban csökken a teljes tréning időtartama alatt.
-
-  [FIX-3] ENTROPY_DECAY egységhiba javítva: 30_000_000 → 900_000
-    _total_updates MINIBATCH-ITERÁCIÓKAT számol, nem epizódokat.
-    30M epizód végén total_updates ~937_000 → progress volt ~3.1%.
-    Javítás: ENTROPY_DECAY = 900_000 (30M ep / 2048 buffer * 60 minibatch).
-    Az entrópia-együttható most a tréning végén ténylegesen ENTROPY_FINAL-ra csökken.
-
-  [RF-2 FIX] StepLR → CosineAnnealingLR (megtartva, T_max javítva fentebb)
+  [RF-2 FIX] StepLR(step_size=1_000_000) → CosineAnnealingLR(T_max=500)
+    Az eredeti step_size hatékonyan végtelen volt (~2 milliárd epizód / decay),
+    mert scheduler.step() minden update()-ben hívódott, nem epizódonként.
+    CosineAnnealingLR simán csökkenti az LR-t 500 update-ciklus alatt
+    (≈ 1M epizód 2048 buffer_size mellett), ami PPO-hoz ideális.
 """
 import collections, numpy as np, torch, torch.nn.functional as F, torch.optim as optim
 from .buffer import PPOBuffer
 
 class PPOTrainer:
     CLIP_EPS=0.2; PPO_EPOCHS=8; MINIBATCH=256; VALUE_COEF=0.5
-    ENTROPY_COEF=0.01; ENTROPY_FINAL=0.001
-
-    # [FIX-3] Egységhiba javítva: 30_000_000 (epizód) → 900_000 (minibatch iter)
-    # Magyarázat: 30M ep / 2048 buffer * ~60 minibatch/update ≈ 878k → kerek 900k
-    # Így progress=100% ténylegesen ~30M ep körül következik be.
-    ENTROPY_DECAY = 900_000
-
+    ENTROPY_COEF=0.01; ENTROPY_FINAL=0.001; ENTROPY_DECAY=900_000  # [FIX-3: ~30M ep / 2048 buffer × 60 minibatch]
     MAX_GRAD_NORM=0.5; GAMMA=0.99; GAE_LAM=0.95
-
-    # [FIX-1] T_max javítva: 500 → 14_648
-    # Számítás: 30_000_000 ep / 2048 buffer_size = 14_648 update
-    # Így az LR egyirányban, monoton csökken a teljes tréning alatt –
-    # nincs több catastrophic forgetting a ciklusok miatt.
-    LR_T_MAX = 14_648
-    LR_ETA_MIN_RATIO = 0.05  # min LR = alap LR * 0.05
+    # LR scheduler paraméterek – T_max=500 update ≈ 1M epizód (2048 buffer_size mellett)
+    LR_T_MAX=14_648; LR_ETA_MIN_RATIO=0.05  # min LR = alap LR * 0.05  [FIX-1: 30M ep / 2048 buffer]
 
     def __init__(self, model, lr=3e-4, device=None):
         self.model=model; self.device=device or torch.device('cpu')
-        self._lr=lr
+        self._lr=lr  # eltároljuk eta_min kiszámításához
         self.use_amp=(self.device.type=='cuda')
         self.optimizer=optim.Adam(model.parameters(),lr=lr,eps=1e-5)
-
-        # [FIX-1] CosineAnnealingLR helyes T_max-szal:
-        # Az LR 3e-4-ről smoothan csökken lr*0.05-re 14_648 update alatt,
-        # majd ott marad – nem ugrik vissza a maximumra.
+        # [RF-2 FIX] CosineAnnealingLR: lr lineárisan csökken T_max update alatt,
+        # majd felmegy, majd újra csökken – stabilabb tanulási dinamikát ad PPO-hoz.
         self.scheduler=optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
             T_max=self.LR_T_MAX,
@@ -56,8 +34,6 @@ class PPOTrainer:
         self._total_updates=0
 
     def _entropy_coef(self):
-        # [FIX-3] ENTROPY_DECAY most minibatch-iteráció egységben van,
-        # ugyanolyan egységben mint _total_updates → progress helyes.
         progress=min(self._total_updates/self.ENTROPY_DECAY,1.0)
         return self.ENTROPY_COEF+(self.ENTROPY_FINAL-self.ENTROPY_COEF)*progress
 
@@ -67,8 +43,11 @@ class PPOTrainer:
 
         Paraméterek:
             buffer:     PPOBuffer – a gyűjtött tapasztalatok
-            last_value: V(s_{T+1}) bootstrap érték a buffer utolsó lépése
-                        UTÁNI állapothoz. Terminális esetén 0.0 (default).
+            last_value: [RF-3 FIX] V(s_{T+1}) bootstrap érték a buffer
+                        utolsó lépése UTÁNI állapothoz.
+                        - Terminális lépés esetén: 0.0 (default, helyes)
+                        - Nem-terminális esetén: a learner V(s) értéke
+                          az utolsó env állapothoz (runner.py adja át)
         """
         if len(buffer)<4: return {}
         advantages,returns=buffer.compute_gae(self.GAMMA,self.GAE_LAM,
@@ -117,6 +96,9 @@ class PPOTrainer:
             try:
                 self.optimizer.load_state_dict(d['optimizer'])
             except (KeyError, ValueError) as e:
+                # Architektúra változáskor (pl. v4.1→v4.2 GRU rétegek hozzáadva)
+                # az optimizer parameter group mérete nem egyezik → kihagyjuk.
+                # Az optimizer friss állapotból indul, a model weights megmaradnak.
                 import logging
                 logging.getLogger('PokerAI').warning(
                     f'Optimizer state nem töltve be (architektúra mismatch): {e}'
@@ -125,8 +107,8 @@ class PPOTrainer:
             try:
                 self.scheduler.load_state_dict(d['scheduler'])
             except (KeyError, ValueError):
-                # Régi StepLR vagy T_max=500-as checkpoint → kihagyjuk,
-                # a scheduler T_max=14_648-cal indul nulláról. Helyes viselkedés.
+                # Régi StepLR checkpoint → CosineAnnealingLR nem kompatibilis;
+                # egyszerűen kihagyjuk (scheduler nulláról indul).
                 pass
-        if 'scaler' in d: self.scaler.load_state_dict(d['scaler'])
+        if 'scaler'    in d: self.scaler.load_state_dict(d['scaler'])
         self._total_updates=d.get('total_updates',0)
