@@ -1,47 +1,34 @@
 """
 config.py -- PokerAI v4 központi konfiguráció
 
-[ARCH FIX] Korábban a konstansok szét voltak szórva modulszintű változókként:
-- training/runner.py: NUM_ENVS, BUFFER_COLLECT_SIZE, HIDDEN_SIZE, LEARNING_RATE ...
-- training/trainer.py: CLIP_EPS, PPO_EPOCHS, MINIBATCH, LR_T_MAX ...
-- training/collector.py: _MAX_STEPS_PER_HAND, _STREET_REWARD_SCALE ...
+[CONFIG-FULL v4.3] Minden tréning paraméter egy helyen, kód-módosítás nélkül
+állítható.  A config.json felülírja a Python default értékeket – így más
+modellt, más stílust, más reward shaping-et CSAK a JSON-ban kell beállítani.
 
-Mostantól egyetlen TrainingConfig dataclass tartalmaz minden konfigurálható
-paramétert. A runner.py ezt példányosítja és adja át.
+Új mezők (v4.3):
+  lr_scheduler              – LR scheduler típusa: 'cosine' | 'linear' | 'none'
+  reset_optimizer_on_load   – True → checkpoint betöltésekor optimizer/scheduler
+                              nulláról indul (degenerált modell újratanításához)
+  allin_penalty_*           – All-in spam elleni közvetlen büntetés
+  fold_bonus_*              – Gyenge lapokkal való fold jutalmazása
+  stack_blindness_penalty_* – Rövid stacknél min-raise büntetése
 
-Használat:
-    from config import TrainingConfig
-    cfg = TrainingConfig()                              # default értékek
-    cfg = TrainingConfig(num_envs=256, hidden_size=256) # overrides
-
-Előnyök:
-- Kísérletezhetőség: egy helyen változtatható minden paraméter
-- Type safety: mypy strict mode kompatibilis
-- Dokumentált: minden paraméternek van docstring-je
-- Checkpoint-ba menthető: cfg.__dict__ → JSON
-
-[COLAB MOD v1] Új mezők:
-    milestone_hands -- mérföldkő-teszthez használt kézszám (default: 2000)
-
-[OPT-1] equity_n_sim 200→100, equity_cache_size 20_000→100_000:
-    - Az equity Monte Carlo becslésnél 100 szimuláció ~1-2% pontossággal
-      elegendő a reward shaping céljaira (nem kell befektetési döntés-szintű
-      pontosság). Az early stopping (min_sims=30) tovább csökkenti az
-      átlagos futási időt.
-    - Nagyobb cache → több preflop/common board hit → kevesebb újraszámítás.
+Adatfolyam:
+  config.json["config"]
+      ↓  launcher.build_training_config()
+  TrainingConfig
+      ↓  runner.run_training_session()
+  PPOTrainer / BatchedSyncCollector / OpponentPool
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 
 @dataclass
 class TrainingConfig:
     """
-    PPO tréning konfiguráció.
-
-    Minden paraméter módosítható példányosításkor.
+    PPO tréning konfiguráció – minden paraméter módosítható a config.json-ban.
     """
 
     # ── Env & collection ──────────────────────────────────────────────────────
@@ -50,7 +37,7 @@ class TrainingConfig:
     """Párhuzamos rlcard env-ek száma. GPU memória szerint skálázandó."""
 
     buffer_collect_size: int = 2048
-    """Ennyi epizód gyűlik össze PPO update előtt. Nagyobb → stabilabb gradiens."""
+    """Ennyi epizód gyűlik össze PPO update előtt."""
 
     max_steps_per_hand: int = 500
     """Ennyi lépés után az env deaktiválódik (végtelen kéz védelem)."""
@@ -69,7 +56,7 @@ class TrainingConfig:
     """Adam optimizer kezdeti LR."""
 
     clip_eps: float = 0.2
-    """PPO clip epsilon – policy ratio clamp: [1-ε, 1+ε]."""
+    """PPO clip epsilon."""
 
     ppo_epochs: int = 8
     """Minibatch epochs száma update-enként."""
@@ -78,16 +65,19 @@ class TrainingConfig:
     """Minibatch méret a PPO update-ben."""
 
     value_coef: float = 0.5
-    """Critic loss súlya az összesített loss-ban."""
+    """Critic loss súlya."""
 
     entropy_coef: float = 0.01
-    """Kezdeti entropy bónusz – exploration ösztönzés."""
+    """Kezdeti entropy bónusz."""
 
     entropy_final: float = 0.001
-    """Végső entropy bónusz (tréning végén)."""
+    """Végső entropy bónusz."""
 
     entropy_decay: int = 30_000_000
-    """Ennyi update-ciklus alatt csökken az entropy_coef entropy_final-ra."""
+    """Ennyi update-ciklus alatt csökken az entropy_coef entropy_final-ra.
+    
+    Degenerált modell javításához ajánlott: 900_000
+    (a modell gyorsabban konvergál és abbahagyja az all-in spammingét)."""
 
     max_grad_norm: float = 0.5
     """Gradient clipping normája."""
@@ -96,45 +86,108 @@ class TrainingConfig:
     """Diszkont faktor."""
 
     gae_lambda: float = 0.95
-    """GAE lambda – trade-off bias/variance."""
+    """GAE lambda."""
 
     # ── LR Scheduler ─────────────────────────────────────────────────────────
 
+    lr_scheduler: str = "cosine"
+    """LR scheduler típusa.
+    
+    Értékek:
+      'cosine'  – CosineAnnealingLR (eredeti, oszcillál)
+      'linear'  – LinearLR (egyirányú csökkentés, ajánlott degenerált modellnél)
+      'none'    – nincs scheduler, LR konstans marad
+    """
+
     lr_t_max: int = 500
-    """CosineAnnealingLR periódus (update-ciklusban)."""
+    """CosineAnnealingLR vagy LinearLR periódus (update-ciklusban).
+    
+    Figyelem: ha a modell 17M epizódnál tart és újraindítod a tréninget,
+    ezt állítsd a hátralévő update-ciklusok számára (pl. 9765)."""
 
     lr_eta_min_ratio: float = 0.05
-    """Minimális LR = learning_rate × eta_min_ratio."""
+    """Minimális LR = learning_rate × eta_min_ratio (cosine/linear esetén)."""
 
-    # ── Reward shaping ────────────────────────────────────────────────────────
+    # ── Checkpoint / optimizer reset ─────────────────────────────────────────
+
+    reset_optimizer_on_load: bool = False
+    """Ha True, checkpoint betöltésekor kihagyja az optimizer és scheduler
+    állapotát – friss LR-rel folytatja a tréninget.
+    
+    Mikor használd:
+      - Degenerált modell javításakor (az optimizer momentum rossz irányba mutat)
+      - LR scheduler csere után (cosine → linear)
+      - Ha a tréning loss nem javul hiába folytatod
+    
+    Biztonságos: a modell súlyok (state_dict) mindig betöltődnek."""
+
+    # ── Reward shaping – meglévő ──────────────────────────────────────────────
 
     draw_fold_penalty: float = 0.08
-    """BB-büntetés ha postflop fold erős equity-vel (>= draw_equity_threshold)."""
+    """BB-büntetés ha postflop fold erős equity-vel."""
 
     draw_equity_threshold: float = 0.44
-    """~8-9 outos draw szintje. E felett a fold büntetett."""
+    """E felett a postflop fold büntetett."""
 
     street_reward_scale: float = 0.05
-    """[RF-11] Street-átmenet equity delta szorzója. Alacsony szándékosan."""
+    """Street-átmenet equity delta szorzója."""
+
+    # ── Reward shaping – All-in spam büntetés ────────────────────────────────
+
+    allin_penalty_enabled: bool = False
+    """All-in büntetés bekapcsolása.
+    
+    Hatása: ha a modell all-in-nel megy alacsony equity-vel,
+    azonnali büntetést kap – megtanulja, hogy a 72o all-in rossz döntés.
+    Ajánlott: True degenerált modellnél."""
+
+    allin_penalty_equity_threshold: float = 0.45
+    """E ALATT az all-in action büntetett.
+    ~50% = átlagos kéz; 0.45 alatt gyengébb a mediánnál."""
+
+    allin_penalty_amount: float = 0.15
+    """All-in büntetés nagysága BB-ben. Ajánlott: 0.10–0.20."""
+
+    # ── Reward shaping – Fold bónusz ─────────────────────────────────────────
+
+    fold_bonus_enabled: bool = False
+    """Fold bónusz bekapcsolása gyenge lapokhoz.
+    
+    Hatása: jutalmat kap a modell ha gyenge lappal dob – közvetlenül
+    gyógyítja a '72o all-in' hibát azzal hogy a fold-ot vonzóbbá teszi.
+    Ajánlott: True degenerált modellnél."""
+
+    fold_bonus_equity_threshold: float = 0.38
+    """E ALATT az fold action jutalmazott (gyenge kéz, helyes döntés dob)."""
+
+    fold_bonus_amount: float = 0.05
+    """Fold bónusz nagysága BB-ben. Ajánlott: 0.03–0.08."""
+
+    # ── Reward shaping – Stack-vakság büntetés ────────────────────────────────
+
+    stack_blindness_penalty_enabled: bool = False
+    """Stack-blindness büntetés bekapcsolása.
+    
+    Hatása: rövid stacknél (pl. ≤15BB) a min-raise helyett push/fold
+    (all-in vagy fold) a GTO stratégia. Ha mégis min-raise-el, bünteti.
+    Ajánlott: True ha a modell short-stack döntéseiben hibák vannak."""
+
+    stack_blindness_bb_threshold: float = 15.0
+    """E ALATT (BB-ben mérve) a nem-all-in raise büntetett."""
+
+    stack_blindness_penalty_amount: float = 0.10
+    """Stack-blindness büntetés nagysága BB-ben."""
 
     # ── Mérföldkő rendszer ────────────────────────────────────────────────────
 
     milestone_interval: int = 2_000_000
-    """Ennyi epizódonként ment snapshot + futtat sanity tesztet.
-
-    Colab futtatáshoz ajánlott érték: 500_000."""
+    """Ennyi epizódonként ment snapshot + futtat sanity tesztet."""
 
     milestone_dir_root: str = "ModellNaplo"
-    """Mérföldkő mentések gyökérmappája.
-
-    Colab esetén ez automatikusan a Drive modellmappa tests/ almappájára
-    van beállítva a _train_session_cli.py által."""
+    """Mérföldkő mentések gyökérmappája."""
 
     milestone_hands: int = 2000
-    """[COLAB MOD v1] Sanity teszt kézszám mérföldkőnél.
-
-    Lokálisan: 2000 (default). Colab-on csökkenthető pl. 500-ra ha
-    a GPU időt kezzel akarod optimalizálni."""
+    """Sanity teszt kézszám mérföldkőnél."""
 
     # ── Opponent pool ─────────────────────────────────────────────────────────
 
@@ -146,30 +199,15 @@ class TrainingConfig:
     # ── Equity estimator ─────────────────────────────────────────────────────
 
     equity_n_sim: int = 100
-    """[OPT-1] Monte Carlo szimulációk száma (maximum; adaptív early stopping).
-
-    Csökkentve 200→100: reward shaping célokhoz elegendő a ~1-2% pontosság.
-    A kollektív hatás az early stopping-gal (min_sims=30) tovább javítja
-    a teljesítményt – a tényleges átlagos szimuláció szám jóval 100 alatt lesz.
-    Modell erősségre nincs érdemi hatás, mivel:
-      - Az equity a state feature-be 0.5-ként kerül (BatchStateBuilder default)
-      - Reward shaping-hez (draw fold penalty, street delta) ~5% pontosság elég
-    """
+    """Monte Carlo szimulációk száma (max; adaptív early stopping aktív)."""
 
     equity_min_sims: int = 30
-    """[OPT-1] Minimum szimulációk az early stopping előtt.
-
-    Csökkentve 50→30: a legtöbb szituációban (erős kéz, gyenge kéz) már
-    30 szim után konvergál a variance. Bizonytalanabb esetekben (marginal
-    hands) az early stopping csak 40-50 sim után lép be – ez elfogadható.
-    """
+    """Minimum szimulációk az early stopping előtt."""
 
     equity_cache_size: int = 100_000
-    """[OPT-1] Equity cache mérete. Növelve 20_000→100_000.
+    """Equity cache mérete (LRU)."""
 
-    Nagyobb cache → több preflop és common board hit → kevesebb újraszámítás.
-    Memória overhead: ~100k entry × ~60 byte ≈ 6MB – elhanyagolható.
-    """
+    # ── Serialization ────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
         """Checkpoint-ba menthető dict."""
@@ -179,6 +217,6 @@ class TrainingConfig:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> TrainingConfig:
+    def from_dict(cls, d: dict) -> "TrainingConfig":
         """Checkpoint-ból visszaállítás."""
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

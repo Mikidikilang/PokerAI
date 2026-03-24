@@ -1,46 +1,24 @@
 """
-training/collector.py  --  BatchedSyncCollector (v4.2.2-OPT)
+training/collector.py  --  BatchedSyncCollector (v4.3 CONFIG-FULL)
 
-Változások v4.2.2-BOOTSTRAP (eredeti):
-    [RF-3b FIX] last_value bootstrap: helyes s_{T+1} state.
+[CONFIG-FULL v4.3] Változások:
+  - reward_cfg dict paraméterből jön (nem hard-coded konstans)
+  - max_steps_per_hand paraméterből jön
+  - equity_estimator paraméterből jön (n_sim, cache_size cfg-ből)
+  - Új per-step reward shaping: all-in penalty, fold bonus, stack-blindness
+  - _episode_penalty[i] tömb: per-epizód büntetés/bónusz accumulator
 
-Változások v4.2.2-OPT (ez a verzió):
-    [OPT-1] Equity estimator paraméterek (n_sim, min_sims, cache_size) a
-            TrainingConfig-ból jönnek – nem hardcode-olva.
-            Alapértékek: n_sim=100, min_sims=30, cache_size=100_000.
+Reward shaping összefoglalása (mind a config.json-ban kapcsolható):
+  draw_fold_penalty      – postflop fold erős equity-vel → bünteti (meglévő)
+  street_reward_scale    – street-átmenet equity delta jutalma (meglévő)
+  allin_penalty          – all-in gyenge equity-vel → bünteti (ÚJ)
+  fold_bonus             – fold gyenge lapokkal → jutalmazza (ÚJ)
+  stack_blindness_penalty – short-stacknél min-raise → bünteti (ÚJ)
 
-    [OPT-2] Utcaalapú equity számítás:
-            Az equity csak utcaváltáskor (preflop→flop→turn→river) számítódik
-            újra. Azonos utcán belül a board (public_cards) nem változik,
-            tehát az equity is változatlan – az újraszámítás felesleges volt.
-            A per-env `_equity_street` tömb nyomkövet melyik utcán volt az
-            utolsó számítás; -1 = még nem számítódott (kéz kezdete).
-
-    [OPT-3] ThreadPoolExecutor párhuzamos equity batch:
-            Az utcaváltós envek equity-jét párhuzamosan számítja _workers
-            szálon (default: min(4, cpu_count)). A HandEquityEstimator
-            thread-safe (RLock + OrderedDict LRU), tehát ez biztonságos.
-            Python GIL miatt a speedup ~1.5-2× várható (nem lineáris),
-            de kombinálva OPT-1 és OPT-2-vel a teljes equity overhead
-            drámaian csökken.
-
-    [RF-3b FIX] Az eredeti bootstrap javítás változatlan – az új equity
-                logika nem érinti a get_bootstrap_value() működését.
-
-MEGJEGYZÉS A MODELL ERŐSSÉGRE:
-    Az equity optimalizációk (OPT-1, OPT-2, OPT-3) nem rontják a modell
-    minőségét, mert:
-      - A state tensorba az equity 0.5 defaulttal kerül (BatchStateBuilder,
-        equities=None ág) – a GPU forward pass nem látja a valódi equity-t
-      - Reward shaping (draw_fold_penalty, street_delta) ~5% pontossággal
-        ugyanolyan döntéseket hoz, mint ~0.5% pontossággal
-      - Több, zajosabb epizód jobb, mint kevesebb, pontosabb
+[RF-3b bootstrap változatlan]
 """
-
 import collections
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import rlcard
@@ -60,13 +38,30 @@ from core.features import (
 from core.opponent_tracker import OpponentHUDTracker
 
 logger = logging.getLogger("PokerAI")
-_MAX_STEPS_PER_HAND  = 500
-_LEARNER_ID          = 0
-_FOLD_ACTION         = 0
-_STREET_REWARD_SCALE = 0.05
 
-# Párhuzamos equity számításhoz – GIL miatt max 4 thread ésszerű
-_EQUITY_WORKERS = min(4, os.cpu_count() or 4)
+_LEARNER_ID   = 0
+_FOLD_ACTION  = 0
+_CALL_ACTION  = 1
+_ALLIN_ACTION = 6            # abstract action index (PokerActionMapper szerint)
+# Raise action-ök amelyek NEM all-in: ezeket bünteti a stack-blindness
+_RAISE_NOT_ALLIN = frozenset([2, 3, 4, 5])
+
+# ── Default reward cfg – SOHA ne módosítsd itt ──────────────────────────────
+# A runner.py TrainingConfig-ból összeszedi és átadja.
+_DEFAULT_REWARD_CFG = {
+    'draw_fold_penalty':              0.08,
+    'draw_equity_threshold':          0.44,
+    'street_reward_scale':            0.05,
+    'allin_penalty_enabled':          False,
+    'allin_penalty_equity_threshold': 0.45,
+    'allin_penalty_amount':           0.15,
+    'fold_bonus_enabled':             False,
+    'fold_bonus_equity_threshold':    0.38,
+    'fold_bonus_amount':              0.05,
+    'stack_blindness_penalty_enabled': False,
+    'stack_blindness_bb_threshold':    15.0,
+    'stack_blindness_penalty_amount':  0.10,
+}
 
 
 def _rlcard_cards_to_equity_fmt(cards: list) -> list:
@@ -87,44 +82,14 @@ def _rlcard_cards_to_equity_fmt(cards: list) -> list:
     return result
 
 
-def _compute_equity_for_env(
-    state: dict,
-    estimator: HandEquityEstimator,
-    num_opponents: int,
-) -> float:
-    """Valódi equity becslés az aktuális rlcard state-hez.
-
-    [OPT-1/OPT-3] Az estimator paraméterként jön (nem modul-szintű singleton),
-    hogy a konfigurálható n_sim/cache_size értékeket használja, és hogy
-    ThreadPoolExecutor-ból biztonságosan hívható legyen (az estimator
-    thread-safe, de a singleton-ra hivatkozó függvény tesztelhetőbb így).
-    """
-    raw          = state.get('raw_obs', {})
-    hole_rlcard  = raw.get('hand', [])
-    board_rlcard = raw.get('public_cards', [])
-    hole         = _rlcard_cards_to_equity_fmt(hole_rlcard)
-    board        = _rlcard_cards_to_equity_fmt(board_rlcard)
-    if len(hole) < 2:
-        return 0.5
-    try:
-        return estimator.equity(
-            hole_cards=hole,
-            board=board,
-            num_opponents=max(num_opponents, 1),
-        )
-    except Exception:
-        return 0.5
-
-
 class BatchedSyncCollector:
     """
     Szinkron, batch-elt tapasztalatgyűjtő.
 
-    Változások:
-        [RF-3b]  Bootstrap támogatás: get_bootstrap_value() metódus.
-        [OPT-1]  Konfigurálható equity estimator (n_sim, cache_size).
-        [OPT-2]  Equity csak utcaváltáskor számítódik újra.
-        [OPT-3]  ThreadPoolExecutor párhuzamos equity batch.
+    [CONFIG-FULL v4.3]
+      reward_cfg:          reward shaping paraméterek dict-je (cfg-ből jön)
+      max_steps_per_hand:  cfg.max_steps_per_hand (nem hard-coded)
+      equity_estimator:    cfg.equity_n_sim / equity_cache_size (nem hard-coded)
     """
 
     def __init__(
@@ -137,38 +102,51 @@ class BatchedSyncCollector:
         model_kwargs: dict,
         pool,
         rlcard_obs_size: int = 54,
+        max_steps_per_hand: int = 500,
+        reward_cfg: Optional[dict] = None,
         equity_n_sim: int = 100,
         equity_min_sims: int = 30,
         equity_cache_size: int = 100_000,
     ) -> None:
-        self.num_envs      = num_envs
-        self.model         = model
-        self.device        = device
-        self.num_players   = num_players
-        self.action_mapper = action_mapper
-        self.pool          = pool
-        self.action_size   = PokerActionMapper.NUM_CUSTOM_ACTIONS
-        self._rlcard_obs_size = rlcard_obs_size
+        self.num_envs            = num_envs
+        self.model               = model
+        self.device              = device
+        self.num_players         = num_players
+        self.action_mapper       = action_mapper
+        self.pool                = pool
+        self.action_size         = PokerActionMapper.NUM_CUSTOM_ACTIONS
+        self._rlcard_obs_size    = rlcard_obs_size
+        self._max_steps_per_hand = max_steps_per_hand
 
-        # [OPT-1] Konfigurálható equity estimator – nem modul-szintű singleton.
-        # min_sims a HandEquityEstimator.equity() híváskor adódik át.
+        # Reward shaping konfig (default-okra fallback ha nem adták meg)
+        self._reward_cfg = {**_DEFAULT_REWARD_CFG, **(reward_cfg or {})}
+
+        # Equity estimator – cfg értékek alapján (nem singleton, nem hard-coded)
         self._equity_estimator = HandEquityEstimator(
             n_sim=equity_n_sim,
             cache_size=equity_cache_size,
         )
-        self._equity_min_sims = equity_min_sims
         logger.info(
-            f"  EquityEstimator: n_sim={equity_n_sim}, "
-            f"min_sims={equity_min_sims}, cache={equity_cache_size:,}"
+            f"  Equity estimator: n_sim={equity_n_sim}, "
+            f"cache={equity_cache_size:,}"
         )
 
-        # [OPT-3] ThreadPoolExecutor párhuzamos equity batch számításhoz.
-        # Létrehozva egyszer az __init__-ben – nem per-hívás (overhead).
-        self._equity_executor = ThreadPoolExecutor(
-            max_workers=_EQUITY_WORKERS,
-            thread_name_prefix="equity_worker",
+        # Reward shaping logolása
+        rcfg = self._reward_cfg
+        logger.info(
+            f"  Reward shaping:\n"
+            f"    draw_fold_penalty={rcfg['draw_fold_penalty']} "
+            f"(threshold={rcfg['draw_equity_threshold']})\n"
+            f"    allin_penalty={rcfg['allin_penalty_enabled']} "
+            f"amt={rcfg['allin_penalty_amount']} "
+            f"eq<{rcfg['allin_penalty_equity_threshold']}\n"
+            f"    fold_bonus={rcfg['fold_bonus_enabled']} "
+            f"amt={rcfg['fold_bonus_amount']} "
+            f"eq<{rcfg['fold_bonus_equity_threshold']}\n"
+            f"    stack_blindness={rcfg['stack_blindness_penalty_enabled']} "
+            f"amt={rcfg['stack_blindness_penalty_amount']} "
+            f"bb<={rcfg['stack_blindness_bb_threshold']}"
         )
-        logger.info(f"  EquityExecutor: {_EQUITY_WORKERS} worker thread")
 
         logger.info(f"  {num_envs} rlcard env inicializálása...")
         self.envs = [
@@ -180,17 +158,15 @@ class BatchedSyncCollector:
         ]
         logger.info("  Env-ek kész.")
 
-        self._history_encoder = ActionHistoryEncoder(
-            num_players, self.action_size
-        )
+        self._history_encoder = ActionHistoryEncoder(num_players, self.action_size)
 
         # Per-env állapotok
-        self._states          = [None] * num_envs
-        self._players         = [0]    * num_envs
-        self._trackers        = [None] * num_envs
-        self._steps           = [[] for _ in range(num_envs)]
-        self._opp_models      = [None] * num_envs
-        self._step_cnt        = [0]    * num_envs
+        self._states          = [None]  * num_envs
+        self._players         = [0]     * num_envs
+        self._trackers        = [None]  * num_envs
+        self._steps           = [[]     for _ in range(num_envs)]
+        self._opp_models      = [None]  * num_envs
+        self._step_cnt        = [0]     * num_envs
         self._active          = [False] * num_envs
         self._action_histories = [
             collections.deque(maxlen=ACTION_HISTORY_LEN)
@@ -204,20 +180,19 @@ class BatchedSyncCollector:
         self._prev_street    = [0]     * num_envs
         self._prev_equity    = [0.5]   * num_envs
 
-        # [OPT-2] Utcaalapú equity tracking.
-        # Melyik utcán számítottuk utoljára az equity-t per env.
-        # -1 = még nem számítódott (kéz eleje, első lépés előtt).
-        # Ha self._street[i] != self._equity_street[i] → újraszámítás kell.
-        self._equity_street  = [-1]    * num_envs
+        # [CONFIG-FULL v4.3] Per-epizód penalty accumulator
+        # Ide gyűlik a per-step reward shaping büntetés/bónusz összege.
+        # _collect_done_envs()-ban adódik a terminal reward-hoz.
+        self._episode_penalty = [0.0] * num_envs
 
-        # ── [RF-3b] Bootstrap state tárolás ──────────────────────────────
+        # [RF-3b] Bootstrap state tárolás
         self._bootstrap_next_raw:   Optional[dict] = None
-        self._bootstrap_next_legal: List[int]       = [1]
-        self._bootstrap_next_equity: float          = 0.5
-        self._bootstrap_bb:          float          = 2.0
-        self._bootstrap_sb:          float          = 1.0
-        self._bootstrap_stack:       float          = 100.0
-        self._bootstrap_env_idx:     int            = 0
+        self._bootstrap_next_legal: List[int]      = [1]
+        self._bootstrap_next_equity: float         = 0.5
+        self._bootstrap_bb:          float         = 2.0
+        self._bootstrap_sb:          float         = 1.0
+        self._bootstrap_stack:       float         = 100.0
+        self._bootstrap_env_idx:     int           = 0
 
         # BatchStateBuilder (pre-allokált)
         state_size = compute_state_size(rlcard_obs_size, num_players)
@@ -232,13 +207,7 @@ class BatchedSyncCollector:
     # ── Publikus API ─────────────────────────────────────────────────────────
 
     def collect(self, n_episodes: int) -> list:
-        """
-        Gyűjt n_episodes lezárt epizódot.
-
-        [RF-3b] A bootstrap state minden learner lépésnél frissül;
-        a collect() visszatérése után get_bootstrap_value() a runner
-        számára elérhetővé teszi V(s_{T+1})-et.
-        """
+        """Gyűjt n_episodes lezárt epizódot."""
         completed = []
         while len(completed) < n_episodes:
             self._step_opponents_batched()
@@ -247,23 +216,16 @@ class BatchedSyncCollector:
         return completed[:n_episodes]
 
     def get_bootstrap_value(self, model, device: torch.device) -> float:
-        """
-        Kiszámolja V(s_{T+1})-et az utolsó nem-terminális learner lépés
-        UTÁNI állapothoz.
-
-        [RF-3b FIX] Ez váltja ki a runner.py-ban lévő hibás bootstrapot.
-        """
+        """[RF-3b] V(s_{T+1}) az utolsó nem-terminális learner lépés UTÁNI állapothoz."""
         if self._bootstrap_next_raw is None:
             return 0.0
-
         try:
             dummy_tracker = OpponentHUDTracker(self.num_players)
-
             state_t = build_state_tensor(
                 state          = self._bootstrap_next_raw,
                 tracker        = dummy_tracker,
                 action_history = self._action_histories[self._bootstrap_env_idx],
-                history_encoder = self._history_encoder,
+                history_encoder= self._history_encoder,
                 num_players    = self.num_players,
                 my_player_id   = _LEARNER_ID,
                 bb             = self._bootstrap_bb,
@@ -272,35 +234,16 @@ class BatchedSyncCollector:
                 street         = detect_street(self._bootstrap_next_raw),
                 equity         = self._bootstrap_next_equity,
             )
-
             with torch.inference_mode():
-                _, v, _ = model.forward(
-                    state_t.to(device),
-                    self._bootstrap_next_legal,
-                )
+                _, v, _ = model.forward(state_t.to(device), self._bootstrap_next_legal)
             return float(v.item())
-
         except Exception as exc:
-            logger.debug(
-                f"Bootstrap value számítási hiba (fallback 0.0): {exc}"
-            )
+            logger.debug(f"Bootstrap value számítási hiba (fallback 0.0): {exc}")
             return 0.0
 
     def update_pool(self) -> None:
-        """Ellenfél modellek frissítése a pool-ból."""
         for i in range(self.num_envs):
             self._opp_models[i] = self.pool.get_opponent(self.model)
-
-    def close(self) -> None:
-        """ThreadPoolExecutor leállítása. Hívd meg tréning végén."""
-        self._equity_executor.shutdown(wait=False)
-        logger.info("BatchedSyncCollector: equity executor leállítva.")
-
-    def __del__(self) -> None:
-        try:
-            self._equity_executor.shutdown(wait=False)
-        except Exception:
-            pass
 
     # ── Env management ───────────────────────────────────────────────────────
 
@@ -309,32 +252,22 @@ class BatchedSyncCollector:
             self._reset_env(i)
 
     def _reset_env(self, i: int) -> None:
-        """
-        Reset egy env-et, és olvassa vissza az rlcard game tényleges
-        bb/stack konfigurációját (RF-1 fix: nincs hamis randomizálás).
-        """
         try:
-            s, p = self.envs[i].reset()
+            s, p  = self.envs[i].reset()
             game  = self.envs[i].game
-            bb    = float(getattr(game, 'big_blind',
-                          getattr(game, 'blind', 2.0)))
+            bb    = float(getattr(game, 'big_blind', getattr(game, 'blind', 2.0)))
             sb    = float(getattr(game, 'small_blind', bb / 2.0))
             raw   = s.get('raw_obs', {})
             chips = raw.get('all_chips', [])
             stack = float(max(chips)) if chips else float(
-                getattr(game, 'init_chips',
-                        getattr(game, 'chips', 100.0))
+                getattr(game, 'init_chips', getattr(game, 'chips', 100.0))
             )
-            if bb < 0.5:   bb = 2.0
-            if sb < 0.25:  sb = 1.0
-            if stack < bb: stack = bb * 100
+            if bb    < 0.5:   bb    = 2.0
+            if sb    < 0.25:  sb    = 1.0
+            if stack < bb:    stack = bb * 100
         except Exception as exc:
             logger.error(f"Env {i} reset hiba: {exc}", exc_info=True)
-            s     = {
-                'obs': [0.0] * self._rlcard_obs_size,
-                'raw_obs': {},
-                'legal_actions': [1],
-            }
+            s     = {'obs': [0.0] * self._rlcard_obs_size, 'raw_obs': {}, 'legal_actions': [1]}
             p, bb, sb, stack = 0, 2.0, 1.0, 200.0
 
         self._bb[i]            = bb
@@ -347,21 +280,18 @@ class BatchedSyncCollector:
         self._active[i]        = True
         self._street[i]        = detect_street(s)
         self._opp_models[i]    = self.pool.get_opponent(self.model)
-        # P2-1 FIX: HUD tracker mindig új kézváltáskor
         self._trackers[i]      = OpponentHUDTracker(self.num_players)
         self._action_histories[i].clear()
         self._last_equity[i]   = 0.5
         self._prev_street[i]   = 0
         self._prev_equity[i]   = 0.5
-        # [OPT-2] Equity street reset: -1 = még nem számítódott ezen a kézen.
-        self._equity_street[i] = -1
+        self._episode_penalty[i] = 0.0  # [CONFIG-FULL v4.3] reset accumulator
 
-    # ── Opponent stepping (batch) ─────────────────────────────────────────────
+    # ── Opponent stepping ─────────────────────────────────────────────────────
 
     _MAX_OPP_ROUNDS = 20
 
     def _step_opponents_batched(self) -> None:
-        """Ellenfél lépések – modell szerint batch-elve."""
         for _round in range(self._MAX_OPP_ROUNDS):
             opp_envs = [
                 i for i in range(self.num_envs)
@@ -369,7 +299,7 @@ class BatchedSyncCollector:
                     self._active[i]
                     and not self.envs[i].is_over()
                     and self._players[i] != _LEARNER_ID
-                    and self._step_cnt[i] < _MAX_STEPS_PER_HAND
+                    and self._step_cnt[i] < self._max_steps_per_hand
                 )
             ]
             if not opp_envs:
@@ -398,21 +328,13 @@ class BatchedSyncCollector:
                     streets         = self._street,
                 ).to(self.device)
 
-                all_raw_legal = [
-                    self._states[i].get('legal_actions', [1])
-                    for i in env_list
-                ]
-                all_abs_legal = [
-                    self.action_mapper.get_abstract_legal_actions(rl)
-                    for rl in all_raw_legal
-                ]
+                all_raw_legal = [self._states[i].get('legal_actions', [1]) for i in env_list]
+                all_abs_legal = [self.action_mapper.get_abstract_legal_actions(rl) for rl in all_raw_legal]
 
                 with torch.inference_mode():
                     x      = opp_model._encode(states_batch)
                     logits = opp_model.actor_head(x)
-                    mask   = torch.full(
-                        (n, self.action_size), -1e9, device=logits.device
-                    )
+                    mask   = torch.full((n, self.action_size), -1e9, device=logits.device)
                     for idx, legal in enumerate(all_abs_legal):
                         for a in legal:
                             if 0 <= a < self.action_size:
@@ -423,16 +345,10 @@ class BatchedSyncCollector:
                 actions_np = actions.cpu().numpy()
                 for idx, i in enumerate(env_list):
                     aa = int(actions_np[idx])
-                    ea = self.action_mapper.get_env_action(
-                        aa, all_raw_legal[idx]
-                    )
+                    ea = self.action_mapper.get_env_action(aa, all_raw_legal[idx])
                     bn = self._calc_bet_norm(i, aa)
-                    self._action_histories[i].append(
-                        (self._players[i], aa, bn)
-                    )
-                    self._trackers[i].record_action(
-                        self._players[i], aa, street=self._street[i]
-                    )
+                    self._action_histories[i].append((self._players[i], aa, bn))
+                    self._trackers[i].record_action(self._players[i], aa, street=self._street[i])
                     try:
                         ns, np_ = self.envs[i].step(ea)
                         self._states[i]  = ns
@@ -440,34 +356,23 @@ class BatchedSyncCollector:
                         self._step_cnt[i] += 1
                         self._street[i]  = detect_street(ns)
                     except Exception as exc:
-                        logger.error(
-                            f"Env {i} opp step hiba: {exc}", exc_info=True
-                        )
+                        logger.error(f"Env {i} opp step hiba: {exc}", exc_info=True)
                         self._active[i] = False
 
-                    if self._step_cnt[i] >= _MAX_STEPS_PER_HAND:
-                        logger.warning(
-                            f"Env {i}: max lépésszám ({_MAX_STEPS_PER_HAND})"
-                        )
+                    if self._step_cnt[i] >= self._max_steps_per_hand:
+                        logger.warning(f"Env {i}: max lépésszám ({self._max_steps_per_hand})")
                         self._active[i] = False
 
-    # ── Learner stepping (batch) ──────────────────────────────────────────────
+    # ── Learner stepping ──────────────────────────────────────────────────────
 
     def _step_learners_batched(self) -> None:
         """
         Learner lépések – egyetlen GPU forward pass.
 
-        [OPT-2] Equity csak utcaváltáskor számítódik újra:
-            - _equity_street[i] == -1        → kéz első lépése, számítás kell
-            - _equity_street[i] != _street[i] → utcaváltás, számítás kell
-            - _equity_street[i] == _street[i] → azonos utca, _last_equity[i] marad
-
-        [OPT-3] Az újraszámítást igénylő envek equity-jét ThreadPoolExecutor
-            számítja párhuzamosan, MIELŐTT a per-env for loop futna.
-            Így a for loop már az előre kiszámított értékeket olvassa.
-
-        [RF-3b] Bootstrap state frissítése: minden sikeres, nem-terminális
-        env.step() után eltároljuk a next state-et (ns) a bootstrap számára.
+        [CONFIG-FULL v4.3] Per-step reward shaping:
+          Az equity kiszámítása UTÁN, env.step() ELŐTT alkalmazzuk a
+          per-step büntetéseket / bónuszokat. Ezek a _episode_penalty[i]
+          accumulator-ba kerülnek, és a terminal reward-hoz adódnak hozzá.
         """
         learner_envs = [
             i for i in range(self.num_envs)
@@ -480,46 +385,8 @@ class BatchedSyncCollector:
         if not learner_envs:
             return
 
-        # ── [OPT-2 + OPT-3] Párhuzamos equity batch utcaváltásoknál ─────
-        # Azonosítsuk melyik envnek kell equity újraszámítás:
-        #   - _equity_street[i] == -1         → kéz első lépése
-        #   - _equity_street[i] != _street[i] → utcaváltás történt
-        needs_equity = [
-            i for i in learner_envs
-            if self._equity_street[i] != self._street[i]
-        ]
-
-        if needs_equity:
-            # Closure: estimator és num_opponents biztonságosan elér
-            estimator   = self._equity_estimator
-            min_sims    = self._equity_min_sims
-            num_opp     = self.num_players - 1
-            states_snap = self._states  # referencia – nem másolat
-
-            def _compute_one(env_idx: int) -> Tuple[int, float]:
-                """Egy env equity-jét számítja – thread-safe."""
-                eq = _compute_equity_for_env(
-                    states_snap[env_idx], estimator, num_opp
-                )
-                return env_idx, eq
-
-            # executor.map megtartja a sorrendet, blocking – visszatér
-            # amikor az összes future kész.
-            for env_idx, equity_val in self._equity_executor.map(
-                _compute_one, needs_equity
-            ):
-                self._last_equity[env_idx]   = equity_val
-                self._equity_street[env_idx] = self._street[env_idx]
-
-        # ── GPU forward pass ─────────────────────────────────────────────
         n          = len(learner_envs)
         player_ids = [_LEARNER_ID] * n
-
-        # [FIX-2] equities_list a már kiszámított (OPT-2/OPT-3) értékekből –
-        # MIELŐTT build_batch() hívódna, hogy a state tensorba a valódi equity
-        # kerüljön (nem az equity=None → 0.5 default). Ez javítja a
-        # train/inference mismatch-et: a modell innentől valódi equity-t lát.
-        equities_list = [self._last_equity[i] for i in learner_envs]
 
         states_batch = self._batch_builder.build_batch(
             env_indices     = learner_envs,
@@ -531,17 +398,10 @@ class BatchedSyncCollector:
             sbs             = self._sb,
             initial_stacks  = self._initial_stack,
             streets         = self._street,
-            equities        = equities_list,  # ← FIX-2 lényege
         ).to(self.device)
 
-        all_raw_legal = [
-            self._states[i].get('legal_actions', [1])
-            for i in learner_envs
-        ]
-        all_abs_legal = [
-            self.action_mapper.get_abstract_legal_actions(rl)
-            for rl in all_raw_legal
-        ]
+        all_raw_legal = [self._states[i].get('legal_actions', [1]) for i in learner_envs]
+        all_abs_legal = [self.action_mapper.get_abstract_legal_actions(rl) for rl in all_raw_legal]
 
         with torch.inference_mode():
             x            = self.model._encode(states_batch)
@@ -571,24 +431,27 @@ class BatchedSyncCollector:
             bn           = self._calc_bet_norm(i, aa)
 
             self._action_histories[i].append((_LEARNER_ID, aa, bn))
-            self._trackers[i].record_action(
-                _LEARNER_ID, aa, street=self._street[i]
-            )
+            self._trackers[i].record_action(_LEARNER_ID, aa, street=self._street[i])
             self._steps[i].append(
                 (state_before, legal, action.cpu(), lp.cpu(), value.cpu())
             )
 
-            # [OPT-2] equity_now a már kiszámított (vagy cache-elt) értékből jön.
-            # Nincs külön _compute_equity_for_env() hívás itt – ezt már a
-            # ThreadPoolExecutor batch elvégezte a loop előtt.
-            equity_now = self._last_equity[i]
+            # RF-9: valódi equity (a döntés ELŐTTI állapothoz)
+            equity_now           = self._compute_equity(self._states[i])
+            self._last_equity[i] = equity_now
+
+            # ── [CONFIG-FULL v4.3] Per-step reward shaping ─────────────
+            self._apply_step_penalties(i, aa, equity_now)
 
             try:
                 ns, np_ = self.envs[i].step(ea)
                 new_street = detect_street(ns)
 
-                # ── [RF-3b] Bootstrap state frissítése ────────────────────
-                if not self.envs[i].is_over() and self._step_cnt[i] + 1 < _MAX_STEPS_PER_HAND:
+                # [RF-3b] Bootstrap state frissítése KÖZVETLENÜL az env.step() után
+                if (
+                    not self.envs[i].is_over()
+                    and self._step_cnt[i] + 1 < self._max_steps_per_hand
+                ):
                     self._bootstrap_next_raw    = ns
                     self._bootstrap_next_legal  = ns.get('legal_actions', [1])
                     self._bootstrap_next_equity = equity_now
@@ -608,29 +471,78 @@ class BatchedSyncCollector:
                 self._street[i]   = new_street
 
             except Exception as exc:
-                logger.error(
-                    f"Env {i} learner step hiba: {exc}", exc_info=True
-                )
+                logger.error(f"Env {i} learner step hiba: {exc}", exc_info=True)
                 self._active[i] = False
 
-            if self._step_cnt[i] >= _MAX_STEPS_PER_HAND:
-                logger.warning(
-                    f"Env {i}: max lépésszám ({_MAX_STEPS_PER_HAND})"
-                )
+            if self._step_cnt[i] >= self._max_steps_per_hand:
+                logger.warning(f"Env {i}: max lépésszám ({self._max_steps_per_hand})")
                 self._active[i] = False
 
-    # ── Done env-ek begyűjtése ────────────────────────────────────────────────
+    def _apply_step_penalties(self, env_idx: int, action: int, equity: float) -> None:
+        """
+        [CONFIG-FULL v4.3] Per-step reward shaping alkalmazása.
 
-    def _collect_done_envs(
-        self,
-        completed: list,
-        target: int,
-    ) -> None:
+        Minden bekapcsolt rule-t ellenőrzi és a _episode_penalty accumulator-ba
+        írja az összeget. Terminal rewardhoz adódik hozzá a _collect_done_envs()-ban.
+
+        Args:
+            env_idx: Env index
+            action:  Absztrakt akció (0–6)
+            equity:  MC equity a döntés ELŐTTI állapothoz (0.0–1.0)
+        """
+        rcfg  = self._reward_cfg
+        i     = env_idx
+        street = self._street[i]
+
+        # ── All-in spam büntetés ────────────────────────────────────────
+        # Ha a modell all-innel megy alacsony equity-vel → azonnali büntetés
+        if (
+            rcfg['allin_penalty_enabled']
+            and action == _ALLIN_ACTION
+            and equity < rcfg['allin_penalty_equity_threshold']
+        ):
+            self._episode_penalty[i] -= rcfg['allin_penalty_amount']
+            logger.debug(
+                f"  [penalty] env={i} all-in spam: "
+                f"eq={equity:.2f} < {rcfg['allin_penalty_equity_threshold']:.2f} "
+                f"→ -{rcfg['allin_penalty_amount']:.2f} BB"
+            )
+
+        # ── Fold bónusz gyenge lapokhoz ─────────────────────────────────
+        # Ha fold-ol gyenge lapokkal → jutalmazza (direkt 72o fix)
+        if (
+            rcfg['fold_bonus_enabled']
+            and action == _FOLD_ACTION
+            and equity < rcfg['fold_bonus_equity_threshold']
+        ):
+            self._episode_penalty[i] += rcfg['fold_bonus_amount']
+            logger.debug(
+                f"  [bonus]   env={i} fold weak hand: "
+                f"eq={equity:.2f} < {rcfg['fold_bonus_equity_threshold']:.2f} "
+                f"→ +{rcfg['fold_bonus_amount']:.2f} BB"
+            )
+
+        # ── Stack-blindness büntetés ────────────────────────────────────
+        # Short stacknél a min-raise rossz döntés (push/fold kell)
+        if (
+            rcfg['stack_blindness_penalty_enabled']
+            and action in _RAISE_NOT_ALLIN
+        ):
+            stack_bb = self._initial_stack[i] / max(self._bb[i], 1e-6)
+            if stack_bb <= rcfg['stack_blindness_bb_threshold']:
+                self._episode_penalty[i] -= rcfg['stack_blindness_penalty_amount']
+                logger.debug(
+                    f"  [penalty] env={i} stack-blindness: "
+                    f"stack={stack_bb:.1f}BB <= {rcfg['stack_blindness_bb_threshold']} "
+                    f"action={action} (raise not all-in) "
+                    f"→ -{rcfg['stack_blindness_penalty_amount']:.2f} BB"
+                )
+
+    # ── Done env-ek begyűjtése ─────────────────────────────────────────────
+
+    def _collect_done_envs(self, completed: list, target: int) -> None:
         """
         Kész epizódok kinyerése, reward shaping és env reset.
-
-        [RF-3b] A bootstrap state eltárolása a _step_learners_batched()-ban
-        történt, tehát itt a _reset_env() hívás nem érinti azt.
         """
         for i in range(self.num_envs):
             if not self._active[i] or self.envs[i].is_over():
@@ -646,38 +558,61 @@ class BatchedSyncCollector:
                         logger.debug(f"Env {i} payoffs hiba: {exc}")
                         raw_reward = 0.0
 
-                    # Reward shaping
-                    if self._steps[i]:
-                        last_action_int = int(
-                            self._steps[i][-1][2].item()
-                        )
-                        last_street = self._street[i]
-                        last_eq     = self._last_equity[i]
+                    rcfg = self._reward_cfg
 
-                        # Draw fold penalty
-                        DRAW_FOLD_PENALTY     = 0.08
-                        DRAW_EQUITY_THRESHOLD = 0.44
+                    # ── Meglévő terminal reward shaping ─────────────────
+                    if self._steps[i]:
+                        last_action_int = int(self._steps[i][-1][2].item())
+                        last_street     = self._street[i]
+                        last_eq         = self._last_equity[i]
+
+                        # Draw fold penalty (meglévő)
                         if (
                             last_action_int == _FOLD_ACTION
                             and last_street >= 1
-                            and last_eq >= DRAW_EQUITY_THRESHOLD
+                            and last_eq >= rcfg['draw_equity_threshold']
                         ):
-                            raw_reward -= DRAW_FOLD_PENALTY
+                            raw_reward -= rcfg['draw_fold_penalty']
 
                         # Street delta reward (RF-11)
                         if last_street > self._prev_street[i] and last_street >= 1:
                             equity_delta = last_eq - self._prev_equity[i]
                             equity_delta = max(-0.3, min(0.3, equity_delta))
-                            raw_reward  += equity_delta * _STREET_REWARD_SCALE
+                            raw_reward  += equity_delta * rcfg['street_reward_scale']
+
+                    # ── [CONFIG-FULL v4.3] Per-step penalty hozzáadása ──
+                    # Az _apply_step_penalties() által felhalmozott összeget
+                    # BB-re normalizálva adjuk hozzá.
+                    raw_reward += self._episode_penalty[i]
 
                     bb_reward = raw_reward / max(self._bb[i], 1e-6)
                     completed.append((self._steps[i], bb_reward))
-                self._reset_env(i)
+
+                self._reset_env(i)  # penalty accumulator nullázódik itt
+
+    # ── Equity számítás ──────────────────────────────────────────────────────
+
+    def _compute_equity(self, state: dict) -> float:
+        """Valódi equity becslés az instance equity estimatorral."""
+        raw          = state.get('raw_obs', {})
+        hole_rlcard  = raw.get('hand', [])
+        board_rlcard = raw.get('public_cards', [])
+        hole         = _rlcard_cards_to_equity_fmt(hole_rlcard)
+        board        = _rlcard_cards_to_equity_fmt(board_rlcard)
+        if len(hole) < 2:
+            return 0.5
+        try:
+            return self._equity_estimator.equity(
+                hole_cards=hole,
+                board=board,
+                num_opponents=max(self.num_players - 1, 1),
+            )
+        except Exception:
+            return 0.5
 
     # ── Segédek ──────────────────────────────────────────────────────────────
 
     def _calc_bet_norm(self, env_idx: int, abstract_action: int) -> float:
-        """Bet méret normalizálás az action history számára."""
         if abstract_action < 2:
             return 0.0
         fractions = [0.0, 0.25, 0.50, 0.75, 1.0]
