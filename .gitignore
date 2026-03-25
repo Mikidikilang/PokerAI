@@ -3,7 +3,6 @@ logs/
 runs/
 screenshots/
 models/*
-# SQLite ellenfél adatbázis
 players.db
 players.db-wal
 players.db-shm
