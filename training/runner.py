@@ -13,6 +13,8 @@ training/runner.py  --  Tréning session (v4.3 CONFIG-FULL)
 
 from __future__ import annotations
 
+import glob
+import json
 import logging
 import os
 import subprocess
@@ -33,6 +35,7 @@ from training.normalizer import RunningMeanStd
 from training.opponent_pool import OpponentPool
 from training.trainer import PPOTrainer
 from utils.checkpoint_utils import safe_load_checkpoint
+from training.model_manager import LifecycleLogger
 
 logger = logging.getLogger("PokerAI")
 
@@ -161,6 +164,7 @@ def _run_milestone(
     filename, model, trainer, reward_norm, episodes, time_spent,
     state_size, action_size, num_players, milestone_episodes,
     milestone_dir_root, rlcard_obs_size=54, milestone_hands=None,
+    lifecycle=None,
 ):
     ms_str        = _milestone_str(milestone_episodes)
     base_name     = os.path.splitext(os.path.basename(filename))[0]
@@ -199,6 +203,23 @@ def _run_milestone(
         result = subprocess.run(cmd, check=False, timeout=600, capture_output=True, text=True)
         if result.returncode == 0:
             logger.info(f"✅ {ms_str} teszt kész → {milestone_dir!r}")
+            # Lifecycle naplózás: teszteredmény JSON visszaolvasása
+            if lifecycle is not None:
+                try:
+                    test_jsons = sorted(glob.glob(os.path.join(milestone_dir, "*.json")))
+                    test_data = {}
+                    for tj in test_jsons:
+                        if os.path.basename(tj) != os.path.basename(milestone_model_path):
+                            with open(tj, "r", encoding="utf-8") as f:
+                                test_data = json.load(f)
+                            break
+                    lifecycle.log_milestone(
+                        episode=milestone_episodes,
+                        test_name=f"sanity_check_{ms_str}",
+                        results=test_data if test_data else {"milestone_dir": milestone_dir},
+                    )
+                except Exception as lc_exc:
+                    logger.warning(f"[Lifecycle] Mérföldkő naplózási hiba: {lc_exc}")
         else:
             _TAIL = 800
             logger.error(
@@ -291,6 +312,14 @@ def run_training_session(
     # ── Checkpoint betöltés ───────────────────────────────────────────────
     start_episode    = 0
     total_time_spent = 0.0
+
+    # ── Lifecycle napló inicializálása ────────────────────────────────────
+    model_name = os.path.splitext(os.path.basename(filename))[0]
+    lifecycle_path = os.path.join(
+        os.path.dirname(filename) if os.path.dirname(filename) else ".",
+        "lifecycle.json",
+    )
+    lifecycle = LifecycleLogger(lifecycle_path, model_id=model_name)
 
     if os.path.exists(filename):
         logger.info(f"Checkpoint betöltése: {filename!r}")
@@ -399,116 +428,136 @@ def run_training_session(
         logger.info("reset_optimizer_on_load=True: friss optimizer-rel indult")
     logger.info("=" * 70)
 
+    # Lifecycle: session megnyitása az aktuális config snapshotjával
+    lifecycle.start_session(cfg.to_dict(), start_episode)
+
     # ── Fő tréning loop ───────────────────────────────────────────────────
-    while total_collected < target_episodes:
-        to_collect = min(cfg.buffer_collect_size, target_episodes - total_collected)
+    try:
+        while total_collected < target_episodes:
+            to_collect = min(cfg.buffer_collect_size, target_episodes - total_collected)
 
-        prev_snap = total_collected // OpponentPool.SNAPSHOT_INTERVAL
-        next_snap = (total_collected + to_collect) // OpponentPool.SNAPSHOT_INTERVAL
-        if next_snap > prev_snap and total_collected > start_episode:
-            pool.snapshot(learner)
-            collector.update_pool()
+            prev_snap = total_collected // OpponentPool.SNAPSHOT_INTERVAL
+            next_snap = (total_collected + to_collect) // OpponentPool.SNAPSHOT_INTERVAL
+            if next_snap > prev_snap and total_collected > start_episode:
+                pool.snapshot(learner)
+                collector.update_pool()
 
-        learner.eval()
-        try:
-            all_episodes = collector.collect(to_collect)
-        except Exception as exc:
-            logger.error(f"Gyűjtési hiba: {exc}", exc_info=True)
-            continue
+            learner.eval()
+            try:
+                all_episodes = collector.collect(to_collect)
+            except Exception as exc:
+                logger.error(f"Gyűjtési hiba: {exc}", exc_info=True)
+                continue
 
-        learner.train()
-        if not all_episodes:
-            logger.warning("Üres gyűjtési batch")
-            continue
+            learner.train()
+            if not all_episodes:
+                logger.warning("Üres gyűjtési batch")
+                continue
 
-        for steps, bb_reward in all_episodes:
-            reward_norm.update(bb_reward)
-            norm_r  = reward_norm.normalize(bb_reward)
-            n_steps = len(steps)
-            for i, (s, la, a, lp, v) in enumerate(steps):
-                buffer.add(
-                    state=s.unsqueeze(0),
-                    legal_actions=la,
-                    action=a,
-                    log_prob=lp,
-                    value=v,
-                    reward=norm_r if i == n_steps - 1 else 0.0,
-                    episode_end=(i == n_steps - 1),
+            for steps, bb_reward in all_episodes:
+                reward_norm.update(bb_reward)
+                norm_r  = reward_norm.normalize(bb_reward)
+                n_steps = len(steps)
+                for i, (s, la, a, lp, v) in enumerate(steps):
+                    buffer.add(
+                        state=s.unsqueeze(0),
+                        legal_actions=la,
+                        action=a,
+                        log_prob=lp,
+                        value=v,
+                        reward=norm_r if i == n_steps - 1 else 0.0,
+                        episode_end=(i == n_steps - 1),
+                    )
+
+            collected_this_batch = len(all_episodes)
+            total_collected     += collected_this_batch
+
+            last_value = 0.0
+            if buffer.episode_ends and not buffer.episode_ends[-1]:
+                last_value = collector.get_bootstrap_value(learner, device)
+
+            try:
+                metrics = trainer.update(buffer, last_value=last_value)
+            except Exception as exc:
+                logger.error(f"PPO update hiba: {exc}", exc_info=True)
+                buffer.reset()
+                metrics = {}
+
+            if writer and metrics:
+                for k, mv in metrics.items():
+                    writer.add_scalar(f"Loss/{k}", mv, total_collected)
+                writer.add_scalar("Reward/mean_bb", reward_norm.mean, total_collected)
+                writer.add_scalar("Reward/std_bb", reward_norm.var ** 0.5, total_collected)
+
+            prev_1k = (total_collected - collected_this_batch) // 1_000
+            curr_1k = total_collected // 1_000
+
+            if curr_1k > prev_1k:
+                elapsed      = time.time() - session_start
+                done_so_far  = total_collected - start_episode
+                remaining    = target_episodes - total_collected
+                eps_sec      = done_so_far / max(elapsed, 1e-6)
+                eta_str      = time.strftime("%H:%M:%S", time.gmtime(remaining / max(eps_sec, 1e-6)))
+                ela_str      = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+                lr           = trainer.optimizer.param_groups[0]["lr"]
+
+                logger.info(
+                    f"Ep {total_collected:>8,}/{target_episodes:,} | "
+                    f"Eltelt {ela_str} | ETA {eta_str} | LR {lr:.2e} | "
+                    f"Actor {metrics.get('actor', float('nan')):+.4f} | "
+                    f"Critic {metrics.get('critic', float('nan')):.4f} | "
+                    f"Ent {metrics.get('entropy', float('nan')):.4f} | "
+                    f"Pool {len(pool):2d}"
                 )
 
-        collected_this_batch = len(all_episodes)
-        total_collected     += collected_this_batch
-
-        last_value = 0.0
-        if buffer.episode_ends and not buffer.episode_ends[-1]:
-            last_value = collector.get_bootstrap_value(learner, device)
-
-        try:
-            metrics = trainer.update(buffer, last_value=last_value)
-        except Exception as exc:
-            logger.error(f"PPO update hiba: {exc}", exc_info=True)
-            buffer.reset()
-            metrics = {}
-
-        if writer and metrics:
-            for k, mv in metrics.items():
-                writer.add_scalar(f"Loss/{k}", mv, total_collected)
-            writer.add_scalar("Reward/mean_bb", reward_norm.mean, total_collected)
-            writer.add_scalar("Reward/std_bb", reward_norm.var ** 0.5, total_collected)
-
-        prev_1k = (total_collected - collected_this_batch) // 1_000
-        curr_1k = total_collected // 1_000
-
-        if curr_1k > prev_1k:
-            elapsed      = time.time() - session_start
-            done_so_far  = total_collected - start_episode
-            remaining    = target_episodes - total_collected
-            eps_sec      = done_so_far / max(elapsed, 1e-6)
-            eta_str      = time.strftime("%H:%M:%S", time.gmtime(remaining / max(eps_sec, 1e-6)))
-            ela_str      = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            lr           = trainer.optimizer.param_groups[0]["lr"]
-
-            logger.info(
-                f"Ep {total_collected:>8,}/{target_episodes:,} | "
-                f"Eltelt {ela_str} | ETA {eta_str} | LR {lr:.2e} | "
-                f"Actor {metrics.get('actor', float('nan')):+.4f} | "
-                f"Critic {metrics.get('critic', float('nan')):.4f} | "
-                f"Ent {metrics.get('entropy', float('nan')):.4f} | "
-                f"Pool {len(pool):2d}"
-            )
-
-            _save_checkpoint(
-                filename, learner, trainer, reward_norm,
-                total_collected, total_time_spent + elapsed,
-                STATE_SIZE, ACTION_SIZE,
-                num_players=num_players, rlcard_obs_size=rlcard_obs_size,
-            )
-
-            current_milestone = (
-                (total_collected // cfg.milestone_interval) * cfg.milestone_interval
-            )
-            if current_milestone > last_milestone and current_milestone > 0:
-                last_milestone = current_milestone
-                _run_milestone(
-                    filename=filename, model=learner, trainer=trainer,
-                    reward_norm=reward_norm, episodes=total_collected,
-                    time_spent=total_time_spent + elapsed,
-                    state_size=STATE_SIZE, action_size=ACTION_SIZE,
-                    num_players=num_players,
-                    milestone_episodes=current_milestone,
-                    milestone_dir_root=milestone_dir_root,
-                    rlcard_obs_size=rlcard_obs_size,
-                    milestone_hands=cfg.milestone_hands,
+                _save_checkpoint(
+                    filename, learner, trainer, reward_norm,
+                    total_collected, total_time_spent + elapsed,
+                    STATE_SIZE, ACTION_SIZE,
+                    num_players=num_players, rlcard_obs_size=rlcard_obs_size,
                 )
 
-    if writer:
-        writer.close()
+                current_milestone = (
+                    (total_collected // cfg.milestone_interval) * cfg.milestone_interval
+                )
+                if current_milestone > last_milestone and current_milestone > 0:
+                    last_milestone = current_milestone
+                    _run_milestone(
+                        filename=filename, model=learner, trainer=trainer,
+                        reward_norm=reward_norm, episodes=total_collected,
+                        time_spent=total_time_spent + elapsed,
+                        state_size=STATE_SIZE, action_size=ACTION_SIZE,
+                        num_players=num_players,
+                        milestone_episodes=current_milestone,
+                        milestone_dir_root=milestone_dir_root,
+                        rlcard_obs_size=rlcard_obs_size,
+                        milestone_hands=cfg.milestone_hands,
+                        lifecycle=lifecycle,
+                    )
 
-    elapsed = time.time() - session_start
-    _save_checkpoint(
-        filename, learner, trainer, reward_norm,
-        target_episodes, total_time_spent + elapsed,
-        STATE_SIZE, ACTION_SIZE,
-        num_players=num_players, rlcard_obs_size=rlcard_obs_size,
-    )
-    logger.info(f"KÉSZ  →  {filename!r}  ({target_episodes:,} epizód)")
+    except KeyboardInterrupt:
+        logger.info("Tréning kézzel megszakítva (Ctrl+C). Session mentése...")
+    finally:
+        if writer:
+            writer.close()
+
+        elapsed = time.time() - session_start
+        _save_checkpoint(
+            filename, learner, trainer, reward_norm,
+            total_collected, total_time_spent + elapsed,
+            STATE_SIZE, ACTION_SIZE,
+            num_players=num_players, rlcard_obs_size=rlcard_obs_size,
+        )
+
+        # Lifecycle: session lezárása aggregált metrikákkal
+        lifecycle.close_session(
+            end_episode=total_collected,
+            metrics={
+                "mean_actor_loss":  metrics.get("actor",   0.0) if metrics else 0.0,
+                "mean_critic_loss": metrics.get("critic",  0.0) if metrics else 0.0,
+                "mean_entropy":     metrics.get("entropy", 0.0) if metrics else 0.0,
+                "mean_bb_reward":   float(reward_norm.mean) if hasattr(reward_norm, "mean") else 0.0,
+                "execution_time_hours": elapsed / 3600,
+            },
+        )
+        logger.info(f"KÉSZ  →  {filename!r}  ({total_collected:,} epizód)")

@@ -209,6 +209,10 @@ class ModelManager:
     def tests_dir(self, name: str) -> str:
         return os.path.join(self.model_dir(name), "tests")
 
+    def lifecycle_path(self, name: str) -> str:
+        """Az életút-napló (LifecycleLogger) JSON fájljának útvonala."""
+        return os.path.join(self.model_dir(name), "lifecycle.json")
+
     def ensure_model_dir(self, name: str, num_players: int = 6) -> str:
         d = self.model_dir(name)
         os.makedirs(d, exist_ok=True)
@@ -479,3 +483,133 @@ class ModelManager:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LifecycleLogger  --  Életút-naplózó (JSON Lifecycle Log)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import shutil
+import time
+import uuid
+
+
+class LifecycleLogger:
+    """
+    A modell teljes életútját rögzítő naplózó.
+
+    Minden tréning session-höz elmenti a teljes TrainingConfig snapshotot,
+    a PPO metrikákat, és a mérföldkő teszteredményeket egyetlen koherens
+    naplo.json-ban – a ModelManager naplo.json-jától elkülönülve.
+
+    Atomikus írás: naplo.json.tmp → os.replace() (crash-biztonságos).
+
+    Tipikus használat:
+        lifecycle = LifecycleLogger(manager.lifecycle_path(name))
+        lifecycle.start_session(cfg.to_dict(), start_episode)
+        lifecycle.log_milestone(1_000_000, "sanity_check", results_dict)
+        lifecycle.close_session(end_episode, {"mean_policy_loss": -0.012, ...})
+    """
+
+    def __init__(self, log_path: str, model_id: str = "PokerAI") -> None:
+        self.log_path = log_path
+        self.model_id = model_id
+        self._active_idx: Optional[int] = None
+
+        os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)
+        self._data: Dict[str, Any] = self._load_or_init()
+
+    # ── Belső segédek ────────────────────────────────────────────────────────
+
+    def _load_or_init(self) -> Dict[str, Any]:
+        if os.path.exists(self.log_path):
+            try:
+                with open(self.log_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                logger.info(
+                    f"[Lifecycle] Napló betöltve: {self.log_path} "
+                    f"({len(data.get('sessions', []))} session, "
+                    f"{data.get('total_episodes_trained', 0):,} ep)"
+                )
+                return data
+            except json.JSONDecodeError:
+                bak = f"{self.log_path}.bak"
+                logger.warning(f"[Lifecycle] Sérült JSON – biztonsági mentés: {bak}")
+                shutil.copy(self.log_path, bak)
+        logger.info(f"[Lifecycle] Új lifecycle napló: {self.log_path}")
+        return {
+            "model_id": self.model_id,
+            "created_at": self._ts(),
+            "total_episodes_trained": 0,
+            "sessions": [],
+        }
+
+    def _save(self) -> None:
+        tmp = f"{self.log_path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2, ensure_ascii=False, default=str)
+        os.replace(tmp, self.log_path)
+
+    @staticmethod
+    def _ts() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _active(self) -> Dict[str, Any]:
+        if self._active_idx is None:
+            raise RuntimeError("[Lifecycle] Nincs aktív session – hívj start_session()-t.")
+        return self._data["sessions"][self._active_idx]
+
+    # ── Publikus API ─────────────────────────────────────────────────────────
+
+    def start_session(self, config_dict: Dict[str, Any], start_episode: int) -> str:
+        """Új session nyitása a config teljes snapshotjával."""
+        if self._active_idx is not None:
+            logger.warning("[Lifecycle] Árva nyitott session lezárása.")
+            self.close_session(start_episode, {"system_note": "Automatikus lezárás (újraindítás)"})
+
+        sid = f"sess_{uuid.uuid4().hex[:8]}"
+        self._data["sessions"].append({
+            "session_id":    sid,
+            "start_time":    self._ts(),
+            "end_time":      None,
+            "episode_range": {"start": start_episode, "end": None},
+            "config":        config_dict,
+            "metrics":       {},
+            "milestones":    [],
+        })
+        self._active_idx = len(self._data["sessions"]) - 1
+        self._save()
+        logger.info(f"[Lifecycle] Session nyitva: {sid} (ep {start_episode:,})")
+        return sid
+
+    def log_milestone(self, episode: int, test_name: str, results: Dict[str, Any]) -> None:
+        """Mérföldkő teszteredmény beillesztése az aktív session alá."""
+        sess = self._active()
+        if episode > self._data.get("total_episodes_trained", 0):
+            self._data["total_episodes_trained"] = episode
+        sess["milestones"].append({
+            "episode":   episode,
+            "timestamp": self._ts(),
+            "test_name": test_name,
+            "results":   results,
+        })
+        self._save()
+        logger.info(f"[Lifecycle] Mérföldkő: {test_name} @ ep {episode:,}")
+
+    def close_session(self, end_episode: int, metrics: Dict[str, Any]) -> None:
+        """Session lezárása, metrikák véglegesítése."""
+        if self._active_idx is None:
+            return
+        sess = self._active()
+        sess["end_time"] = self._ts()
+        sess["episode_range"]["end"] = end_episode
+        sess["metrics"] = metrics
+        if end_episode > self._data.get("total_episodes_trained", 0):
+            self._data["total_episodes_trained"] = end_episode
+        sid = sess["session_id"]
+        self._active_idx = None
+        self._save()
+        logger.info(f"[Lifecycle] Session lezárva: {sid} (ep {end_episode:,})")
+
+    def get_total_episodes(self) -> int:
+        return self._data.get("total_episodes_trained", 0)
