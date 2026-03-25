@@ -1922,7 +1922,16 @@ def run_single_model(model_path, np_, device_str, n_hands, seed,
     tl.log(f"  Modell: {model_path} ({episodes:,} ep)")
     tl.log(f"  {np_}p | {n_hands:,} kéz | seed={seed}")
 
-    model = AdvancedPokerAI(state_size=state_size, action_size=action_size).to(device)
+    # gru_hidden kiolvasása a checkpoint state_dict shape-jéből,
+    # mert régi checkpointokban nincs elmentve explicit kulcsként.
+    # gru_encoder.out_norm.weight alakja: [gru_hidden]
+    sd = ck['state_dict']
+    gru_hidden = sd['gru_encoder.out_norm.weight'].shape[0] if 'gru_encoder.out_norm.weight' in sd else None
+    model = AdvancedPokerAI(
+        state_size=state_size,
+        action_size=action_size,
+        gru_hidden=gru_hidden,
+    ).to(device)
     model.load_state_dict(ck['state_dict']); model.eval()
     ob=ObsBuilder(np_); tr=OpponentHUDTracker(np_)
     he=ActionHistoryEncoder(np_,action_size); ee=HandEquityEstimator(n_sim=200)
